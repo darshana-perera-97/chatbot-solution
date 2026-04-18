@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Thin scrollbars — light theme tint (violet family) */
+:root {
+  --scrollbar-track: #faf7ff;
+  --scrollbar-thumb: #d4c4fd;
+  --scrollbar-thumb-hover: #c4b5fd;
+  --scrollbar-size: 4px;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* Dashboard Recharts: no focus ring on click (wrapper/SVG are focusable) */
+.dashboard-page .recharts-responsive-container:focus,
+.dashboard-page .recharts-responsive-container:focus-visible,
+.dashboard-page .recharts-wrapper:focus,
+.dashboard-page .recharts-wrapper:focus-visible,
+.dashboard-page .recharts-surface:focus,
+.dashboard-page .recharts-surface:focus-visible {
+  outline: none;
+}
+
+.dashboard-page .recharts-wrapper *:focus {
+  outline: none;
+}
