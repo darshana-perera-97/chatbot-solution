@@ -1,9 +1,10 @@
 {
   "files": {
     "main.css": "/static/css/main.fde2f684.css",
-    "main.js": "/static/js/main.a41d3664.js",
+    "main.js": "/static/js/main.a80ed427.js",
     "static/js/453.64aababc.chunk.js": "/static/js/453.64aababc.chunk.js",
     "static/media/log-assetremovebg.png": "/static/media/log-assetremovebg.930bfb3b2eb18a7f372e.png",
+    "static/media/nexgenaoLogo.jpeg": "/static/media/nexgenaoLogo.c4340f670d76b0820025.jpeg",
     "index.html": "/index.html",
     "static/media/dashboard-hero.svg": "/static/media/dashboard-hero.04ba6b643eb865ea6a7ef44d91e4c4fc.svg",
     "static/media/avatar-zaenal.svg": "/static/media/avatar-zaenal.cd2ecff45f1448f0886345a5e8f0cb87.svg",
@@ -11,11 +12,11 @@
     "static/media/avatar-dhea.svg": "/static/media/avatar-dhea.f89ced13fbd369025e78a8dba9bc09fb.svg",
     "static/media/avatar-rina.svg": "/static/media/avatar-rina.3fbe7f9fd2406d4508de03e6fa169079.svg",
     "main.fde2f684.css.map": "/static/css/main.fde2f684.css.map",
-    "main.a41d3664.js.map": "/static/js/main.a41d3664.js.map",
+    "main.a80ed427.js.map": "/static/js/main.a80ed427.js.map",
     "453.64aababc.chunk.js.map": "/static/js/453.64aababc.chunk.js.map"
   },
   "entrypoints": [
     "static/css/main.fde2f684.css",
-    "static/js/main.a41d3664.js"
+    "static/js/main.a80ed427.js"
   ]
 }

@@ -14,6 +14,7 @@ import {
   Settings,
 } from "lucide-react";
 import { clearWorkspaceUserSession } from "../auth/userSession";
+import nexgenaoLogo from "../assets/nexgenaoLogo.jpeg";
 
 const navItems = [
   { label: "Dashboard", path: "/dashboard", icon: LayoutDashboard },
@@ -44,7 +45,11 @@ function AppLayout() {
             }`}
           >
             <div className="flex min-w-0 items-center gap-2">
-              <div className="h-9 w-9 shrink-0 rounded-full bg-gradient-to-br from-[#8B5CF6] to-[#FB923C]" />
+              <img
+                src={nexgenaoLogo}
+                alt="NexGenAI logo"
+                className="h-9 w-9 shrink-0 rounded-full object-cover"
+              />
               <div
                 className={`min-w-0 leading-tight ${
                   sidebarCollapsed ? "xl:hidden" : ""
