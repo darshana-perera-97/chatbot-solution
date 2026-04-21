@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
-import { LeadQualityCell } from "../components/LeadQualityCell";
 
 function formatDate(iso) {
   const value = typeof iso === "string" ? iso : "";
@@ -110,7 +109,6 @@ function Inquiries() {
                   <th className="px-3 py-2 font-medium">Name</th>
                   <th className="px-3 py-2 font-medium">Email</th>
                   <th className="px-3 py-2 font-medium">Phone</th>
-                  <th className="px-3 py-2 font-medium">Quality of leads</th>
                   <th className="px-3 py-2 font-medium">Updated</th>
                   <th className="px-3 py-2 font-medium">Action</th>
                 </tr>
@@ -127,9 +125,6 @@ function Inquiries() {
                     <td className="px-3 py-3 text-sm text-slate-600">{getByLabelLike(row, /email/i)}</td>
                     <td className="px-3 py-3 text-sm text-slate-600">
                       {getByLabelLike(row, /phone|mobile|contact/i)}
-                    </td>
-                    <td className="px-3 py-3 text-sm text-slate-600">
-                      <LeadQualityCell row={row} />
                     </td>
                     <td className="px-3 py-3 text-sm text-slate-500">{formatDate(row.updatedAt)}</td>
                     <td className="rounded-r-xl px-3 py-3 text-sm text-slate-500">
