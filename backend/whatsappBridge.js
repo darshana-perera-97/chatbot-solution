@@ -20,6 +20,52 @@ function ensureAuthDir() {
   }
 }
 
+function resolveChromeExecutablePath() {
+  const fromEnv =
+    (typeof process.env.PUPPETEER_EXECUTABLE_PATH === "string" &&
+      process.env.PUPPETEER_EXECUTABLE_PATH.trim()) ||
+    (typeof process.env.CHROME_BIN === "string" && process.env.CHROME_BIN.trim()) ||
+    "";
+  if (fromEnv) return fromEnv;
+
+  if (process.platform === "darwin") {
+    const macCandidates = [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+    for (const p of macCandidates) {
+      if (fs.existsSync(p)) return p;
+    }
+  }
+
+  return "";
+}
+
+function buildPuppeteerOptions() {
+  const executablePath = resolveChromeExecutablePath();
+  const args = [];
+
+  // Sandbox flags are primarily needed in Linux container environments.
+  if (process.platform === "linux") {
+    args.push("--no-sandbox", "--disable-setuid-sandbox");
+  }
+
+  args.push("--disable-dev-shm-usage", "--disable-accelerated-2d-canvas", "--disable-gpu");
+
+  const opts = {
+    // Cold starts can exceed Puppeteer's default 30s on some machines.
+    timeout: 120000,
+    headless: true,
+    args,
+  };
+
+  if (executablePath) {
+    opts.executablePath = executablePath;
+  }
+
+  return opts;
+}
+
 function jidToConversationId(jid) {
   const safe = String(jid || "")
     .trim()
@@ -205,18 +251,7 @@ function createWhatsAppBridge(deps) {
         clientId: `wa-${safe}`,
         dataPath: authRoot,
       }),
-      puppeteer: {
-        // Cold starts can exceed Puppeteer's default 30s on some machines.
-        timeout: 120000,
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-accelerated-2d-canvas",
-          "--disable-gpu",
-        ],
-      },
+      puppeteer: buildPuppeteerOptions(),
     });
 
     entry.client = client;
@@ -344,7 +379,11 @@ function createWhatsAppBridge(deps) {
       await client.initialize();
     } catch (e) {
       entry.phase = "error";
-      entry.error = e instanceof Error ? e.message : String(e);
+      const message = e instanceof Error ? e.message : String(e);
+      entry.error =
+        "Failed to launch browser for WhatsApp Web. " +
+        message +
+        " | Tip: set PUPPETEER_EXECUTABLE_PATH to your Chrome binary path.";
     }
 
     return { ok: true };

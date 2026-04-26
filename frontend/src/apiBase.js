@@ -1,7 +1,6 @@
 import { defaultBackendOrigin } from "./backendConfig.js";
 
 const DEFAULT_LOCAL_API = defaultBackendOrigin;
-
 function normalizeBase(url) {
   return (url || "").trim().replace(/\/$/, "");
 }
