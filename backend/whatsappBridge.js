@@ -1,5 +1,6 @@
 const path = require("path");
 const fs = require("fs");
+const { execSync } = require("child_process");
 const QRCode = require("qrcode");
 const whatsappAutoStart = require("./whatsappAutoStart");
 
@@ -95,6 +96,49 @@ function buildPuppeteerOptions(executablePath = "") {
   }
 
   return opts;
+}
+
+function releaseLinuxProfileDir(profileDir) {
+  if (process.platform !== "linux") return;
+  if (!profileDir || !fs.existsSync(profileDir)) return;
+
+  const lockArtifacts = ["SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort"];
+  for (const name of lockArtifacts) {
+    const p = path.join(profileDir, name);
+    try {
+      if (fs.existsSync(p)) fs.rmSync(p, { force: true, recursive: true });
+    } catch {
+      /* ignore stale lock cleanup errors */
+    }
+  }
+
+  // If a crashed/restarted Node process left Chromium running with this exact profile,
+  // terminate only those browser processes whose command line includes this profile path.
+  const escapedDir = profileDir.replace(/["`\\$]/g, "\\$&");
+  const escapedForGrep = escapedDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  try {
+    const lines = execSync("ps -eo pid,args", {
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+    })
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .filter((l) => new RegExp(escapedForGrep).test(l))
+      .filter((l) => /chrome|chromium/i.test(l));
+
+    for (const line of lines) {
+      const pid = Number(line.split(/\s+/, 1)[0]);
+      if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+      try {
+        execSync(`kill -TERM ${pid}`, { stdio: "ignore" });
+      } catch {
+        /* ignore if already gone */
+      }
+    }
+  } catch {
+    /* ignore process scan issues */
+  }
 }
 
 function jidToConversationId(jid) {
@@ -308,9 +352,13 @@ function createWhatsAppBridge(deps) {
       return { ok: false, error: entry.error };
     }
 
+    const localAuthClientId = `wa-${safe}`;
+    const localAuthProfileDir = path.join(authRoot, `session-${localAuthClientId}`);
+    releaseLinuxProfileDir(localAuthProfileDir);
+
     const client = new Client({
       authStrategy: new LocalAuth({
-        clientId: `wa-${safe}`,
+        clientId: localAuthClientId,
         dataPath: authRoot,
       }),
       puppeteer: buildPuppeteerOptions(executablePath),
