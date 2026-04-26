@@ -299,6 +299,15 @@ function createWhatsAppBridge(deps) {
     } else {
       waLog(safe, `using browser executable: ${executablePath}`);
     }
+    if (!executablePath) {
+      entry.phase = "error";
+      entry.error =
+        "No Chrome/Chromium executable detected for WhatsApp Web. " +
+        "Set PUPPETEER_EXECUTABLE_PATH (or CHROME_BIN) to your browser binary path.";
+      waLog(safe, "initialize skipped", entry.error);
+      return { ok: false, error: entry.error };
+    }
+
     const client = new Client({
       authStrategy: new LocalAuth({
         clientId: `wa-${safe}`,
