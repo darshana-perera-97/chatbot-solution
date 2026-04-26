@@ -206,6 +206,8 @@ function createWhatsAppBridge(deps) {
         dataPath: authRoot,
       }),
       puppeteer: {
+        // Cold starts can exceed Puppeteer's default 30s on some machines.
+        timeout: 120000,
         headless: true,
         args: [
           "--no-sandbox",

@@ -171,6 +171,8 @@ function Integrations() {
 
   const waConnected = Boolean(waStatus?.connected || waStatus?.phase === "ready");
   const waPhase = typeof waStatus?.phase === "string" ? waStatus.phase : "";
+  const waConnectedAccountLabel =
+    [waStatus?.pushname, waStatus?.phone].filter(Boolean).join(" · ") || "Connected";
 
   return (
     <>
@@ -218,6 +220,11 @@ function Integrations() {
 
                 <h2 className="mt-4 text-lg font-semibold text-slate-900">{item.name}</h2>
                 <p className="mt-2 flex-1 text-sm leading-relaxed text-slate-500">{item.description}</p>
+                {isWa && waConnected ? (
+                  <p className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800">
+                    Connected account: {waConnectedAccountLabel}
+                  </p>
+                ) : null}
 
                 <div className="mt-6 flex flex-wrap items-center gap-2 border-t border-[#EEE8FF] pt-4">
                   <button
@@ -345,9 +352,7 @@ function Integrations() {
               <div className="rounded-xl border border-[#E9DFFF] bg-white p-3 shadow-sm">
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Session</p>
                 <p className="mt-1 text-sm font-semibold text-slate-800">
-                  {waConnected
-                    ? [waStatus?.pushname, waStatus?.phone].filter(Boolean).join(" · ") || "Connected"
-                    : "Not linked"}
+                  {waConnected ? waConnectedAccountLabel : "Not linked"}
                 </p>
               </div>
             </div>
@@ -361,10 +366,12 @@ function Integrations() {
                 />
               ) : null}
               {waConnected ? (
-                <p className="text-center text-sm font-medium text-[#6D28D9]">
-                  WhatsApp is linked. Incoming messages get AI replies; use Chats to monitor or take over with Live
-                  Agent.
-                </p>
+                <div className="text-center">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Connected account
+                  </p>
+                  <p className="mt-1 text-sm font-semibold text-[#6D28D9]">{waConnectedAccountLabel}</p>
+                </div>
               ) : null}
               {!waStatus?.qrDataUrl && !waConnected && waPhase !== "error" ? (
                 <p className="text-center text-sm text-slate-500">
