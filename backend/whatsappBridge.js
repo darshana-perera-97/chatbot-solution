@@ -26,23 +26,54 @@ function resolveChromeExecutablePath() {
       process.env.PUPPETEER_EXECUTABLE_PATH.trim()) ||
     (typeof process.env.CHROME_BIN === "string" && process.env.CHROME_BIN.trim()) ||
     "";
-  if (fromEnv) return fromEnv;
+  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+  if (fromEnv) return "";
 
+  const candidates = [];
   if (process.platform === "darwin") {
-    const macCandidates = [
+    candidates.push(
       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
       "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    ];
-    for (const p of macCandidates) {
-      if (fs.existsSync(p)) return p;
+      "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+    );
+  }
+  if (process.platform === "linux") {
+    candidates.push(
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/google-chrome",
+      "/usr/bin/chromium-browser",
+      "/usr/bin/chromium",
+      "/snap/bin/chromium"
+    );
+  }
+  if (process.platform === "win32") {
+    candidates.push(
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
+    );
+  }
+
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+
+  // Last fallback: Puppeteer's own downloaded browser (if present).
+  try {
+    const puppeteer = require("puppeteer");
+    if (puppeteer && typeof puppeteer.executablePath === "function") {
+      const p = puppeteer.executablePath();
+      if (typeof p === "string" && p.trim() && fs.existsSync(p)) {
+        return p.trim();
+      }
     }
+  } catch {
+    /* ignore */
   }
 
   return "";
 }
 
-function buildPuppeteerOptions() {
-  const executablePath = resolveChromeExecutablePath();
+function buildPuppeteerOptions(executablePath = "") {
   const args = [];
 
   // Sandbox flags are primarily needed in Linux container environments.
@@ -259,12 +290,21 @@ function createWhatsAppBridge(deps) {
     };
     slots.set(safe, entry);
 
+    const executablePath = resolveChromeExecutablePath();
+    if (!executablePath) {
+      waLog(
+        safe,
+        "no browser executable detected (set PUPPETEER_EXECUTABLE_PATH for your server environment)"
+      );
+    } else {
+      waLog(safe, `using browser executable: ${executablePath}`);
+    }
     const client = new Client({
       authStrategy: new LocalAuth({
         clientId: `wa-${safe}`,
         dataPath: authRoot,
       }),
-      puppeteer: buildPuppeteerOptions(),
+      puppeteer: buildPuppeteerOptions(executablePath),
     });
 
     entry.client = client;
@@ -406,7 +446,7 @@ function createWhatsAppBridge(deps) {
       entry.error =
         "Failed to launch browser for WhatsApp Web. " +
         message +
-        " | Tip: set PUPPETEER_EXECUTABLE_PATH to your Chrome binary path.";
+        " | Tip: set PUPPETEER_EXECUTABLE_PATH to your Chrome/Chromium binary path.";
       waLog(safe, "initialize failed", entry.error);
     }
 
