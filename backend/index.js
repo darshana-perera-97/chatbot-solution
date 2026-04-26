@@ -50,6 +50,7 @@ const adminAuthConfigured = () =>
   ADMIN_PASSWORD.length > 0;
 
 const sendJson = (res, statusCode, payload, extraHeaders = {}) => {
+  if (res.headersSent || res.writableEnded) return;
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
     ...extraHeaders,
@@ -2207,6 +2208,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (res.headersSent || res.writableEnded) return;
   sendJson(res, 200, {
     message: "Server is running",
     method: req.method,
