@@ -79,10 +79,17 @@ function buildPuppeteerOptions(executablePath = "") {
 
   // Sandbox flags are primarily needed in Linux container environments.
   if (process.platform === "linux") {
-    args.push("--no-sandbox", "--disable-setuid-sandbox");
+    args.push("--no-sandbox", "--disable-setuid-sandbox", "--no-zygote");
   }
 
-  args.push("--disable-dev-shm-usage", "--disable-accelerated-2d-canvas", "--disable-gpu");
+  args.push(
+    "--disable-dev-shm-usage",
+    "--disable-accelerated-2d-canvas",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--no-first-run",
+    "--no-default-browser-check"
+  );
 
   const opts = {
     // Cold starts can exceed Puppeteer's default 30s on some machines.
@@ -361,6 +368,9 @@ function createWhatsAppBridge(deps) {
         clientId: localAuthClientId,
         dataPath: authRoot,
       }),
+      takeoverOnConflict: true,
+      takeoverTimeoutMs: 0,
+      restartOnAuthFail: true,
       puppeteer: buildPuppeteerOptions(executablePath),
     });
 
@@ -505,6 +515,7 @@ function createWhatsAppBridge(deps) {
         message +
         " | Tip: set PUPPETEER_EXECUTABLE_PATH to your Chrome/Chromium binary path.";
       waLog(safe, "initialize failed", entry.error);
+      return { ok: false, error: entry.error };
     }
 
     return { ok: true };
