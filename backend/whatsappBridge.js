@@ -157,10 +157,19 @@ function createWhatsAppBridge(deps) {
 
   /** @type {Map<string, object>} */
   const slots = new Map();
+  const waLog = (workspaceUserId, message, ...extra) => {
+    const prefix = `[whatsapp][user:${workspaceUserId}]`;
+    if (extra.length) {
+      console.log(prefix, message, ...extra);
+    } else {
+      console.log(prefix, message);
+    }
+  };
 
   async function destroyClient(workspaceUserId) {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     if (!safe) return;
+    waLog(safe, "destroying client session");
     const entry = slots.get(safe);
     if (entry?.client) {
       try {
@@ -171,6 +180,7 @@ function createWhatsAppBridge(deps) {
       }
     }
     slots.delete(safe);
+    waLog(safe, "client session removed");
   }
 
   function getStatus(workspaceUserId) {
@@ -225,15 +235,18 @@ function createWhatsAppBridge(deps) {
     }
     const existingSlot = slots.get(safe);
     if (existingSlot?.phase === "ready") {
+      waLog(safe, "already linked and ready");
       return { ok: true, alreadyConnected: true };
     }
     if (
       existingSlot?.client &&
       ["initializing", "qr", "authenticated"].includes(existingSlot.phase)
     ) {
+      waLog(safe, `linking already in progress (phase=${existingSlot.phase})`);
       return { ok: true, pending: true };
     }
     ensureAuthDir();
+    waLog(safe, "starting linking flow (initializing client)");
     await destroyClient(safe);
 
     const entry = {
@@ -260,20 +273,24 @@ function createWhatsAppBridge(deps) {
       try {
         entry.qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, width: 280 });
         entry.phase = "qr";
+        waLog(safe, "qr generated; waiting for device link scan");
       } catch (e) {
         entry.error = e instanceof Error ? e.message : String(e);
         entry.phase = "error";
+        waLog(safe, "failed generating qr", entry.error);
       }
     });
 
     client.on("authenticated", () => {
       entry.phase = "authenticated";
       entry.qrDataUrl = "";
+      waLog(safe, "account login authenticated");
     });
 
     client.on("auth_failure", (m) => {
       entry.phase = "error";
       entry.error = String(m || "auth_failure");
+      waLog(safe, "auth failure", entry.error);
     });
 
     client.on("ready", () => {
@@ -283,11 +300,16 @@ function createWhatsAppBridge(deps) {
       entry.phone = wid?.user || "";
       entry.pushname = channelLabelFromClient(client);
       whatsappAutoStart.addUserId(safe);
+      waLog(
+        safe,
+        `linked and ready (account=${entry.pushname || "unknown"}${entry.phone ? ` · ${entry.phone}` : ""})`
+      );
     });
 
     client.on("disconnected", (reason) => {
       entry.phase = "disconnected";
       entry.error = String(reason || "disconnected");
+      waLog(safe, "disconnected", entry.error);
     });
 
     client.on("message", async (msg) => {
@@ -377,6 +399,7 @@ function createWhatsAppBridge(deps) {
 
     try {
       await client.initialize();
+      waLog(safe, "client initialize() called successfully");
     } catch (e) {
       entry.phase = "error";
       const message = e instanceof Error ? e.message : String(e);
@@ -384,6 +407,7 @@ function createWhatsAppBridge(deps) {
         "Failed to launch browser for WhatsApp Web. " +
         message +
         " | Tip: set PUPPETEER_EXECUTABLE_PATH to your Chrome binary path.";
+      waLog(safe, "initialize failed", entry.error);
     }
 
     return { ok: true };
