@@ -1,7 +1,7 @@
 {
   "files": {
     "main.css": "/static/css/main.fde2f684.css",
-    "main.js": "/static/js/main.8368f93f.js",
+    "main.js": "/static/js/main.3caaf69b.js",
     "static/js/453.64aababc.chunk.js": "/static/js/453.64aababc.chunk.js",
     "static/media/log-assetremovebg.png": "/static/media/log-assetremovebg.930bfb3b2eb18a7f372e.png",
     "static/media/nexgenaoLogo.jpeg": "/static/media/nexgenaoLogo.c4340f670d76b0820025.jpeg",
@@ -12,11 +12,11 @@
     "static/media/avatar-dhea.svg": "/static/media/avatar-dhea.51fa80c4cf78c17b9f4e1c3e2fa768ec.svg",
     "static/media/avatar-rina.svg": "/static/media/avatar-rina.192558def33bb69031f26bd8897fc7f8.svg",
     "main.fde2f684.css.map": "/static/css/main.fde2f684.css.map",
-    "main.8368f93f.js.map": "/static/js/main.8368f93f.js.map",
+    "main.3caaf69b.js.map": "/static/js/main.3caaf69b.js.map",
     "453.64aababc.chunk.js.map": "/static/js/453.64aababc.chunk.js.map"
   },
   "entrypoints": [
     "static/css/main.fde2f684.css",
-    "static/js/main.8368f93f.js"
+    "static/js/main.3caaf69b.js"
   ]
 }
