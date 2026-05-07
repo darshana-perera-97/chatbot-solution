@@ -13,12 +13,26 @@ try {
   LocalAuth = null;
 }
 
-const authRoot = path.join(__dirname, "data", "whatsapp-auth");
+const dataRoot = path.join(__dirname, "data");
 
-function ensureAuthDir() {
+function resolveUserAuthRoot(workspaceUserId) {
+  const safeUserId = String(workspaceUserId || "").trim();
+  const userDir = path.join(dataRoot, safeUserId);
+  const authRoot = path.join(userDir, "whatsapp-auth");
   if (!fs.existsSync(authRoot)) {
     fs.mkdirSync(authRoot, { recursive: true });
   }
+  return authRoot;
+}
+
+function resolveUserWebCacheDir(workspaceUserId) {
+  const safeUserId = String(workspaceUserId || "").trim();
+  const userDir = path.join(dataRoot, safeUserId);
+  const cacheDir = path.join(userDir, ".wwebjs_cache");
+  if (!fs.existsSync(cacheDir)) {
+    fs.mkdirSync(cacheDir, { recursive: true });
+  }
+  return cacheDir;
 }
 
 function resolveChromeExecutablePath() {
@@ -248,6 +262,29 @@ function createWhatsAppBridge(deps) {
     }
   };
 
+  function removeAuthSession(workspaceUserId) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    if (!safe) return;
+    const authRoot = path.join(dataRoot, safe, "whatsapp-auth");
+    const cacheDir = path.join(dataRoot, safe, ".wwebjs_cache");
+    try {
+      if (fs.existsSync(authRoot)) {
+        fs.rmSync(authRoot, { recursive: true, force: true });
+        waLog(safe, "removed persisted auth session files");
+      }
+      if (fs.existsSync(cacheDir)) {
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+        waLog(safe, "removed persisted WhatsApp web cache files");
+      }
+    } catch (e) {
+      waLog(
+        safe,
+        "failed removing persisted auth session files",
+        e instanceof Error ? e.message : String(e)
+      );
+    }
+  }
+
   async function destroyClient(workspaceUserId) {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     if (!safe) return;
@@ -263,6 +300,26 @@ function createWhatsAppBridge(deps) {
     }
     slots.delete(safe);
     waLog(safe, "client session removed");
+  }
+
+  async function disconnectAndForget(workspaceUserId) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    if (!safe) return;
+    const entry = slots.get(safe);
+    if (entry?.client) {
+      try {
+        waLog(safe, "logging out linked WhatsApp Web device session");
+        await entry.client.logout();
+      } catch (e) {
+        waLog(
+          safe,
+          "logout call failed; continuing with local disconnect",
+          e instanceof Error ? e.message : String(e)
+        );
+      }
+    }
+    await destroyClient(safe);
+    removeAuthSession(safe);
   }
 
   function getStatus(workspaceUserId) {
@@ -327,7 +384,6 @@ function createWhatsAppBridge(deps) {
       waLog(safe, `linking already in progress (phase=${existingSlot.phase})`);
       return { ok: true, pending: true };
     }
-    ensureAuthDir();
     waLog(safe, "starting linking flow (initializing client)");
     await destroyClient(safe);
 
@@ -359,7 +415,9 @@ function createWhatsAppBridge(deps) {
       return { ok: false, error: entry.error };
     }
 
-    const localAuthClientId = `wa-${safe}`;
+    const authRoot = resolveUserAuthRoot(safe);
+    const webCachePath = resolveUserWebCacheDir(safe);
+    const localAuthClientId = "wa";
     const localAuthProfileDir = path.join(authRoot, `session-${localAuthClientId}`);
     releaseLinuxProfileDir(localAuthProfileDir);
 
@@ -371,6 +429,10 @@ function createWhatsAppBridge(deps) {
       takeoverOnConflict: true,
       takeoverTimeoutMs: 0,
       restartOnAuthFail: true,
+      webVersionCache: {
+        type: "local",
+        path: webCachePath,
+      },
       puppeteer: buildPuppeteerOptions(executablePath),
     });
 
@@ -524,6 +586,7 @@ function createWhatsAppBridge(deps) {
   return {
     startLinking,
     destroyClient,
+    disconnectAndForget,
     getStatus,
     sendText,
     jidToConversationId,

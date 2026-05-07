@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   LogOut,
   MessageSquare,
+  Package,
   Plug,
   Settings,
 } from "lucide-react";
@@ -23,6 +24,7 @@ const navItems = [
   { label: "Knowledgebase", path: "/knowledgebase", icon: BookOpen },
   { label: "Test Bot", path: "/test-bot", icon: Bot },
   { label: "Inquiries", path: "/inquiries", icon: Inbox },
+  { label: "Stock loads", path: "/stock-loads", icon: Package },
   { label: "Settings", path: "/settings", icon: Settings },
   { label: "Support", path: "/support", icon: CircleHelp },
 ];

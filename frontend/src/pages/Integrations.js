@@ -37,6 +37,7 @@ function Integrations() {
   const [copiedType, setCopiedType] = useState("");
   const [waStatus, setWaStatus] = useState(null);
   const [waModalError, setWaModalError] = useState("");
+  const [waRefreshing, setWaRefreshing] = useState(false);
 
   const embedScriptSrc = useMemo(() => {
     if (typeof window === "undefined") return "";
@@ -81,10 +82,44 @@ function Integrations() {
 
   const fetchWaStatus = async () => {
     if (!userId) return null;
-    const res = await fetch(apiUrl(`/integrations/whatsapp/status?userId=${encodeURIComponent(userId)}`));
+    const res = await fetch(apiUrl(`/integrations/whatsapp/status?userId=${encodeURIComponent(userId)}`), {
+      cache: "no-store",
+    });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.message || "Could not load WhatsApp status");
     return data;
+  };
+
+  const refreshOrRetryWhatsApp = async ({ openModal = false } = {}) => {
+    if (openModal) setShowWhatsAppConfig(true);
+    setWaModalError("");
+    if (!userId) {
+      setWaModalError("Sign in to connect WhatsApp.");
+      return;
+    }
+
+    setWaRefreshing(true);
+    try {
+      const st = await fetchWaStatus();
+      setWaStatus(st);
+
+      const phase = typeof st?.phase === "string" ? st.phase : "";
+      const shouldRetryStart = !["ready", "qr", "authenticated", "initializing"].includes(phase);
+      if (shouldRetryStart) {
+        const startRes = await fetch(apiUrl("/integrations/whatsapp/start"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId }),
+        });
+        const body = await startRes.json().catch(() => ({}));
+        if (!startRes.ok) throw new Error(body.message || "Could not start WhatsApp client");
+        setWaStatus(body);
+      }
+    } catch (e) {
+      setWaModalError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setWaRefreshing(false);
+    }
   };
 
   useEffect(() => {
@@ -126,30 +161,7 @@ function Integrations() {
   }, [showWhatsAppConfig, userId]);
 
   const openWhatsAppModal = async () => {
-    setShowWhatsAppConfig(true);
-    setWaModalError("");
-    if (!userId) {
-      setWaModalError("Sign in to connect WhatsApp.");
-      return;
-    }
-    try {
-      const st = await fetchWaStatus();
-      setWaStatus(st);
-      const phase = typeof st?.phase === "string" ? st.phase : "";
-      const busy = ["ready", "qr", "authenticated", "initializing"].includes(phase);
-      if (!busy) {
-        const startRes = await fetch(apiUrl("/integrations/whatsapp/start"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ userId }),
-        });
-        const body = await startRes.json().catch(() => ({}));
-        if (!startRes.ok) throw new Error(body.message || "Could not start WhatsApp client");
-        setWaStatus(body);
-      }
-    } catch (e) {
-      setWaModalError(e instanceof Error ? e.message : "Request failed");
-    }
+    await refreshOrRetryWhatsApp({ openModal: true });
   };
 
   const disconnectWhatsApp = async () => {
@@ -388,18 +400,21 @@ function Integrations() {
             <div className="mt-4 flex flex-wrap gap-2">
               <button
                 type="button"
-                onClick={() => void openWhatsAppModal()}
+                onClick={() => void refreshOrRetryWhatsApp()}
+                disabled={waRefreshing}
                 className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#A78BFA] px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-[#8B5CF6]/30 transition hover:opacity-95"
               >
-                Refresh / retry start
+                {waRefreshing ? "Refreshing..." : "Refresh"}
               </button>
-              <button
-                type="button"
-                onClick={() => void disconnectWhatsApp()}
-                className="rounded-xl border border-[#E9DFFF] bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-[#FCFAFF]"
-              >
-                Disconnect
-              </button>
+              {waConnected ? (
+                <button
+                  type="button"
+                  onClick={() => void disconnectWhatsApp()}
+                  className="rounded-xl border border-[#E9DFFF] bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-[#FCFAFF]"
+                >
+                  Disconnect
+                </button>
+              ) : null}
             </div>
           </div>
         </div>

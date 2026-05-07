@@ -1,6 +1,7 @@
 {
   "short_name": "AI Agent",
   "name": "AI Agent Workspace",
+  "description": "Build, test, and deploy your AI chatbot with knowledgebase, leads, web embed, and channel integrations.",
   "icons": [
     {
       "src": "favicon.ico",

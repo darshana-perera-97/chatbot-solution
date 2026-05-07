@@ -23,13 +23,15 @@ function isLocalBrowserHost() {
  */
 export function apiUrl(path) {
   const normalized = path.startsWith("/") ? path : `/${path}`;
-  const fromEnv = normalizeBase(process.env.REACT_APP_API_BASE_URL);
-  if (fromEnv) return `${fromEnv}${normalized}`;
+  // Prefer local backend while developing or when a built bundle
+  // is opened from localhost to avoid accidental remote API targets.
   if (process.env.NODE_ENV === "development") {
     return `${DEFAULT_LOCAL_API}${normalized}`;
   }
   if (isLocalBrowserHost()) {
     return `${DEFAULT_LOCAL_API}${normalized}`;
   }
+  const fromEnv = normalizeBase(process.env.REACT_APP_API_BASE_URL);
+  if (fromEnv) return `${fromEnv}${normalized}`;
   return normalized;
 }

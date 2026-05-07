@@ -74,7 +74,7 @@ function Login() {
 
   return (
     <LoginScreen
-      title="Welcome Back"
+      title="Welcome back"
       subtitle="Sign in with your workspace email (or username) and password to open your command center."
       identityLabel="Email or username"
       identityPlaceholder="admin or you@company.com"
@@ -92,7 +92,8 @@ function Login() {
       secondaryChild={
         <button
           type="button"
-          className="flex-1 rounded-full border border-[#ECE3FF] bg-white px-6 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-[#DDD6FE] hover:bg-[#FAFAFF]"
+          disabled
+          className="flex-1 rounded-xl border border-[#ECE3FF] bg-white px-6 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-[#DDD6FE] hover:bg-[#FAFAFF]"
         >
           Create Account
         </button>

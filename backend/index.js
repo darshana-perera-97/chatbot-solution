@@ -1,6 +1,7 @@
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const { randomUUID } = require("crypto");
 const dotenv = require("dotenv");
 const { createWhatsAppBridge } = require("./whatsappBridge");
 const whatsappAutoStart = require("./whatsappAutoStart");
@@ -24,13 +25,14 @@ const adminCorsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-const ACCOUNTS_PATH = path.join(__dirname, "data", "accounts.json");
+const DATA_DIR = path.join(__dirname, "data");
+const ACCOUNTS_PATH = path.join(DATA_DIR, "accounts.json");
 const METRICS_PATH = path.join(__dirname, "data", "metrics.json");
 const CHATS_PATH = path.join(__dirname, "data", "chats.json");
 const LEADS_PATH = path.join(__dirname, "data", "leads.json");
 const WIDGET_SETTINGS_PATH = path.join(__dirname, "data", "widgetSettings.json");
+const STOCK_LOADS_PATH = path.join(DATA_DIR, "stockLoads.json");
 const AGENT_DETAILS_PATH = path.join(__dirname, "data", "agentDetails.json");
-const AGENT_DETAILS_BY_USER_DIR = path.join(__dirname, "data", "agentDetailsUsers");
 const FRONTEND_BUILD_DIR = path.join(__dirname, "..", "frontend", "build");
 const FRONTEND_INDEX_PATH = path.join(FRONTEND_BUILD_DIR, "index.html");
 /** Previous location; copied into `data/` on first access if present. */
@@ -164,20 +166,53 @@ const writeAccounts = (accounts) => {
   fs.writeFileSync(ACCOUNTS_PATH, JSON.stringify(accounts, null, 2), "utf8");
 };
 
-const ensureChatsFile = () => {
-  const dir = path.dirname(CHATS_PATH);
+const createUniqueUserId = (existingAccounts) => {
+  const used = new Set(
+    (Array.isArray(existingAccounts) ? existingAccounts : []).map((entry) =>
+      String(entry?.id || "")
+    )
+  );
+
+  let id = "";
+  do {
+    if (typeof randomUUID === "function") {
+      id = `user_${randomUUID()}`;
+    } else {
+      id = `user_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    }
+  } while (used.has(id));
+
+  return id;
+};
+
+const resolveUserScopedPath = (userIdRaw, fileName, fallbackPath) => {
+  const safeUserId = sanitizeAgentDetailsUserId(
+    typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
+  );
+  if (!safeUserId) return fallbackPath;
+  const userDir = path.join(DATA_DIR, safeUserId);
+  if (!fs.existsSync(userDir)) {
+    fs.mkdirSync(userDir, { recursive: true });
+  }
+  return path.join(userDir, fileName);
+};
+
+const ensureChatsFile = (userIdRaw) => {
+  const targetPath = resolveUserScopedPath(userIdRaw, "chats.json", CHATS_PATH);
+  const dir = path.dirname(targetPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  if (!fs.existsSync(CHATS_PATH)) {
-    fs.writeFileSync(CHATS_PATH, JSON.stringify({ sessions: [] }, null, 2), "utf8");
+  if (!fs.existsSync(targetPath)) {
+    fs.writeFileSync(targetPath, JSON.stringify({ sessions: [] }, null, 2), "utf8");
   }
+  return targetPath;
 };
 
-const readChatsStore = () => {
-  ensureChatsFile();
+const readChatsStore = (userIdRaw) => {
+  const targetPath = ensureChatsFile(userIdRaw);
   try {
-    const raw = fs.readFileSync(CHATS_PATH, "utf8");
+    const raw = fs.readFileSync(targetPath, "utf8");
     const parsed = JSON.parse(raw || "{}");
     return {
       sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
@@ -187,28 +222,30 @@ const readChatsStore = () => {
   }
 };
 
-const writeChatsStore = (store) => {
-  ensureChatsFile();
+const writeChatsStore = (store, userIdRaw) => {
+  const targetPath = ensureChatsFile(userIdRaw);
   const payload = {
     sessions: Array.isArray(store?.sessions) ? store.sessions : [],
   };
-  fs.writeFileSync(CHATS_PATH, JSON.stringify(payload, null, 2), "utf8");
+  fs.writeFileSync(targetPath, JSON.stringify(payload, null, 2), "utf8");
 };
 
-const ensureLeadsFile = () => {
-  const dir = path.dirname(LEADS_PATH);
+const ensureLeadsFile = (userIdRaw) => {
+  const targetPath = resolveUserScopedPath(userIdRaw, "leads.json", LEADS_PATH);
+  const dir = path.dirname(targetPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  if (!fs.existsSync(LEADS_PATH)) {
-    fs.writeFileSync(LEADS_PATH, JSON.stringify({ leads: [] }, null, 2), "utf8");
+  if (!fs.existsSync(targetPath)) {
+    fs.writeFileSync(targetPath, JSON.stringify({ leads: [] }, null, 2), "utf8");
   }
+  return targetPath;
 };
 
-const readLeadsStore = () => {
-  ensureLeadsFile();
+const readLeadsStore = (userIdRaw) => {
+  const targetPath = ensureLeadsFile(userIdRaw);
   try {
-    const raw = fs.readFileSync(LEADS_PATH, "utf8");
+    const raw = fs.readFileSync(targetPath, "utf8");
     const parsed = JSON.parse(raw || "{}");
     return {
       leads: Array.isArray(parsed.leads) ? parsed.leads : [],
@@ -218,12 +255,12 @@ const readLeadsStore = () => {
   }
 };
 
-const writeLeadsStore = (store) => {
-  ensureLeadsFile();
+const writeLeadsStore = (store, userIdRaw) => {
+  const targetPath = ensureLeadsFile(userIdRaw);
   const payload = {
     leads: Array.isArray(store?.leads) ? store.leads : [],
   };
-  fs.writeFileSync(LEADS_PATH, JSON.stringify(payload, null, 2), "utf8");
+  fs.writeFileSync(targetPath, JSON.stringify(payload, null, 2), "utf8");
 };
 
 const getDefaultWidgetSettings = () => ({
@@ -243,35 +280,51 @@ const getDefaultWidgetSettings = () => ({
   updatedAt: null,
 });
 
-const ensureWidgetSettingsFile = () => {
-  const dir = path.dirname(WIDGET_SETTINGS_PATH);
+const ensureWidgetSettingsFile = (userIdRaw) => {
+  const targetPath = resolveUserScopedPath(
+    userIdRaw,
+    "widgetSettings.json",
+    WIDGET_SETTINGS_PATH
+  );
+  const dir = path.dirname(targetPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  if (!fs.existsSync(WIDGET_SETTINGS_PATH)) {
-    fs.writeFileSync(WIDGET_SETTINGS_PATH, JSON.stringify({ users: {} }, null, 2), "utf8");
+  if (!fs.existsSync(targetPath)) {
+    const payload = sanitizeAgentDetailsUserId(String(userIdRaw || ""))
+      ? getDefaultWidgetSettings()
+      : { users: {} };
+    fs.writeFileSync(targetPath, JSON.stringify(payload, null, 2), "utf8");
   }
+  return targetPath;
 };
 
-const readWidgetSettingsStore = () => {
-  ensureWidgetSettingsFile();
+const readWidgetSettingsStore = (userIdRaw) => {
+  const targetPath = ensureWidgetSettingsFile(userIdRaw);
   try {
-    const raw = fs.readFileSync(WIDGET_SETTINGS_PATH, "utf8");
+    const raw = fs.readFileSync(targetPath, "utf8");
     const parsed = JSON.parse(raw || "{}");
+    if (sanitizeAgentDetailsUserId(String(userIdRaw || ""))) {
+      return sanitizeWidgetSettings(parsed);
+    }
     return {
       users: parsed?.users && typeof parsed.users === "object" ? parsed.users : {},
     };
   } catch (error) {
-    return { users: {} };
+    return sanitizeAgentDetailsUserId(String(userIdRaw || ""))
+      ? getDefaultWidgetSettings()
+      : { users: {} };
   }
 };
 
-const writeWidgetSettingsStore = (store) => {
-  ensureWidgetSettingsFile();
-  const payload = {
-    users: store?.users && typeof store.users === "object" ? store.users : {},
-  };
-  fs.writeFileSync(WIDGET_SETTINGS_PATH, JSON.stringify(payload, null, 2), "utf8");
+const writeWidgetSettingsStore = (store, userIdRaw) => {
+  const targetPath = ensureWidgetSettingsFile(userIdRaw);
+  const payload = sanitizeAgentDetailsUserId(String(userIdRaw || ""))
+    ? sanitizeWidgetSettings(store)
+    : {
+        users: store?.users && typeof store.users === "object" ? store.users : {},
+      };
+  fs.writeFileSync(targetPath, JSON.stringify(payload, null, 2), "utf8");
 };
 
 const getDefaultAgentDetails = () => ({
@@ -381,8 +434,12 @@ const readWidgetSettings = (userIdRaw) => {
     typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
   );
   if (!safeUserId) return getDefaultWidgetSettings();
-  const store = readWidgetSettingsStore();
-  const raw = store.users?.[safeUserId];
+  const perUserPath = resolveUserScopedPath(safeUserId, "widgetSettings.json", WIDGET_SETTINGS_PATH);
+  if (fs.existsSync(perUserPath)) {
+    return { ...getDefaultWidgetSettings(), ...readWidgetSettingsStore(safeUserId) };
+  }
+  const legacy = readWidgetSettingsStore("");
+  const raw = legacy.users?.[safeUserId];
   return { ...getDefaultWidgetSettings(), ...sanitizeWidgetSettings(raw) };
 };
 
@@ -391,14 +448,105 @@ const writeWidgetSettings = (userIdRaw, settingsRaw) => {
     typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
   );
   if (!safeUserId) return null;
-  const store = readWidgetSettingsStore();
   const settings = {
     ...sanitizeWidgetSettings(settingsRaw),
     updatedAt: new Date().toISOString(),
   };
-  store.users[safeUserId] = settings;
-  writeWidgetSettingsStore(store);
+  writeWidgetSettingsStore(settings, safeUserId);
   return settings;
+};
+
+const clampStockLoadString = (value, maxLen) => {
+  const s = typeof value === "string" ? value.trim() : "";
+  return s.slice(0, maxLen);
+};
+
+const sanitizeStockLoadItems = (raw) => {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const cementItem = clampStockLoadString(entry.cementItem ?? entry.item ?? entry.label ?? "", 200);
+    const invoiceNumber = clampStockLoadString(entry.invoiceNumber ?? entry.invoice ?? "", 120);
+    const chequeNumber = clampStockLoadString(entry.chequeNumber ?? entry.cheque ?? "", 120);
+    let quantity = "";
+    if (entry.quantity != null && entry.quantity !== "") {
+      quantity = clampStockLoadString(String(entry.quantity), 40);
+    }
+    if (!cementItem) continue;
+    out.push({ cementItem, quantity, invoiceNumber, chequeNumber });
+  }
+  return out.slice(0, 80);
+};
+
+const sanitizeStockLoadRecord = (entry) => {
+  if (!entry || typeof entry !== "object") return null;
+  const id = clampStockLoadString(entry.id, 80);
+  const createdAt = clampStockLoadString(entry.createdAt, 40);
+  const reference = clampStockLoadString(entry.reference, 120);
+  const notes = clampStockLoadString(entry.notes, 2000);
+  const items = sanitizeStockLoadItems(entry.items);
+  if (!id || !createdAt || !items.length) return null;
+  return { id, createdAt, reference, notes, items };
+};
+
+const ensureStockLoadsFile = (userIdRaw) => {
+  const safeUserId = sanitizeAgentDetailsUserId(String(userIdRaw || ""));
+  if (!safeUserId) return "";
+  const targetPath = resolveUserScopedPath(safeUserId, "stockLoads.json", STOCK_LOADS_PATH);
+  const dir = path.dirname(targetPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  if (!fs.existsSync(targetPath)) {
+    fs.writeFileSync(targetPath, JSON.stringify({ loads: [] }, null, 2), "utf8");
+  }
+  return targetPath;
+};
+
+const readStockLoadsStore = (userIdRaw) => {
+  const safeUserId = sanitizeAgentDetailsUserId(String(userIdRaw || ""));
+  if (!safeUserId) return { loads: [] };
+  const targetPath = ensureStockLoadsFile(userIdRaw);
+  if (!targetPath) return { loads: [] };
+  try {
+    const raw = fs.readFileSync(targetPath, "utf8");
+    const parsed = JSON.parse(raw || "{}");
+    const loads = Array.isArray(parsed.loads) ? parsed.loads : [];
+    const sanitized = loads.map(sanitizeStockLoadRecord).filter(Boolean);
+    return { loads: sanitized };
+  } catch {
+    return { loads: [] };
+  }
+};
+
+const appendStockLoad = (userIdRaw, body) => {
+  const safeUserId = sanitizeAgentDetailsUserId(String(userIdRaw || ""));
+  if (!safeUserId) {
+    return { ok: false, statusCode: 400, message: "A valid userId is required" };
+  }
+  const items = sanitizeStockLoadItems(body?.items);
+  if (!items.length) {
+    return {
+      ok: false,
+      statusCode: 400,
+      message: "Add at least one cement item (description) per line.",
+    };
+  }
+  const reference = clampStockLoadString(body?.reference, 120);
+  const notes = clampStockLoadString(body?.notes, 2000);
+  const load = {
+    id: `sl_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    createdAt: new Date().toISOString(),
+    reference,
+    notes,
+    items,
+  };
+  const store = readStockLoadsStore(safeUserId);
+  const nextLoads = [load, ...store.loads].slice(0, 500);
+  const targetPath = ensureStockLoadsFile(safeUserId);
+  fs.writeFileSync(targetPath, JSON.stringify({ loads: nextLoads }, null, 2), "utf8");
+  return { ok: true, load };
 };
 
 const sanitizeSessionChatMessages = (raw) => {
@@ -456,7 +604,7 @@ const getLeadByConversation = (userIdRaw, conversationIdRaw) => {
     typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
   );
   if (!safeUserId || !safeConversationId) return null;
-  const store = readLeadsStore();
+  const store = readLeadsStore(safeUserId);
   const leads = Array.isArray(store.leads) ? store.leads : [];
   return (
     leads.find(
@@ -478,7 +626,7 @@ const upsertLeadByConversation = (userIdRaw, conversationIdRaw, fieldLabels, col
 
   const sanitizedCollected = sanitizeCollectedFields(fieldLabels, collectedFields);
   const nowIso = new Date().toISOString();
-  const store = readLeadsStore();
+  const store = readLeadsStore(safeUserId);
   const leads = Array.isArray(store.leads) ? store.leads : [];
   const idx = leads.findIndex(
     (lead) =>
@@ -504,7 +652,7 @@ const upsertLeadByConversation = (userIdRaw, conversationIdRaw, fieldLabels, col
     leads.unshift(payload);
   }
 
-  writeLeadsStore({ leads: leads.slice(0, 1000) });
+  writeLeadsStore({ leads: leads.slice(0, 1000) }, safeUserId);
   return payload;
 };
 
@@ -513,7 +661,7 @@ const getLeadsForUser = (userIdRaw) => {
     typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
   );
   if (!safeUserId) return [];
-  const store = readLeadsStore();
+  const store = readLeadsStore(safeUserId);
   const leads = Array.isArray(store.leads) ? store.leads : [];
   return leads
     .filter((lead) => String(lead.userId || "") === safeUserId)
@@ -674,7 +822,7 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
   const nowIso = new Date().toISOString();
   const conversation = sanitizeSessionChatMessages(messages);
 
-  const store = readChatsStore();
+  const store = readChatsStore(safeUserId);
   const sessions = Array.isArray(store.sessions) ? store.sessions : [];
   const existingIndex = sessions.findIndex(
     (session) =>
@@ -732,7 +880,7 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
     });
   }
 
-  writeChatsStore({ sessions: sessions.slice(0, 200) });
+  writeChatsStore({ sessions: sessions.slice(0, 200) }, safeUserId);
 };
 
 const getTestChatSessionsForUser = (userIdRaw) => {
@@ -740,7 +888,7 @@ const getTestChatSessionsForUser = (userIdRaw) => {
     typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
   );
   if (!safeUserId) return [];
-  const store = readChatsStore();
+  const store = readChatsStore(safeUserId);
   const sessions = Array.isArray(store.sessions) ? store.sessions : [];
   return sessions
     .filter((session) => String(session.userId || "") === safeUserId)
@@ -837,10 +985,7 @@ const resolveAgentDetailsPath = (userIdRaw) => {
     typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
   );
   if (safe) {
-    if (!fs.existsSync(AGENT_DETAILS_BY_USER_DIR)) {
-      fs.mkdirSync(AGENT_DETAILS_BY_USER_DIR, { recursive: true });
-    }
-    return path.join(AGENT_DETAILS_BY_USER_DIR, `${safe}.json`);
+    return resolveUserScopedPath(safe, "agentDetails.json", AGENT_DETAILS_PATH);
   }
   ensureAgentDetailsFile();
   return AGENT_DETAILS_PATH;
@@ -1074,14 +1219,20 @@ const sanitizeFieldsToCollect = (value) => {
 
 const migrateLegacyPerUserAgentDetails = (safeUserId, destPath) => {
   if (!safeUserId || fs.existsSync(destPath)) return;
-  const legacyPath = path.join(LEGACY_AGENT_DETAILS_BY_USER_DIR, `${safeUserId}.json`);
+  const legacyCandidates = [
+    path.join(LEGACY_AGENT_DETAILS_BY_USER_DIR, `${safeUserId}.json`),
+    path.join(__dirname, "data", "agentDetailsUsers", `${safeUserId}.json`),
+  ];
   try {
-    if (fs.existsSync(legacyPath)) {
-      const dir = path.dirname(destPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+    for (const legacyPath of legacyCandidates) {
+      if (fs.existsSync(legacyPath)) {
+        const dir = path.dirname(destPath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.copyFileSync(legacyPath, destPath);
+        break;
       }
-      fs.copyFileSync(legacyPath, destPath);
     }
   } catch (error) {
     /* ignore migration failures */
@@ -1636,6 +1787,7 @@ const server = http.createServer((req, res) => {
       reqPath === "/admin/metrics" ||
       reqPath === "/agent-details" ||
       reqPath === "/widget-settings" ||
+      reqPath === "/stock-loads" ||
       reqPath === "/leads" ||
       reqPath === "/chat/test" ||
       reqPath === "/chat/test/live-agent" ||
@@ -1815,6 +1967,13 @@ const server = http.createServer((req, res) => {
     return sendJson(res, 200, { settings }, adminCorsHeaders);
   }
 
+  if (req.method === "GET" && reqPath === "/stock-loads") {
+    const query = parseQuery(req);
+    const userId = typeof query.userId === "string" ? query.userId : "";
+    const store = readStockLoadsStore(userId);
+    return sendJson(res, 200, store, adminCorsHeaders);
+  }
+
   if (req.method === "GET" && reqPath === "/leads") {
     const query = parseQuery(req);
     const userId = typeof query.userId === "string" ? query.userId : "";
@@ -1832,6 +1991,22 @@ const server = http.createServer((req, res) => {
           return sendJson(res, 400, { message: "A valid userId is required" }, adminCorsHeaders);
         }
         return sendJson(res, 200, { message: "Widget settings saved", settings: saved }, adminCorsHeaders);
+      },
+      () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
+    );
+    return;
+  }
+
+  if (req.method === "POST" && reqPath === "/stock-loads") {
+    parseJsonBody(
+      req,
+      (parsedBody) => {
+        const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
+        const result = appendStockLoad(userId, parsedBody);
+        if (!result.ok) {
+          return sendJson(res, result.statusCode, { message: result.message }, adminCorsHeaders);
+        }
+        return sendJson(res, 200, { message: "Stock load saved", load: result.load }, adminCorsHeaders);
       },
       () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
     );
@@ -2048,7 +2223,7 @@ const server = http.createServer((req, res) => {
       (parsedBody) => {
         void (async () => {
           const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
-          await whatsappBridge.destroyClient(userId);
+          await whatsappBridge.disconnectAndForget(userId);
           whatsappAutoStart.removeUserId(userId);
           return sendJson(
             res,
@@ -2103,7 +2278,7 @@ const server = http.createServer((req, res) => {
         }
 
         const account = {
-          id: `${Date.now()}`,
+          id: createUniqueUserId(accounts),
           username,
           email,
           password,
@@ -2112,6 +2287,10 @@ const server = http.createServer((req, res) => {
           status,
           createdAt: new Date().toISOString(),
         };
+        const accountDataDir = path.join(DATA_DIR, account.id);
+        if (!fs.existsSync(accountDataDir)) {
+          fs.mkdirSync(accountDataDir, { recursive: true });
+        }
         const updated = [account, ...accounts];
         writeAccounts(updated);
         return sendJson(res, 201, { account, accounts: updated }, adminCorsHeaders);

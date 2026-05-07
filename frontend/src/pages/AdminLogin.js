@@ -86,7 +86,7 @@ function AdminLogin() {
           Admin
         </span>
       }
-      subtitle="Sign in with the administrator account from your server configuration. This route is not for workspace or team members."
+      subtitle="Sign in with the administrator account from your server configuration."
       showSubtitleBell={false}
       identityFieldIcon="user"
       identityLabel="Admin username"
@@ -106,7 +106,7 @@ function AdminLogin() {
       secondaryChild={
         <Link
           to="/login"
-          className="inline-flex flex-1 items-center justify-center rounded-full border border-[#ECE3FF] bg-white px-6 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-[#DDD6FE] hover:bg-[#FAFAFF]"
+          className="inline-flex flex-1 items-center justify-center rounded-xl border border-[#ECE3FF] bg-white px-6 py-3 text-sm font-semibold text-slate-700 no-underline shadow-sm transition hover:border-[#DDD6FE] hover:bg-[#FAFAFF]"
         >
           Open workspace login
         </Link>

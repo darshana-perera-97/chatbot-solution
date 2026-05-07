@@ -1,6 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import RequireAdmin from "./components/RequireAdmin";
 import RequireWorkspaceUser from "./components/RequireWorkspaceUser";
+import SeoHead from "./components/SeoHead";
 import AppLayout from "./layouts/AppLayout";
 import AdminHome from "./pages/AdminHome";
 import AdminLogin from "./pages/AdminLogin";
@@ -10,15 +11,19 @@ import EmbeddedChatbot from "./pages/EmbeddedChatbot";
 import Integrations from "./pages/Integrations";
 import Inquiries from "./pages/Inquiries";
 import Knowledgebase from "./pages/Knowledgebase";
+import LandingPage from "./pages/LandingPage";
 import Login from "./pages/Login";
 import Settings from "./pages/Settings";
+import StockLoads from "./pages/StockLoads";
 import Support from "./pages/Support";
 import TestBot from "./pages/TestBot";
 
 function App() {
   return (
     <BrowserRouter>
+      <SeoHead />
       <Routes>
+        <Route path="/" element={<LandingPage />} />
         <Route path="/login" element={<Login />} />
         <Route path="/embed/chatbot" element={<EmbeddedChatbot />} />
         <Route path="/admin/login" element={<AdminLogin />} />
@@ -37,7 +42,7 @@ function App() {
             </RequireWorkspaceUser>
           }
         >
-          <Route path="/" element={<Navigate replace to="/dashboard" />} />
+          <Route path="/app" element={<Navigate replace to="/dashboard" />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/chats" element={<Chats />} />
           <Route path="/integrations" element={<Integrations />} />
@@ -47,6 +52,7 @@ function App() {
             path="/inquiries"
             element={<Inquiries />}
           />
+          <Route path="/stock-loads" element={<StockLoads />} />
           <Route
             path="/settings"
             element={<Settings />}

@@ -2,9 +2,8 @@ const fs = require("fs");
 const path = require("path");
 
 const FILE_PATH = path.join(__dirname, "data", "whatsapp-autostart.json");
-/** Same root as `whatsappBridge` LocalAuth `dataPath` — folders `session-wa-<userId>`. */
-const WHATSAPP_AUTH_ROOT = path.join(__dirname, "data", "whatsapp-auth");
-const SESSION_FOLDER_PREFIX = "session-wa-";
+const DATA_ROOT = path.join(__dirname, "data");
+const SESSION_FOLDER_NAME = "session-wa";
 
 function ensureDir() {
   const dir = path.dirname(FILE_PATH);
@@ -52,12 +51,12 @@ function removeUserId(userId) {
 function discoverUserIdsFromSessionFolders() {
   const found = [];
   try {
-    if (!fs.existsSync(WHATSAPP_AUTH_ROOT)) return found;
-    for (const ent of fs.readdirSync(WHATSAPP_AUTH_ROOT, { withFileTypes: true })) {
+    if (!fs.existsSync(DATA_ROOT)) return found;
+    for (const ent of fs.readdirSync(DATA_ROOT, { withFileTypes: true })) {
       if (!ent.isDirectory()) continue;
-      const name = ent.name;
-      if (!name.startsWith(SESSION_FOLDER_PREFIX)) continue;
-      const uid = name.slice(SESSION_FOLDER_PREFIX.length);
+      const uid = ent.name;
+      const authSessionPath = path.join(DATA_ROOT, uid, "whatsapp-auth", SESSION_FOLDER_NAME);
+      if (!fs.existsSync(authSessionPath)) continue;
       if (uid && /^[a-zA-Z0-9_-]+$/.test(uid) && uid.length <= 64) found.push(uid);
     }
   } catch {

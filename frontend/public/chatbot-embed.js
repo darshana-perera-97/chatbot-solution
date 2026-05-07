@@ -23,12 +23,14 @@
   var previewModeAttr = (script.getAttribute("data-preview-mode") || "").trim().toLowerCase();
   var previewMode = previewModeAttr === "1" || previewModeAttr === "true" || previewModeAttr === "yes";
   var previewThemeRaw = "";
+  var initialThemeRaw = "";
   var previewLauncherImage = "";
   try {
     previewThemeRaw = decodeURIComponent(previewThemeAttr || "");
   } catch (e) {
     previewThemeRaw = "";
   }
+  initialThemeRaw = previewThemeRaw;
   try {
     previewLauncherImage = decodeURIComponent(previewLauncherImageAttr || "");
   } catch (e) {
@@ -36,11 +38,13 @@
   }
 
   var srcBase = script.src.replace(/\/chatbot-embed\.js(\?.*)?$/, "/embed/chatbot");
-  var iframeParams = [];
-  if (userId) iframeParams.push("userId=" + encodeURIComponent(userId));
-  if (previewThemeRaw) iframeParams.push("previewTheme=" + encodeURIComponent(previewThemeRaw));
-  if (previewMode) iframeParams.push("previewMode=1");
-  var iframeSrc = srcBase + (iframeParams.length ? "?" + iframeParams.join("&") : "");
+  function buildIframeSrc(themeRaw) {
+    var iframeParams = [];
+    if (userId) iframeParams.push("userId=" + encodeURIComponent(userId));
+    if (themeRaw) iframeParams.push("previewTheme=" + encodeURIComponent(themeRaw));
+    if (previewMode) iframeParams.push("previewMode=1");
+    return srcBase + (iframeParams.length ? "?" + iframeParams.join("&") : "");
+  }
   var parsedScriptUrl = null;
   try {
     parsedScriptUrl = new URL(script.src, window.location.href);
@@ -87,7 +91,7 @@
 
   var frame = document.createElement("iframe");
   frame.id = "nexgen-chatbot-embed-frame";
-  frame.src = iframeSrc;
+  frame.src = "about:blank";
   frame.title = "NexGenAI Chatbot";
   frame.loading = "lazy";
   frame.allow = "clipboard-write";
@@ -166,7 +170,38 @@
   window.addEventListener("resize", applyResponsiveSize);
   window.addEventListener("orientationchange", applyResponsiveSize);
 
-  if (userId && !previewLauncherImage) {
+  function applyLauncherImage(imageValue) {
+    if (!imageValue || !/^data:image\//i.test(imageValue)) return;
+    launcher.style.backgroundImage = "url(\"" + imageValue.replace(/"/g, '\\"') + "\")";
+    launcher.style.backgroundColor = "transparent";
+    launcher.textContent = "";
+    launcher.dataset.hasImage = "1";
+  }
+
+  function buildThemePayload(settings) {
+    if (!settings || typeof settings !== "object") return "";
+    var theme = {
+      headerColor: settings.headerColor,
+      senderMessageBgColor: settings.senderMessageBgColor,
+      senderMessageTextColor: settings.senderMessageTextColor,
+      receiverMessageBgColor: settings.receiverMessageBgColor,
+      receiverMessageTextColor: settings.receiverMessageTextColor,
+      sendButtonColor: settings.sendButtonColor,
+      backgroundColor: settings.backgroundColor,
+      textColor: settings.textColor
+    };
+    try {
+      return JSON.stringify(theme);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function initializeFrameSource() {
+    if (!userId || previewMode || initialThemeRaw) {
+      frame.src = buildIframeSrc(initialThemeRaw);
+      return;
+    }
     var settingsUrl =
       resolveApiBase() +
       "/widget-settings" +
@@ -182,20 +217,23 @@
         });
       })
       .then(function (payload) {
-        var image = payload && payload.settings && typeof payload.settings.launcherImage === "string"
-          ? payload.settings.launcherImage.trim()
-          : "";
-        if (!image || !/^data:image\//i.test(image)) return;
-        launcher.style.backgroundImage = "url(\"" + image.replace(/"/g, '\\"') + "\")";
-        launcher.style.backgroundColor = "transparent";
-        launcher.textContent = "";
-        launcher.dataset.hasImage = "1";
+        var settings = payload && payload.settings && typeof payload.settings === "object" ? payload.settings : null;
+        if (settings && !initialThemeRaw) {
+          initialThemeRaw = buildThemePayload(settings);
+        }
+        if (!previewLauncherImage && settings && typeof settings.launcherImage === "string") {
+          applyLauncherImage(settings.launcherImage.trim());
+        }
       })
       .catch(function () {
         /* no-op */
+      })
+      .finally(function () {
+        frame.src = buildIframeSrc(initialThemeRaw);
       });
   }
 
   document.body.appendChild(frame);
   document.body.appendChild(launcher);
+  initializeFrameSource();
 })();
