@@ -39,7 +39,10 @@ function resolveChromeExecutablePath() {
   const fromEnv =
     (typeof process.env.PUPPETEER_EXECUTABLE_PATH === "string" &&
       process.env.PUPPETEER_EXECUTABLE_PATH.trim()) ||
+    (typeof process.env.PUPPETEER_EXECUTABLE === "string" &&
+      process.env.PUPPETEER_EXECUTABLE.trim()) ||
     (typeof process.env.CHROME_BIN === "string" && process.env.CHROME_BIN.trim()) ||
+    (typeof process.env.CHROMIUM_PATH === "string" && process.env.CHROMIUM_PATH.trim()) ||
     "";
   if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
   if (fromEnv) return "";
@@ -70,6 +73,31 @@ function resolveChromeExecutablePath() {
 
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
+  }
+
+  // Linux distributions often expose browser binaries only on PATH.
+  if (process.platform === "linux") {
+    const pathCandidates = [
+      "google-chrome-stable",
+      "google-chrome",
+      "chromium-browser",
+      "chromium",
+      "chrome",
+    ];
+    for (const cmd of pathCandidates) {
+      try {
+        const resolved = execSync(`command -v ${cmd}`, {
+          stdio: ["ignore", "pipe", "ignore"],
+          encoding: "utf8",
+        })
+          .trim()
+          .split("\n")
+          .pop();
+        if (resolved && fs.existsSync(resolved)) return resolved;
+      } catch {
+        /* command not found */
+      }
+    }
   }
 
   // Last fallback: Puppeteer's own downloaded browser (if present).
@@ -401,18 +429,10 @@ function createWhatsAppBridge(deps) {
     if (!executablePath) {
       waLog(
         safe,
-        "no browser executable detected (set PUPPETEER_EXECUTABLE_PATH for your server environment)"
+        "no explicit browser executable detected; trying Puppeteer default browser resolution"
       );
     } else {
       waLog(safe, `using browser executable: ${executablePath}`);
-    }
-    if (!executablePath) {
-      entry.phase = "error";
-      entry.error =
-        "No Chrome/Chromium executable detected for WhatsApp Web. " +
-        "Set PUPPETEER_EXECUTABLE_PATH (or CHROME_BIN) to your browser binary path.";
-      waLog(safe, "initialize skipped", entry.error);
-      return { ok: false, error: entry.error };
     }
 
     const authRoot = resolveUserAuthRoot(safe);
