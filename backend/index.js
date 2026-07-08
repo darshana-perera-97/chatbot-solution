@@ -5,6 +5,13 @@ const { randomUUID } = require("crypto");
 const dotenv = require("dotenv");
 const { createWhatsAppBridge } = require("./whatsappBridge");
 const whatsappAutoStart = require("./whatsappAutoStart");
+const {
+  ALLOWED_PLANS,
+  PLAN_TRIAL_DAYS,
+  normalizePlan,
+  getWhatsAppAccountLimit,
+  sanitizeWhatsAppAccountId,
+} = require("./planConfig");
 
 // Load `backend/.env` even when Node is started from the repo root (dotenv default is cwd-only).
 dotenv.config({ path: path.join(__dirname, ".env") });
@@ -38,12 +45,7 @@ const FRONTEND_INDEX_PATH = path.join(FRONTEND_BUILD_DIR, "index.html");
 /** Previous location; copied into `data/` on first access if present. */
 const LEGACY_AGENT_DETAILS_PATH = path.join(__dirname, "dta", "agentDetails.json");
 const LEGACY_AGENT_DETAILS_BY_USER_DIR = path.join(__dirname, "dta", "agentDetails");
-const ALLOWED_PLANS = new Set(["Test", "Trial", "Basic", "Pro"]);
 const ALLOWED_STATUS = new Set(["Active", "Inactive"]);
-const PLAN_TRIAL_DAYS = {
-  Test: 7,
-  Trial: 30,
-};
 
 const adminAuthConfigured = () =>
   typeof ADMIN_USERNAME === "string" &&
@@ -798,11 +800,50 @@ const sanitizeWhatsappChatId = (raw) => {
   return raw.trim().slice(0, 120);
 };
 
+const sanitizeWhatsappPeerPhone = (raw) => {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim().slice(0, 40);
+  if (!trimmed) return "";
+  const digits = trimmed.replace(/\D/g, "");
+  if (digits.length < 7 || digits.length > 18) return "";
+  return `+${digits}`;
+};
+
 const resolveSessionWhatsappChatId = (existingSession, options) => {
   if (options && options.whatsappChatId !== undefined) return sanitizeWhatsappChatId(options.whatsappChatId);
   if (existingSession && typeof existingSession.whatsappChatId === "string")
     return sanitizeWhatsappChatId(existingSession.whatsappChatId);
   return "";
+};
+
+const resolveSessionWhatsappPeerPhone = (existingSession, options) => {
+  if (options && options.whatsappPeerPhone !== undefined) {
+    const next = sanitizeWhatsappPeerPhone(options.whatsappPeerPhone);
+    if (next) return next;
+  }
+  if (existingSession && typeof existingSession.whatsappPeerPhone === "string") {
+    return sanitizeWhatsappPeerPhone(existingSession.whatsappPeerPhone);
+  }
+  return "";
+};
+
+const resolveSessionWhatsappAccountId = (existingSession, options) => {
+  if (options && options.whatsappAccountId !== undefined) {
+    return sanitizeWhatsAppAccountId(options.whatsappAccountId) || "1";
+  }
+  if (existingSession && typeof existingSession.whatsappAccountId === "string") {
+    return sanitizeWhatsAppAccountId(existingSession.whatsappAccountId) || "1";
+  }
+  return "1";
+};
+
+const getWorkspacePlanContext = (userIdRaw) => {
+  const userId = typeof userIdRaw === "string" ? userIdRaw.trim() : "";
+  const accounts = readAccounts();
+  const account = accounts.find((entry) => String(entry.id || "").trim() === userId);
+  const plan = account ? normalizePlan(account.plan) : "";
+  const limit = Math.max(1, getWhatsAppAccountLimit(plan) || 1);
+  return { plan, limit, account };
 };
 
 const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {}) => {
@@ -842,6 +883,8 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
   const chatSource = resolveSessionChatSource(prevSession, options);
   const channelAccountName = resolveSessionChannelAccountName(prevSession, options);
   const whatsappChatId = resolveSessionWhatsappChatId(prevSession, options);
+  const whatsappPeerPhone = resolveSessionWhatsappPeerPhone(prevSession, options);
+  const whatsappAccountId = resolveSessionWhatsappAccountId(prevSession, options);
 
   if (existingIndex >= 0) {
     sessions[existingIndex] = {
@@ -852,6 +895,8 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
       chatSource,
       channelAccountName,
       whatsappChatId,
+      whatsappPeerPhone,
+      whatsappAccountId,
       messages: conversation,
       messageCount: conversation.length,
       liveAgentEnabled: Boolean(
@@ -871,6 +916,8 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
       chatSource,
       channelAccountName,
       whatsappChatId,
+      whatsappPeerPhone,
+      whatsappAccountId,
       messages: conversation,
       messageCount: conversation.length,
       liveAgentEnabled: Boolean(options.liveAgentEnabled),
@@ -881,6 +928,34 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
   }
 
   writeChatsStore({ sessions: sessions.slice(0, 200) }, safeUserId);
+};
+
+const patchTestChatSessionPeerPhone = (userIdRaw, conversationIdRaw, phoneRaw) => {
+  const safeUserId = sanitizeAgentDetailsUserId(
+    typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
+  );
+  const safeConversationId = sanitizeConversationId(
+    typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
+  );
+  const phone = sanitizeWhatsappPeerPhone(phoneRaw);
+  if (!safeUserId || !safeConversationId || !phone) return null;
+
+  const store = readChatsStore(safeUserId);
+  const sessions = Array.isArray(store.sessions) ? store.sessions : [];
+  const index = sessions.findIndex(
+    (session) =>
+      String(session.userId || "") === safeUserId &&
+      String(session.conversationId || "") === safeConversationId
+  );
+  if (index < 0) return null;
+
+  sessions[index] = {
+    ...sessions[index],
+    whatsappPeerPhone: phone,
+    updatedAt: new Date().toISOString(),
+  };
+  writeChatsStore({ sessions: sessions.slice(0, 200) }, safeUserId);
+  return getTestChatSessionByConversation(safeUserId, safeConversationId);
 };
 
 const getTestChatSessionsForUser = (userIdRaw) => {
@@ -905,6 +980,14 @@ const getTestChatSessionsForUser = (userIdRaw) => {
         channelAccountName: sanitizeChannelAccountName(session.channelAccountName),
         whatsappChatId:
           typeof session.whatsappChatId === "string" ? sanitizeWhatsappChatId(session.whatsappChatId) : "",
+        whatsappPeerPhone:
+          typeof session.whatsappPeerPhone === "string"
+            ? sanitizeWhatsappPeerPhone(session.whatsappPeerPhone)
+            : "",
+        whatsappAccountId:
+          typeof session.whatsappAccountId === "string"
+            ? sanitizeWhatsAppAccountId(session.whatsappAccountId) || "1"
+            : "1",
         messages: sanitizeSessionChatMessages(session.messages),
         messageCount: Number(session.messageCount) || 0,
         liveAgentEnabled: Boolean(session.liveAgentEnabled),
@@ -1509,6 +1592,8 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
     chatSource: parsedBody.chatSource,
     channelAccountName: parsedBody.channelAccountName,
     whatsappChatId: parsedBody.whatsappChatId,
+    whatsappPeerPhone: parsedBody.whatsappPeerPhone,
+    whatsappAccountId: parsedBody.whatsappAccountId,
   };
 
   let cleaned = [];
@@ -1646,6 +1731,23 @@ const whatsappBridge = createWhatsAppBridge({
   sanitizeChatMessages,
 });
 
+const enrichWhatsappSessionPeerPhones = async (userIdRaw, sessions) => {
+  const safeUserId = sanitizeAgentDetailsUserId(
+    typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
+  );
+  if (!safeUserId || !Array.isArray(sessions) || !sessions.length) return sessions;
+
+  for (const session of sessions) {
+    if (sanitizeChatSource(session.chatSource) !== "whatsapp") continue;
+    if (session.whatsappPeerPhone) continue;
+    const phone = await whatsappBridge.resolvePeerPhoneForSession(safeUserId, session);
+    if (!phone) continue;
+    session.whatsappPeerPhone = phone;
+    patchTestChatSessionPeerPhone(safeUserId, session.conversationId, phone);
+  }
+  return sessions;
+};
+
 const readMetrics = () => {
   const defaults = {
     aiAgentsLive: 0,
@@ -1708,16 +1810,6 @@ const getAccountIdFromPath = (reqPath) => {
   return decodeURIComponent(reqPath.slice(prefix.length)).trim();
 };
 
-const normalizePlan = (plan) => {
-  if (typeof plan !== "string") return "";
-  const cleaned = plan.trim().toLowerCase();
-  if (cleaned === "test") return "Test";
-  if (cleaned === "trial") return "Trial";
-  if (cleaned === "basic") return "Basic";
-  if (cleaned === "pro") return "Pro";
-  return "";
-};
-
 const evaluatePlanAccess = (account) => {
   const normalizedPlan = normalizePlan(account.plan);
   if (!normalizedPlan) {
@@ -1731,7 +1823,7 @@ const evaluatePlanAccess = (account) => {
     };
   }
 
-  if (normalizedPlan === "Basic" || normalizedPlan === "Pro") {
+  if (normalizedPlan === "Basic" || normalizedPlan === "Intermediate" || normalizedPlan === "Pro") {
     return {
       ok: true,
       chatbotEnabled: true,
@@ -2113,8 +2205,12 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && reqPath === "/chat/test/sessions") {
     const query = parseQuery(req);
     const userId = typeof query.userId === "string" ? query.userId : "";
-    const sessions = getTestChatSessionsForUser(userId);
-    return sendJson(res, 200, { sessions }, adminCorsHeaders);
+    void (async () => {
+      const sessions = getTestChatSessionsForUser(userId);
+      const enriched = await enrichWhatsappSessionPeerPhones(userId, sessions);
+      return sendJson(res, 200, { sessions: enriched }, adminCorsHeaders);
+    })();
+    return;
   }
 
   if (req.method === "GET" && reqPath === "/chat/test/session") {
@@ -2172,7 +2268,11 @@ const server = http.createServer((req, res) => {
           const waPeer =
             typeof session.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
           if (sanitizeChatSource(session.chatSource) === "whatsapp" && waPeer) {
-            await whatsappBridge.sendText(userId, waPeer, message);
+            const waAccountId =
+              typeof session.whatsappAccountId === "string"
+                ? sanitizeWhatsAppAccountId(session.whatsappAccountId) || "1"
+                : "1";
+            await whatsappBridge.sendText(userId, waAccountId, waPeer, message);
           }
           return sendJson(res, 200, { session }, adminCorsHeaders);
         })();
@@ -2185,8 +2285,9 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && reqPath === "/integrations/whatsapp/status") {
     const query = parseQuery(req);
     const userId = typeof query.userId === "string" ? query.userId : "";
-    const status = whatsappBridge.getStatus(userId);
-    return sendJson(res, 200, status, adminCorsHeaders);
+    const { plan, limit } = getWorkspacePlanContext(userId);
+    const status = whatsappBridge.getStatus(userId, limit);
+    return sendJson(res, 200, { ...status, plan }, adminCorsHeaders);
   }
 
   if (req.method === "POST" && reqPath === "/integrations/whatsapp/start") {
@@ -2199,11 +2300,29 @@ const server = http.createServer((req, res) => {
             if (!sanitizeAgentDetailsUserId(userId)) {
               return sendJson(res, 400, { message: "Valid userId is required" }, adminCorsHeaders);
             }
-            await whatsappBridge.startLinking(userId);
+            const { plan, limit } = getWorkspacePlanContext(userId);
+            const accountId = sanitizeWhatsAppAccountId(parsedBody.accountId, limit) || "1";
+            if (Number(accountId) > limit) {
+              return sendJson(
+                res,
+                403,
+                {
+                  message: `Your ${plan || "current"} plan allows up to ${limit} WhatsApp account(s).`,
+                  plan,
+                  limit,
+                },
+                adminCorsHeaders
+              );
+            }
+            await whatsappBridge.startLinking(userId, accountId);
             return sendJson(
               res,
               200,
-              { message: "WhatsApp client started", ...whatsappBridge.getStatus(userId) },
+              {
+                message: "WhatsApp client started",
+                ...whatsappBridge.getStatus(userId, limit),
+                plan,
+              },
               adminCorsHeaders
             );
           } catch (err) {
@@ -2223,12 +2342,17 @@ const server = http.createServer((req, res) => {
       (parsedBody) => {
         void (async () => {
           const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
-          await whatsappBridge.disconnectAndForget(userId);
-          whatsappAutoStart.removeUserId(userId);
+          const { plan, limit } = getWorkspacePlanContext(userId);
+          const accountId = sanitizeWhatsAppAccountId(parsedBody.accountId, limit) || "1";
+          await whatsappBridge.disconnectAndForget(userId, accountId);
           return sendJson(
             res,
             200,
-            { message: "Disconnected", ...whatsappBridge.getStatus(userId) },
+            {
+              message: "Disconnected",
+              ...whatsappBridge.getStatus(userId, limit),
+              plan,
+            },
             adminCorsHeaders
           );
         })();
@@ -2397,20 +2521,22 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  const restartIds = whatsappAutoStart.readRestoreUserIds();
-  if (restartIds.length === 0) return;
+  const restartLinks = whatsappAutoStart.readRestoreLinks();
+  if (restartLinks.length === 0) return;
   console.log(
-    `[whatsapp] auto-connect: initializing ${restartIds.length} WhatsApp client(s) (saved sessions + disk)…`
+    `[whatsapp] auto-connect: initializing ${restartLinks.length} WhatsApp client(s) (saved sessions + disk)…`
   );
   void (async () => {
-    for (const uid of restartIds) {
+    for (const link of restartLinks) {
+      const uid = String(link.userId || "").trim();
+      const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
       if (!sanitizeAgentDetailsUserId(uid)) continue;
       try {
-        await whatsappBridge.startLinking(uid);
+        await whatsappBridge.startLinking(uid, accountId);
       } catch (e) {
         console.warn(
           "[whatsapp] auto-connect failed:",
-          uid,
+          `${uid}::${accountId}`,
           e instanceof Error ? e.message : String(e)
         );
       }

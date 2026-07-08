@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, Globe, MessageCircle, X } from "lucide-react";
+import { ArrowRight, Globe, MessageCircle, Plus, X } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
+import { getWhatsAppAccountLimit, normalizePlan } from "../planConfig";
 
 /** Channel integrations — extend this list as you add more. */
 const integrationCards = [
@@ -19,7 +20,7 @@ const integrationCards = [
   {
     id: "whatsapp",
     name: "WhatsApp",
-    description: "Link WhatsApp Web to this workspace: same AI replies as the web widget, chats show under Chats.",
+    description: "Link one or more WhatsApp numbers to this workspace. Limits depend on your plan.",
     status: "available",
     statusLabel: "Not connected",
     icon: MessageCircle,
@@ -29,15 +30,68 @@ const integrationCards = [
   },
 ];
 
+function accountLabel(account) {
+  if (!account) return "";
+  const parts = [account.pushname, account.phone].filter(Boolean);
+  return parts.length ? parts.join(" · ") : account.label || `Account ${account.accountId}`;
+}
+
+function WhatsAppAccountAvatar({ account, size = "lg" }) {
+  const sizeClass = size === "sm" ? "h-10 w-10" : "h-20 w-20";
+  const iconSize = size === "sm" ? 18 : 32;
+  const pic = typeof account?.profilePicDataUrl === "string" ? account.profilePicDataUrl : "";
+  if (pic) {
+    return (
+      <img
+        src={pic}
+        alt={accountLabel(account)}
+        className={`${sizeClass} rounded-full border-2 border-white object-cover shadow-md ring-2 ring-[#E9DFFF]`}
+      />
+    );
+  }
+  return (
+    <div
+      className={`flex ${sizeClass} items-center justify-center rounded-full bg-emerald-100 text-emerald-700 ring-2 ring-[#E9DFFF]`}
+    >
+      <MessageCircle size={iconSize} />
+    </div>
+  );
+}
+
 function Integrations() {
   const profile = getWorkspaceUserProfile();
   const userId = profile?.id ? String(profile.id).trim() : "";
+  const userPlan = normalizePlan(profile?.plan || "");
+  const planLimit = getWhatsAppAccountLimit(userPlan || profile?.plan);
   const [showWebConfig, setShowWebConfig] = useState(false);
   const [showWhatsAppConfig, setShowWhatsAppConfig] = useState(false);
+  const [activeAccountId, setActiveAccountId] = useState("1");
   const [copiedType, setCopiedType] = useState("");
   const [waStatus, setWaStatus] = useState(null);
   const [waModalError, setWaModalError] = useState("");
   const [waRefreshing, setWaRefreshing] = useState(false);
+
+  const waAccounts = useMemo(() => {
+    if (Array.isArray(waStatus?.accounts) && waStatus.accounts.length) return waStatus.accounts;
+    const fallbackLimit = Number(waStatus?.limit) || planLimit;
+    return Array.from({ length: fallbackLimit }, (_, index) => ({
+      accountId: String(index + 1),
+      label: `Account ${index + 1}`,
+      phase: "idle",
+      connected: false,
+      qrDataUrl: "",
+      error: "",
+      pushname: "",
+      phone: "",
+    }));
+  }, [waStatus, planLimit]);
+
+  const waLimit = Number(waStatus?.limit) || planLimit;
+  const waConnectedCount =
+    Number(waStatus?.connectedCount) ||
+    waAccounts.filter((account) => account.connected || account.phase === "ready").length;
+  const activeAccount =
+    waAccounts.find((account) => account.accountId === activeAccountId) || waAccounts[0] || null;
 
   const embedScriptSrc = useMemo(() => {
     if (typeof window === "undefined") return "";
@@ -90,8 +144,9 @@ function Integrations() {
     return data;
   };
 
-  const refreshOrRetryWhatsApp = async ({ openModal = false } = {}) => {
+  const refreshOrRetryWhatsApp = async ({ openModal = false, accountId = activeAccountId } = {}) => {
     if (openModal) setShowWhatsAppConfig(true);
+    if (accountId) setActiveAccountId(String(accountId));
     setWaModalError("");
     if (!userId) {
       setWaModalError("Sign in to connect WhatsApp.");
@@ -103,18 +158,46 @@ function Integrations() {
       const st = await fetchWaStatus();
       setWaStatus(st);
 
-      const phase = typeof st?.phase === "string" ? st.phase : "";
+      const accounts = Array.isArray(st?.accounts) ? st.accounts : [];
+      const target =
+        accounts.find((account) => account.accountId === String(accountId)) ||
+        accounts.find((account) => !account.connected) ||
+        accounts[0];
+      const targetId = target?.accountId || String(accountId || "1");
+      const phase = typeof target?.phase === "string" ? target.phase : "";
       const shouldRetryStart = !["ready", "qr", "authenticated", "initializing"].includes(phase);
       if (shouldRetryStart) {
         const startRes = await fetch(apiUrl("/integrations/whatsapp/start"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ userId }),
+          body: JSON.stringify({ userId, accountId: targetId }),
         });
         const body = await startRes.json().catch(() => ({}));
         if (!startRes.ok) throw new Error(body.message || "Could not start WhatsApp client");
         setWaStatus(body);
+        setActiveAccountId(targetId);
       }
+    } catch (e) {
+      setWaModalError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setWaRefreshing(false);
+    }
+  };
+
+  const startAccountLinking = async (accountId) => {
+    if (!userId) return;
+    setActiveAccountId(String(accountId));
+    setWaModalError("");
+    setWaRefreshing(true);
+    try {
+      const startRes = await fetch(apiUrl("/integrations/whatsapp/start"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, accountId: String(accountId) }),
+      });
+      const body = await startRes.json().catch(() => ({}));
+      if (!startRes.ok) throw new Error(body.message || "Could not start WhatsApp client");
+      setWaStatus(body);
     } catch (e) {
       setWaModalError(e instanceof Error ? e.message : "Request failed");
     } finally {
@@ -161,17 +244,19 @@ function Integrations() {
   }, [showWhatsAppConfig, userId]);
 
   const openWhatsAppModal = async () => {
-    await refreshOrRetryWhatsApp({ openModal: true });
+    const firstOpenSlot =
+      waAccounts.find((account) => !account.connected && account.phase !== "ready")?.accountId || "1";
+    await refreshOrRetryWhatsApp({ openModal: true, accountId: firstOpenSlot });
   };
 
-  const disconnectWhatsApp = async () => {
+  const disconnectWhatsApp = async (accountId = activeAccountId) => {
     if (!userId) return;
     setWaModalError("");
     try {
       const res = await fetch(apiUrl("/integrations/whatsapp/disconnect"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId }),
+        body: JSON.stringify({ userId, accountId: String(accountId) }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.message || "Disconnect failed");
@@ -181,10 +266,10 @@ function Integrations() {
     }
   };
 
-  const waConnected = Boolean(waStatus?.connected || waStatus?.phase === "ready");
-  const waPhase = typeof waStatus?.phase === "string" ? waStatus.phase : "";
-  const waConnectedAccountLabel =
-    [waStatus?.pushname, waStatus?.phone].filter(Boolean).join(" · ") || "Connected";
+  const waConnected = waConnectedCount > 0;
+  const activeConnected = Boolean(activeAccount?.connected || activeAccount?.phase === "ready");
+  const activePhase = typeof activeAccount?.phase === "string" ? activeAccount.phase : "";
+  const activeAccountLabel = accountLabel(activeAccount) || "Connected";
 
   return (
     <>
@@ -205,7 +290,7 @@ function Integrations() {
             const isConnected = isWeb ? item.status === "connected" : waConnected;
             const statusLabel = isWa
               ? waConnected
-                ? "Connected"
+                ? `${waConnectedCount} connected`
                 : "Not connected"
               : item.statusLabel;
             return (
@@ -232,10 +317,27 @@ function Integrations() {
 
                 <h2 className="mt-4 text-lg font-semibold text-slate-900">{item.name}</h2>
                 <p className="mt-2 flex-1 text-sm leading-relaxed text-slate-500">{item.description}</p>
-                {isWa && waConnected ? (
-                  <p className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800">
-                    Connected account: {waConnectedAccountLabel}
-                  </p>
+                {isWa ? (
+                  <div className="mt-2 space-y-1.5">
+                    <p className="rounded-lg border border-[#EEE8FF] bg-[#FCFAFF] px-2.5 py-1.5 text-xs text-slate-600">
+                      Plan: <span className="font-semibold text-slate-800">{userPlan || "—"}</span> · up to{" "}
+                      <span className="font-semibold text-slate-800">{waLimit}</span> WhatsApp account
+                      {waLimit === 1 ? "" : "s"}
+                    </p>
+                    {waAccounts
+                      .filter((account) => account.connected || account.phase === "ready")
+                      .map((account) => (
+                        <div
+                          key={account.accountId}
+                          className="flex items-center gap-2.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5"
+                        >
+                          <WhatsAppAccountAvatar account={account} size="sm" />
+                          <p className="min-w-0 text-xs font-medium text-emerald-800">
+                            <span className="font-semibold">{account.label}:</span> {accountLabel(account)}
+                          </p>
+                        </div>
+                      ))}
+                  </div>
                 ) : null}
 
                 <div className="mt-6 flex flex-wrap items-center gap-2 border-t border-[#EEE8FF] pt-4">
@@ -251,7 +353,7 @@ function Integrations() {
                         : `bg-gradient-to-r ${item.accent} shadow-emerald-900/10`
                     }`}
                   >
-                    {isConnected ? "Configure" : "Connect"}
+                    {isConnected ? "Manage accounts" : "Connect"}
                     <ArrowRight size={16} className="opacity-90" />
                   </button>
                   <button
@@ -325,13 +427,13 @@ function Integrations() {
 
       {showWhatsAppConfig ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4">
-          <div className="w-full max-w-lg rounded-3xl border border-[#E9DFFF] bg-gradient-to-b from-white to-[#FCFAFF] p-5 shadow-[0_30px_80px_rgba(15,23,42,0.3)]">
+          <div className="w-full max-w-3xl rounded-3xl border border-[#E9DFFF] bg-gradient-to-b from-white to-[#FCFAFF] p-5 shadow-[0_30px_80px_rgba(15,23,42,0.3)]">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h3 className="text-xl font-semibold tracking-tight text-slate-900">WhatsApp connection</h3>
+                <h3 className="text-xl font-semibold tracking-tight text-slate-900">WhatsApp accounts</h3>
                 <p className="mt-1 text-sm text-slate-500">
-                  Scan the QR code with WhatsApp on your phone (Linked devices). Messages use the same AI settings as
-                  your web chat; conversations appear on the Chats page.
+                  Link up to {waLimit} WhatsApp number{waLimit === 1 ? "" : "s"} on your {userPlan || "current"}{" "}
+                  plan. Scan each QR with WhatsApp → Linked devices.
                 </p>
               </div>
               <button
@@ -356,65 +458,131 @@ function Integrations() {
               </p>
             ) : null}
 
-            <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              <div className="rounded-xl border border-[#E9DFFF] bg-white p-3 shadow-sm">
-                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Status</p>
-                <p className="mt-1 text-sm font-semibold capitalize text-slate-800">{waPhase || "—"}</p>
+            <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
+              <div className="space-y-2">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Your slots</p>
+                {waAccounts.map((account) => {
+                  const connected = Boolean(account.connected || account.phase === "ready");
+                  const isActive = account.accountId === activeAccountId;
+                  return (
+                    <div
+                      key={account.accountId}
+                      className={`rounded-xl border p-3 transition ${
+                        isActive
+                          ? "border-[#C4B5FD] bg-[#F8F5FF] shadow-sm"
+                          : "border-[#E9DFFF] bg-white"
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setActiveAccountId(account.accountId)}
+                          className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+                        >
+                          {connected ? <WhatsAppAccountAvatar account={account} size="sm" /> : null}
+                          <span className="min-w-0">
+                            <p className="text-sm font-semibold text-slate-900">{account.label}</p>
+                            <p className="mt-0.5 truncate text-xs text-slate-500">
+                              {connected
+                                ? accountLabel(account)
+                                : account.phase === "qr"
+                                  ? "Waiting for scan"
+                                  : "Not linked"}
+                            </p>
+                          </span>
+                        </button>
+                        <span
+                          className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                            connected
+                              ? "bg-emerald-50 text-emerald-700"
+                              : "bg-slate-100 text-slate-500"
+                          }`}
+                        >
+                          {connected ? "Connected" : account.phase || "idle"}
+                        </span>
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {!connected ? (
+                          <button
+                            type="button"
+                            onClick={() => void startAccountLinking(account.accountId)}
+                            disabled={waRefreshing}
+                            className="inline-flex items-center gap-1 rounded-lg bg-gradient-to-r from-emerald-600 to-emerald-500 px-3 py-1.5 text-xs font-semibold text-white"
+                          >
+                            <Plus size={14} />
+                            Link
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => void disconnectWhatsApp(account.accountId)}
+                            className="rounded-lg border border-[#E9DFFF] bg-white px-3 py-1.5 text-xs font-semibold text-slate-700"
+                          >
+                            Disconnect
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-              <div className="rounded-xl border border-[#E9DFFF] bg-white p-3 shadow-sm">
-                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Session</p>
-                <p className="mt-1 text-sm font-semibold text-slate-800">
-                  {waConnected ? waConnectedAccountLabel : "Not linked"}
-                </p>
-              </div>
-            </div>
 
-            <div className="mt-4 flex min-h-[200px] flex-col items-center justify-center rounded-2xl border border-[#E9DFFF] bg-[#FCFAFF] p-4 shadow-inner">
-              {waStatus?.qrDataUrl && !waConnected ? (
-                <img
-                  src={waStatus.qrDataUrl}
-                  alt="WhatsApp QR code"
-                  className="h-56 w-56 rounded-xl border border-[#E9DFFF] bg-white p-2 shadow-sm"
-                />
-              ) : null}
-              {waConnected ? (
-                <div className="text-center">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                    Connected account
-                  </p>
-                  <p className="mt-1 text-sm font-semibold text-[#6D28D9]">{waConnectedAccountLabel}</p>
+              <div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-xl border border-[#E9DFFF] bg-white p-3 shadow-sm">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Status</p>
+                    <p className="mt-1 text-sm font-semibold capitalize text-slate-800">{activePhase || "—"}</p>
+                  </div>
+                  <div className="rounded-xl border border-[#E9DFFF] bg-white p-3 shadow-sm">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Session</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-800">
+                      {activeConnected ? activeAccountLabel : "Not linked"}
+                    </p>
+                  </div>
                 </div>
-              ) : null}
-              {!waStatus?.qrDataUrl && !waConnected && waPhase !== "error" ? (
-                <p className="text-center text-sm text-slate-500">
-                  {waPhase === "initializing" || waPhase === "authenticated"
-                    ? "Starting browser session…"
-                    : "Waiting for QR code from server…"}
-                </p>
-              ) : null}
-              {waPhase === "error" ? (
-                <p className="text-center text-sm text-red-700">{waStatus?.error || "WhatsApp error"}</p>
-              ) : null}
-            </div>
 
-            <div className="mt-4 flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => void refreshOrRetryWhatsApp()}
-                disabled={waRefreshing}
-                className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#A78BFA] px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-[#8B5CF6]/30 transition hover:opacity-95"
-              >
-                {waRefreshing ? "Refreshing..." : "Refresh"}
-              </button>
-              {waConnected ? (
-                <button
-                  type="button"
-                  onClick={() => void disconnectWhatsApp()}
-                  className="rounded-xl border border-[#E9DFFF] bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-[#FCFAFF]"
-                >
-                  Disconnect
-                </button>
-              ) : null}
+                <div className="mt-4 flex min-h-[220px] flex-col items-center justify-center rounded-2xl border border-[#E9DFFF] bg-[#FCFAFF] p-4 shadow-inner">
+                  {activeAccount?.qrDataUrl && !activeConnected ? (
+                    <img
+                      src={activeAccount.qrDataUrl}
+                      alt="WhatsApp QR code"
+                      className="h-56 w-56 rounded-xl border border-[#E9DFFF] bg-white p-2 shadow-sm"
+                    />
+                  ) : null}
+                  {activeConnected ? (
+                    <div className="text-center">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        Connected account
+                      </p>
+                      <div className="mx-auto mt-3 flex justify-center">
+                        <WhatsAppAccountAvatar account={activeAccount} />
+                      </div>
+                      <p className="mt-3 text-sm font-semibold text-[#6D28D9]">{activeAccountLabel}</p>
+                    </div>
+                  ) : null}
+                  {!activeAccount?.qrDataUrl && !activeConnected && activePhase !== "error" ? (
+                    <p className="text-center text-sm text-slate-500">
+                      {activePhase === "initializing" || activePhase === "authenticated"
+                        ? "Starting browser session…"
+                        : "Select a slot and tap Link to show a QR code."}
+                    </p>
+                  ) : null}
+                  {activePhase === "error" ? (
+                    <p className="text-center text-sm text-red-700">{activeAccount?.error || "WhatsApp error"}</p>
+                  ) : null}
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void refreshOrRetryWhatsApp({ accountId: activeAccountId })}
+                    disabled={waRefreshing}
+                    className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#A78BFA] px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-[#8B5CF6]/30 transition hover:opacity-95"
+                  >
+                    {waRefreshing ? "Refreshing..." : "Refresh"}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>

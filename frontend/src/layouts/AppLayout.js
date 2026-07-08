@@ -15,6 +15,7 @@ import {
   Settings,
 } from "lucide-react";
 import { clearWorkspaceUserSession } from "../auth/userSession";
+import { SidebarWhatsAppStatus } from "../components/SidebarWhatsAppStatus";
 import nexgenaoLogo from "../assets/nexgenaoLogo.jpeg";
 
 const navItems = [
@@ -74,6 +75,8 @@ function AppLayout() {
               {sidebarCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
             </button>
           </div>
+
+          <SidebarWhatsAppStatus collapsed={sidebarCollapsed} />
 
           <nav className="min-h-0 flex-1 space-y-2 overflow-y-auto">
             {navItems.map((item) => (

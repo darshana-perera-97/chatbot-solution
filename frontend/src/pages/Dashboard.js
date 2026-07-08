@@ -216,12 +216,20 @@ function Dashboard() {
     );
   const submittedLeadCount = leads.filter(isSubmittedLead).length;
   const buildersCount = submittedLeadCount;
-  const waConnected = Boolean(waStatus?.connected || waStatus?.phase === "ready");
+  const waConnected = Boolean(
+    (waStatus?.connectedCount || 0) > 0 || waStatus?.connected || waStatus?.phase === "ready"
+  );
   const waDetailLine = (() => {
     if (!userId) return "Sign in to view status";
     if (waStatus?.available === false) return "Backend library not loaded";
-    if (waConnected) {
-      const parts = [waStatus?.pushname, waStatus?.phone].filter(
+    const connectedCount = Number(waStatus?.connectedCount) || 0;
+    const accounts = Array.isArray(waStatus?.accounts) ? waStatus.accounts : [];
+    const connectedAccounts = accounts.filter((account) => account.connected || account.phase === "ready");
+    if (connectedCount > 0 || connectedAccounts.length > 0) {
+      const count = connectedCount || connectedAccounts.length;
+      if (count > 1) return `${count} WhatsApp accounts linked`;
+      const account = connectedAccounts[0] || null;
+      const parts = [account?.pushname || waStatus?.pushname, account?.phone || waStatus?.phone].filter(
         (p) => typeof p === "string" && p.trim()
       );
       return parts.length ? parts.join(" · ") : "Linked device active";

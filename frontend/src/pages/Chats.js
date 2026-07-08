@@ -89,6 +89,59 @@ function pickPhoneFromCollected(collected) {
   return "";
 }
 
+function toE164Phone(raw) {
+  const digits = String(raw || "").replace(/\D/g, "");
+  if (digits.length < 7 || digits.length > 18) return "";
+  return `+${digits}`;
+}
+
+function isWhatsappLidSession(session) {
+  const jid = typeof session?.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
+  if (jid.endsWith("@lid")) return true;
+  const conversationId = typeof session?.conversationId === "string" ? session.conversationId.trim() : "";
+  return conversationId.includes("_lid");
+}
+
+/** Customer WhatsApp number with country code (E.164), from API or JID fallback. */
+function peerWhatsappNumber(session) {
+  const stored =
+    typeof session?.whatsappPeerPhone === "string" ? session.whatsappPeerPhone.trim() : "";
+  const fromStored = toE164Phone(stored);
+  if (fromStored) return fromStored;
+
+  if (isWhatsappLidSession(session)) {
+    const collected =
+      session?.lead?.collectedData && typeof session.lead.collectedData === "object"
+        ? session.lead.collectedData
+        : {};
+    return toE164Phone(pickPhoneFromCollected(collected));
+  }
+
+  const jid = typeof session?.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
+  if (jid && jid.endsWith("@c.us")) {
+    const localPart = jid.split("@")[0] || "";
+    const fromJid = toE164Phone(localPart.split(":")[0]);
+    if (fromJid) return fromJid;
+  }
+
+  const conversationId = typeof session?.conversationId === "string" ? session.conversationId.trim() : "";
+  if (conversationId.startsWith("wa_") && conversationId.endsWith("_c_us")) {
+    const digits = conversationId.slice(3, -5);
+    return toE164Phone(digits);
+  }
+
+  const collected =
+    session?.lead?.collectedData && typeof session.lead.collectedData === "object"
+      ? session.lead.collectedData
+      : {};
+  return toE164Phone(pickPhoneFromCollected(collected));
+}
+
+function whatsappMessagingNumber(session) {
+  if (normalizeChatSource(session) !== "whatsapp") return "";
+  return peerWhatsappNumber(session);
+}
+
 /** Title for the visitor on the left list: real name from lead fields, else Web User / phone / Test User. */
 function conversationPeerDisplayName(session) {
   const collected =
@@ -100,12 +153,18 @@ function conversationPeerDisplayName(session) {
 
   const src = normalizeChatSource(session);
   if (src === "whatsapp") {
+    const waNumber = peerWhatsappNumber(session);
+    if (waNumber) return waNumber;
     const phone = pickPhoneFromCollected(collected);
     if (phone) return phone;
-    return "WhatsApp";
+    return "WhatsApp Contact";
   }
   if (src === "web") return "Web User";
   return "Test User";
+}
+
+function conversationPeerSubtitle(session) {
+  return whatsappMessagingNumber(session);
 }
 
 function avatarInitial(label) {
@@ -213,9 +272,13 @@ function Chats() {
         : messages[messages.length - 1]?.text || "No messages yet.";
       const sourceLabel = formatSessionSourceLabel(session);
       const displayName = conversationPeerDisplayName(session);
+      const peerSubtitle = conversationPeerSubtitle(session);
+      const whatsappNumber = whatsappMessagingNumber(session);
       return {
         id: session.id || `session-${idx}`,
         displayName,
+        peerSubtitle,
+        whatsappNumber,
         preview,
         time: formatConversationTime(session.updatedAt || session.createdAt),
         sourceLabel,
@@ -227,6 +290,8 @@ function Chats() {
     return prepared.filter(
       (c) =>
         c.displayName.toLowerCase().includes(q) ||
+        c.peerSubtitle.toLowerCase().includes(q) ||
+        c.whatsappNumber.toLowerCase().includes(q) ||
         c.preview.toLowerCase().includes(q) ||
         c.sourceLabel.toLowerCase().includes(q)
     );
@@ -365,7 +430,14 @@ function Chats() {
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-start justify-between gap-2">
-                          <span className="truncate font-semibold text-slate-800">{c.displayName}</span>
+                          <div className="min-w-0">
+                            <span className="truncate font-semibold text-slate-800">{c.displayName}</span>
+                            {c.whatsappNumber ? (
+                              <p className="truncate text-[11px] font-semibold text-emerald-700">
+                                WhatsApp {c.whatsappNumber}
+                              </p>
+                            ) : null}
+                          </div>
                           <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-slate-400">
                             {c.time}
                           </span>
@@ -418,6 +490,11 @@ function Chats() {
                 </div>
                 <div className="min-w-0 flex-1">
                   <p className="truncate font-semibold text-slate-900">{active.displayName}</p>
+                  {active.whatsappNumber ? (
+                    <p className="truncate text-xs font-semibold text-emerald-700">
+                      WhatsApp {active.whatsappNumber}
+                    </p>
+                  ) : null}
                   <p className="truncate text-xs text-slate-400">
                     <span
                       className={`mr-1.5 inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold ${
@@ -457,6 +534,15 @@ function Chats() {
                   <MoreVertical size={18} />
                 </button>
               </header>
+
+              {active.whatsappNumber ? (
+                <div className="shrink-0 border-b border-emerald-100 bg-emerald-50/80 px-4 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-800">
+                    Messaging WhatsApp number
+                  </p>
+                  <p className="mt-0.5 text-sm font-bold text-emerald-900">{active.whatsappNumber}</p>
+                </div>
+              ) : null}
 
               <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
                 {Object.keys(leadCollected).length > 0 ? (

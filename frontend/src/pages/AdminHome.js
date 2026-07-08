@@ -631,6 +631,7 @@ function AdminHome() {
                 <option value="Test">Test</option>
                 <option value="Trial">Trial</option>
                 <option value="Basic">Basic</option>
+                <option value="Intermediate">Intermediate</option>
                 <option value="Pro">Pro</option>
               </select>
               <select
@@ -728,6 +729,7 @@ function AdminHome() {
                 <option value="Test">Test</option>
                 <option value="Trial">Trial</option>
                 <option value="Basic">Basic</option>
+                <option value="Intermediate">Intermediate</option>
                 <option value="Pro">Pro</option>
               </select>
               <select

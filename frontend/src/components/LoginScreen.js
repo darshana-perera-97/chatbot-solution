@@ -6,7 +6,7 @@ import nexgenaoLogo from "../assets/nexgenaoLogo.jpeg";
 const SHOW_SOCIAL_LOGIN = false;
 
 /**
- * Shared split login layout (matches `/login` UI) for workspace and admin routes.
+ * Shared split login layout for workspace sign-in.
  */
 function LoginScreen({
   title,

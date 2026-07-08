@@ -3,6 +3,7 @@ const fs = require("fs");
 const { execSync } = require("child_process");
 const QRCode = require("qrcode");
 const whatsappAutoStart = require("./whatsappAutoStart");
+const { sanitizeWhatsAppAccountId } = require("./planConfig");
 
 let Client;
 let LocalAuth;
@@ -25,14 +26,39 @@ function resolveUserAuthRoot(workspaceUserId) {
   return authRoot;
 }
 
-function resolveUserWebCacheDir(workspaceUserId) {
+function localAuthClientIdForAccount(accountId) {
+  const safe = sanitizeWhatsAppAccountId(accountId) || "1";
+  return safe === "1" ? "wa" : `wa-${safe}`;
+}
+
+function slotKey(workspaceUserId, accountId) {
+  const safeUserId = String(workspaceUserId || "").trim();
+  const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+  return `${safeUserId}::${safeAccountId}`;
+}
+
+function resolveUserWebCacheDir(workspaceUserId, accountId = "1") {
   const safeUserId = String(workspaceUserId || "").trim();
   const userDir = path.join(dataRoot, safeUserId);
-  const cacheDir = path.join(userDir, ".wwebjs_cache");
+  const clientId = localAuthClientIdForAccount(accountId);
+  const cacheDir =
+    clientId === "wa"
+      ? path.join(userDir, ".wwebjs_cache")
+      : path.join(userDir, `.wwebjs_cache-${clientId}`);
   if (!fs.existsSync(cacheDir)) {
     fs.mkdirSync(cacheDir, { recursive: true });
   }
   return cacheDir;
+}
+
+function resolveAccountSessionDir(workspaceUserId, accountId = "1") {
+  const safeUserId = String(workspaceUserId || "").trim();
+  const clientId = localAuthClientIdForAccount(accountId);
+  return path.join(dataRoot, safeUserId, "whatsapp-auth", `session-${clientId}`);
+}
+
+function hasPersistedAccountSession(workspaceUserId, accountId = "1") {
+  return fs.existsSync(resolveAccountSessionDir(workspaceUserId, accountId));
 }
 
 function resolveChromeExecutablePath() {
@@ -198,6 +224,105 @@ function jidToConversationId(jid) {
   return `wa_${safe}`;
 }
 
+function toE164Phone(raw) {
+  const digits = String(raw || "").replace(/\D/g, "");
+  if (digits.length < 7 || digits.length > 18) return "";
+  return `+${digits}`;
+}
+
+/** Resolve customer WhatsApp number with country code (E.164), including @lid privacy IDs. */
+function pnToE164(pn) {
+  const s = String(pn || "").trim();
+  if (!s) return "";
+  if (s.includes("@")) {
+    const user = s.split("@")[0].split(":")[0];
+    return toE164Phone(user);
+  }
+  return toE164Phone(s);
+}
+
+async function resolvePeerPhoneFromJid(client, jid, msg = null) {
+  const id = typeof jid === "string" ? jid.trim() : "";
+  if (!id || !client) return "";
+
+  try {
+    if (typeof client.getContactLidAndPhone === "function") {
+      const rows = await client.getContactLidAndPhone([id]);
+      for (const row of rows || []) {
+        const fromPn = pnToE164(row?.pn);
+        if (fromPn) return fromPn;
+      }
+    }
+  } catch (e) {
+    console.warn("[whatsapp] getContactLidAndPhone:", e instanceof Error ? e.message : String(e));
+  }
+
+  try {
+    if (typeof client.getFormattedNumber === "function") {
+      const formatted = await client.getFormattedNumber(id);
+      const fromFormatted = toE164Phone(formatted);
+      if (fromFormatted) return fromFormatted;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    if (typeof client.getContactById === "function") {
+      const contact = await client.getContactById(id);
+      if (contact) {
+        const serialized =
+          typeof contact.id?._serialized === "string" ? contact.id._serialized.trim() : "";
+        if (serialized.endsWith("@c.us")) {
+          const fromSerialized = pnToE164(serialized);
+          if (fromSerialized) return fromSerialized;
+        }
+        const phoneNumberUser =
+          typeof contact.phoneNumber?.user === "string" ? contact.phoneNumber.user.trim() : "";
+        if (phoneNumberUser) {
+          const fromPhoneNumber = toE164Phone(phoneNumberUser);
+          if (fromPhoneNumber) return fromPhoneNumber;
+        }
+        if (typeof contact.getFormattedNumber === "function") {
+          const formatted = await contact.getFormattedNumber();
+          const fromFormatted = toE164Phone(formatted);
+          if (fromFormatted) return fromFormatted;
+        }
+        const fromNumber = toE164Phone(contact.number);
+        if (fromNumber) return fromNumber;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  if (msg && typeof msg.getContact === "function") {
+    try {
+      const contact = await msg.getContact();
+      if (contact) {
+        if (typeof contact.getFormattedNumber === "function") {
+          const formatted = await contact.getFormattedNumber();
+          const fromFormatted = toE164Phone(formatted);
+          if (fromFormatted) return fromFormatted;
+        }
+        const fromContact = toE164Phone(contact.number);
+        if (fromContact) return fromContact;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (id.endsWith("@lid")) return "";
+  return pnToE164(id);
+}
+
+async function resolvePeerWhatsappPhone(client, msg) {
+  const jid = typeof msg?.from === "string" ? msg.from.trim() : "";
+  if (!jid) return "";
+  return resolvePeerPhoneFromJid(client, jid, msg);
+}
+
 function channelLabelFromClient(client) {
   try {
     const info = client?.info;
@@ -207,6 +332,24 @@ function channelLabelFromClient(client) {
       (info.wid && typeof info.wid.user === "string" && info.wid.user) ||
       ""
     );
+  } catch {
+    return "";
+  }
+}
+
+async function profilePicDataUrlFromClient(client) {
+  try {
+    const wid = client?.info?.wid?._serialized;
+    if (!wid || typeof client.getProfilePicUrl !== "function") return "";
+    const picUrl = await client.getProfilePicUrl(wid);
+    if (typeof picUrl !== "string" || !picUrl.trim()) return "";
+    const res = await fetch(picUrl.trim());
+    if (!res.ok) return "";
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length) return "";
+    const contentType =
+      (typeof res.headers.get === "function" && res.headers.get("content-type")) || "image/jpeg";
+    return `data:${contentType};base64,${buf.toString("base64")}`;
   } catch {
     return "";
   }
@@ -281,8 +424,8 @@ function createWhatsAppBridge(deps) {
 
   /** @type {Map<string, object>} */
   const slots = new Map();
-  const waLog = (workspaceUserId, message, ...extra) => {
-    const prefix = `[whatsapp][user:${workspaceUserId}]`;
+  const waLog = (workspaceUserId, accountId, message, ...extra) => {
+    const prefix = `[whatsapp][user:${workspaceUserId}][account:${accountId}]`;
     if (extra.length) {
       console.log(prefix, message, ...extra);
     } else {
@@ -290,34 +433,39 @@ function createWhatsAppBridge(deps) {
     }
   };
 
-  function removeAuthSession(workspaceUserId) {
+  function removeAuthSession(workspaceUserId, accountId = "1") {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     if (!safe) return;
-    const authRoot = path.join(dataRoot, safe, "whatsapp-auth");
-    const cacheDir = path.join(dataRoot, safe, ".wwebjs_cache");
+    const clientId = localAuthClientIdForAccount(safeAccountId);
+    const sessionDir = resolveAccountSessionDir(safe, safeAccountId);
+    const cacheDir = resolveUserWebCacheDir(safe, safeAccountId);
     try {
-      if (fs.existsSync(authRoot)) {
-        fs.rmSync(authRoot, { recursive: true, force: true });
-        waLog(safe, "removed persisted auth session files");
+      if (fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        waLog(safe, safeAccountId, "removed persisted auth session files");
       }
       if (fs.existsSync(cacheDir)) {
         fs.rmSync(cacheDir, { recursive: true, force: true });
-        waLog(safe, "removed persisted WhatsApp web cache files");
+        waLog(safe, safeAccountId, "removed persisted WhatsApp web cache files");
       }
     } catch (e) {
       waLog(
         safe,
+        safeAccountId,
         "failed removing persisted auth session files",
         e instanceof Error ? e.message : String(e)
       );
     }
   }
 
-  async function destroyClient(workspaceUserId) {
+  async function destroyClient(workspaceUserId, accountId = "1") {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     if (!safe) return;
-    waLog(safe, "destroying client session");
-    const entry = slots.get(safe);
+    const key = slotKey(safe, safeAccountId);
+    waLog(safe, safeAccountId, "destroying client session");
+    const entry = slots.get(key);
     if (entry?.client) {
       try {
         entry.client.removeAllListeners();
@@ -326,64 +474,121 @@ function createWhatsAppBridge(deps) {
         /* ignore */
       }
     }
-    slots.delete(safe);
-    waLog(safe, "client session removed");
+    slots.delete(key);
+    waLog(safe, safeAccountId, "client session removed");
   }
 
-  async function disconnectAndForget(workspaceUserId) {
+  async function disconnectAndForget(workspaceUserId, accountId = "1") {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     if (!safe) return;
-    const entry = slots.get(safe);
+    const key = slotKey(safe, safeAccountId);
+    const entry = slots.get(key);
     if (entry?.client) {
       try {
-        waLog(safe, "logging out linked WhatsApp Web device session");
+        waLog(safe, safeAccountId, "logging out linked WhatsApp Web device session");
         await entry.client.logout();
       } catch (e) {
         waLog(
           safe,
+          safeAccountId,
           "logout call failed; continuing with local disconnect",
           e instanceof Error ? e.message : String(e)
         );
       }
     }
-    await destroyClient(safe);
-    removeAuthSession(safe);
+    await destroyClient(safe, safeAccountId);
+    removeAuthSession(safe, safeAccountId);
+    whatsappAutoStart.removeLink(safe, safeAccountId);
   }
 
-  function getStatus(workspaceUserId) {
-    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
-    if (!safe) {
-      return { phase: "error", connected: false, available: Boolean(Client), error: "Invalid user id" };
-    }
-    const entry = slots.get(safe);
+  function maybeRefreshProfilePic(entry) {
+    if (!entry?.client || entry.phase !== "ready" || entry.profilePicLoading) return;
+    if (typeof entry.profilePicDataUrl === "string" && entry.profilePicDataUrl) return;
+    entry.profilePicLoading = true;
+    void profilePicDataUrlFromClient(entry.client)
+      .then((dataUrl) => {
+        entry.profilePicDataUrl = typeof dataUrl === "string" ? dataUrl : "";
+      })
+      .finally(() => {
+        entry.profilePicLoading = false;
+      });
+  }
+
+  function buildAccountStatus(workspaceUserId, accountId, entry) {
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     if (!entry) {
+      const persisted = hasPersistedAccountSession(workspaceUserId, safeAccountId);
       return {
-        phase: "disconnected",
+        accountId: safeAccountId,
+        label: `Account ${safeAccountId}`,
+        phase: persisted ? "disconnected" : "idle",
         connected: false,
-        available: Boolean(Client),
         qrDataUrl: "",
         error: "",
         pushname: "",
         phone: "",
+        profilePicDataUrl: "",
+        persisted,
       };
     }
     return {
+      accountId: safeAccountId,
+      label: `Account ${safeAccountId}`,
       phase: entry.phase,
       connected: entry.phase === "ready",
-      available: Boolean(Client),
       qrDataUrl: entry.qrDataUrl || "",
       error: entry.error || "",
       pushname: entry.pushname || "",
       phone: entry.phone || "",
+      profilePicDataUrl: typeof entry.profilePicDataUrl === "string" ? entry.profilePicDataUrl : "",
+      persisted: hasPersistedAccountSession(workspaceUserId, safeAccountId),
     };
   }
 
-  async function sendText(workspaceUserId, peerJid, text) {
+  function getStatus(workspaceUserId, accountLimit = 1) {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const limit = Math.max(1, Math.min(6, Number(accountLimit) || 1));
+    if (!safe) {
+      return {
+        phase: "error",
+        connected: false,
+        connectedCount: 0,
+        available: Boolean(Client),
+        error: "Invalid user id",
+        accounts: [],
+        limit,
+      };
+    }
+
+    const accounts = [];
+    for (let i = 1; i <= limit; i += 1) {
+      const accountId = String(i);
+      const key = slotKey(safe, accountId);
+      const slotEntry = slots.get(key);
+      if (slotEntry) maybeRefreshProfilePic(slotEntry);
+      accounts.push(buildAccountStatus(safe, accountId, slotEntry));
+    }
+
+    const connectedCount = accounts.filter((account) => account.connected).length;
+    const primary = accounts[0] || buildAccountStatus(safe, "1", null);
+
+    return {
+      ...primary,
+      accounts,
+      connectedCount,
+      limit,
+      available: Boolean(Client),
+    };
+  }
+
+  async function sendText(workspaceUserId, accountId, peerJid, text) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     const body = typeof text === "string" ? text.trim() : "";
     const jid = typeof peerJid === "string" ? peerJid.trim() : "";
     if (!safe || !jid || !body) return { ok: false };
-    const entry = slots.get(safe);
+    const entry = slots.get(slotKey(safe, safeAccountId));
     if (!entry?.client || entry.phase !== "ready") return { ok: false };
     try {
       const sent = await entry.client.sendMessage(jid, body, { sendSeen: false });
@@ -394,50 +599,55 @@ function createWhatsAppBridge(deps) {
     }
   }
 
-  async function startLinking(workspaceUserId) {
+  async function startLinking(workspaceUserId, accountId = "1") {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     if (!safe) throw new Error("Invalid user id");
     if (!Client || !LocalAuth) {
       throw new Error("whatsapp-web.js is not installed. Run npm install in the backend folder.");
     }
-    const existingSlot = slots.get(safe);
+    const key = slotKey(safe, safeAccountId);
+    const existingSlot = slots.get(key);
     if (existingSlot?.phase === "ready") {
-      waLog(safe, "already linked and ready");
+      waLog(safe, safeAccountId, "already linked and ready");
       return { ok: true, alreadyConnected: true };
     }
     if (
       existingSlot?.client &&
       ["initializing", "qr", "authenticated"].includes(existingSlot.phase)
     ) {
-      waLog(safe, `linking already in progress (phase=${existingSlot.phase})`);
+      waLog(safe, safeAccountId, `linking already in progress (phase=${existingSlot.phase})`);
       return { ok: true, pending: true };
     }
-    waLog(safe, "starting linking flow (initializing client)");
-    await destroyClient(safe);
+    waLog(safe, safeAccountId, "starting linking flow (initializing client)");
+    await destroyClient(safe, safeAccountId);
 
     const entry = {
+      accountId: safeAccountId,
       phase: "initializing",
       qrDataUrl: "",
       error: "",
       pushname: "",
       phone: "",
+      profilePicDataUrl: "",
       client: null,
     };
-    slots.set(safe, entry);
+    slots.set(key, entry);
 
     const executablePath = resolveChromeExecutablePath();
     if (!executablePath) {
       waLog(
         safe,
+        safeAccountId,
         "no explicit browser executable detected; trying Puppeteer default browser resolution"
       );
     } else {
-      waLog(safe, `using browser executable: ${executablePath}`);
+      waLog(safe, safeAccountId, `using browser executable: ${executablePath}`);
     }
 
     const authRoot = resolveUserAuthRoot(safe);
-    const webCachePath = resolveUserWebCacheDir(safe);
-    const localAuthClientId = "wa";
+    const webCachePath = resolveUserWebCacheDir(safe, safeAccountId);
+    const localAuthClientId = localAuthClientIdForAccount(safeAccountId);
     const localAuthProfileDir = path.join(authRoot, `session-${localAuthClientId}`);
     releaseLinuxProfileDir(localAuthProfileDir);
 
@@ -462,24 +672,24 @@ function createWhatsAppBridge(deps) {
       try {
         entry.qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, width: 280 });
         entry.phase = "qr";
-        waLog(safe, "qr generated; waiting for device link scan");
+        waLog(safe, safeAccountId, "qr generated; waiting for device link scan");
       } catch (e) {
         entry.error = e instanceof Error ? e.message : String(e);
         entry.phase = "error";
-        waLog(safe, "failed generating qr", entry.error);
+        waLog(safe, safeAccountId, "failed generating qr", entry.error);
       }
     });
 
     client.on("authenticated", () => {
       entry.phase = "authenticated";
       entry.qrDataUrl = "";
-      waLog(safe, "account login authenticated");
+      waLog(safe, safeAccountId, "account login authenticated");
     });
 
     client.on("auth_failure", (m) => {
       entry.phase = "error";
       entry.error = String(m || "auth_failure");
-      waLog(safe, "auth failure", entry.error);
+      waLog(safe, safeAccountId, "auth failure", entry.error);
     });
 
     client.on("ready", () => {
@@ -488,9 +698,13 @@ function createWhatsAppBridge(deps) {
       const wid = client.info?.wid;
       entry.phone = wid?.user || "";
       entry.pushname = channelLabelFromClient(client);
-      whatsappAutoStart.addUserId(safe);
+      whatsappAutoStart.addLink(safe, safeAccountId);
+      void profilePicDataUrlFromClient(client).then((dataUrl) => {
+        entry.profilePicDataUrl = typeof dataUrl === "string" ? dataUrl : "";
+      });
       waLog(
         safe,
+        safeAccountId,
         `linked and ready (account=${entry.pushname || "unknown"}${entry.phone ? ` · ${entry.phone}` : ""})`
       );
     });
@@ -498,7 +712,7 @@ function createWhatsAppBridge(deps) {
     client.on("disconnected", (reason) => {
       entry.phase = "disconnected";
       entry.error = String(reason || "disconnected");
-      waLog(safe, "disconnected", entry.error);
+      waLog(safe, safeAccountId, "disconnected", entry.error);
     });
 
     client.on("message", async (msg) => {
@@ -524,12 +738,12 @@ function createWhatsAppBridge(deps) {
         return;
       }
 
-      const entryNow = slots.get(safe);
+      const entryNow = slots.get(key);
       const label =
         channelLabelFromClient(client) ||
         (entryNow && entryNow.pushname) ||
         (entryNow && entryNow.phone) ||
-        "WhatsApp";
+        `WhatsApp ${safeAccountId}`;
 
       const existing = getTestChatSessionByConversation(safe, conversationId);
       const prior = (existing?.messages || [])
@@ -539,6 +753,7 @@ function createWhatsAppBridge(deps) {
           content: typeof m.content === "string" ? m.content : "",
         }));
       const messages = sanitizeChatMessages([...prior, { role: "user", content: body }]);
+      const whatsappPeerPhone = await resolvePeerWhatsappPhone(client, msg);
 
       const result = await completeWorkspaceChatTurn({
         userId: safe,
@@ -547,6 +762,8 @@ function createWhatsAppBridge(deps) {
         chatSource: "whatsapp",
         channelAccountName: label,
         whatsappChatId: jid,
+        whatsappPeerPhone,
+        whatsappAccountId: safeAccountId,
       });
 
       if (result.kind === "success" && typeof result.reply === "string" && result.reply.trim()) {
@@ -588,7 +805,7 @@ function createWhatsAppBridge(deps) {
 
     try {
       await client.initialize();
-      waLog(safe, "client initialize() called successfully");
+      waLog(safe, safeAccountId, "client initialize() called successfully");
     } catch (e) {
       entry.phase = "error";
       const message = e instanceof Error ? e.message : String(e);
@@ -596,11 +813,39 @@ function createWhatsAppBridge(deps) {
         "Failed to launch browser for WhatsApp Web. " +
         message +
         " | Tip: set PUPPETEER_EXECUTABLE_PATH to your Chrome/Chromium binary path.";
-      waLog(safe, "initialize failed", entry.error);
+      waLog(safe, safeAccountId, "initialize failed", entry.error);
       return { ok: false, error: entry.error };
     }
 
     return { ok: true };
+  }
+
+  async function resolvePeerPhone(workspaceUserId, accountId, jid) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe) return "";
+    const key = slotKey(safe, safeAccountId);
+    const entry = slots.get(key);
+    if (entry?.client && entry.phase === "ready") {
+      const phone = await resolvePeerPhoneFromJid(entry.client, jid);
+      if (phone) return phone;
+    }
+    for (const [slotId, slotEntry] of slots.entries()) {
+      if (!slotId.startsWith(`${safe}:`)) continue;
+      if (!slotEntry?.client || slotEntry.phase !== "ready") continue;
+      const phone = await resolvePeerPhoneFromJid(slotEntry.client, jid);
+      if (phone) return phone;
+    }
+    return "";
+  }
+
+  async function resolvePeerPhoneForSession(workspaceUserId, session) {
+    const jid =
+      session && typeof session.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
+    if (!jid) return "";
+    const accountId =
+      session && typeof session.whatsappAccountId === "string" ? session.whatsappAccountId : "1";
+    return resolvePeerPhone(workspaceUserId, accountId, jid);
   }
 
   return {
@@ -609,6 +854,8 @@ function createWhatsAppBridge(deps) {
     disconnectAndForget,
     getStatus,
     sendText,
+    resolvePeerPhone,
+    resolvePeerPhoneForSession,
     jidToConversationId,
     isLibraryAvailable: Boolean(Client),
   };
