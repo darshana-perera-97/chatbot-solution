@@ -1729,6 +1729,7 @@ const whatsappBridge = createWhatsAppBridge({
   sanitizeAgentDetailsUserId,
   getTestChatSessionByConversation,
   sanitizeChatMessages,
+  saveTestChatSession,
 });
 
 const enrichWhatsappSessionPeerPhones = async (userIdRaw, sessions) => {

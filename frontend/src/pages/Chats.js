@@ -561,23 +561,23 @@ function Chats() {
                 ) : null}
 
                 {messages.map((m) => {
-                  const isSelf = m.role === "user";
+                  const isCustomer = m.role === "user";
                   const isLiveAgent = m.role === "agent";
                   return (
                     <div
                       key={m.id}
-                      className={`flex ${isSelf ? "justify-end" : "justify-start"}`}
+                      className={`flex ${isCustomer ? "justify-start" : "justify-end"}`}
                     >
                       <div
                         className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm shadow-sm ${
-                          isSelf
-                            ? "rounded-br-md bg-gradient-to-br from-[#8B5CF6] to-[#7C3AED] text-white"
+                          isCustomer
+                            ? "rounded-bl-md bg-gradient-to-br from-[#8B5CF6] to-[#7C3AED] text-white"
                             : isLiveAgent
-                            ? "rounded-bl-md border border-emerald-200 bg-emerald-50 text-slate-800"
-                            : "rounded-bl-md border border-[#EEE8FF] bg-white text-slate-800"
+                            ? "rounded-br-md border border-emerald-200 bg-emerald-50 text-slate-800"
+                            : "rounded-br-md border border-[#EEE8FF] bg-white text-slate-800"
                         }`}
                       >
-                        {!isSelf ? (
+                        {!isCustomer ? (
                           <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                             {isLiveAgent ? "Live Agent" : "AI Agent"}
                           </p>

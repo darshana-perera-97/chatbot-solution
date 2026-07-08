@@ -407,12 +407,28 @@ async function deliverAssistantText(client, msg, text) {
   return false;
 }
 
+const WHATSAPP_STALE_REPLY_MS = 2 * 60 * 1000;
+
+function getWhatsAppMessageAgeMs(msg) {
+  const ts = Number(msg?.timestamp);
+  if (!Number.isFinite(ts) || ts <= 0) return 0;
+  const messageMs = ts < 1e12 ? ts * 1000 : ts;
+  return Math.max(0, Date.now() - messageMs);
+}
+
+function isStaleWhatsAppMessage(msg) {
+  const ageMs = getWhatsAppMessageAgeMs(msg);
+  if (ageMs <= 0) return false;
+  return ageMs > WHATSAPP_STALE_REPLY_MS;
+}
+
 /**
  * @param {object} deps
  * @param {function} deps.completeWorkspaceChatTurn
  * @param {function} deps.sanitizeAgentDetailsUserId
  * @param {function} deps.getTestChatSessionByConversation
  * @param {function} deps.sanitizeChatMessages
+ * @param {function} deps.saveTestChatSession
  */
 function createWhatsAppBridge(deps) {
   const {
@@ -420,6 +436,7 @@ function createWhatsAppBridge(deps) {
     sanitizeAgentDetailsUserId,
     getTestChatSessionByConversation,
     sanitizeChatMessages,
+    saveTestChatSession,
   } = deps;
 
   /** @type {Map<string, object>} */
@@ -727,6 +744,41 @@ function createWhatsAppBridge(deps) {
       const jid = msg.from;
       const conversationId = jidToConversationId(jid);
       const body = typeof msg.body === "string" ? msg.body.trim() : "";
+
+      const entryNow = slots.get(key);
+      const label =
+        channelLabelFromClient(client) ||
+        (entryNow && entryNow.pushname) ||
+        (entryNow && entryNow.phone) ||
+        `WhatsApp ${safeAccountId}`;
+
+      if (isStaleWhatsAppMessage(msg)) {
+        if (body) {
+          const existingStale = getTestChatSessionByConversation(safe, conversationId);
+          const priorStale = (existingStale?.messages || [])
+            .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+            .map((m) => ({
+              role: m.role,
+              content: typeof m.content === "string" ? m.content : "",
+            }));
+          const messagesStale = sanitizeChatMessages([...priorStale, { role: "user", content: body }]);
+          const whatsappPeerPhoneStale = await resolvePeerWhatsappPhone(client, msg);
+          saveTestChatSession(safe, conversationId, messagesStale, {
+            chatSource: "whatsapp",
+            channelAccountName: label,
+            whatsappChatId: jid,
+            whatsappPeerPhone: whatsappPeerPhoneStale,
+            whatsappAccountId: safeAccountId,
+          });
+        }
+        waLog(
+          safe,
+          safeAccountId,
+          `skipped auto-reply for stale message (${Math.round(getWhatsAppMessageAgeMs(msg) / 1000)}s old)`
+        );
+        return;
+      }
+
       if (!body) {
         if (msg.hasMedia) {
           try {
@@ -737,13 +789,6 @@ function createWhatsAppBridge(deps) {
         }
         return;
       }
-
-      const entryNow = slots.get(key);
-      const label =
-        channelLabelFromClient(client) ||
-        (entryNow && entryNow.pushname) ||
-        (entryNow && entryNow.phone) ||
-        `WhatsApp ${safeAccountId}`;
 
       const existing = getTestChatSessionByConversation(safe, conversationId);
       const prior = (existing?.messages || [])
