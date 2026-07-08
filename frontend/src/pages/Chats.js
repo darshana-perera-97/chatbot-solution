@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, MoreVertical, Search, Send } from "lucide-react";
 import { useLocation } from "react-router-dom";
 import { apiUrl } from "../apiBase";
@@ -201,6 +201,7 @@ function Chats() {
   const [liveDraft, setLiveDraft] = useState("");
   const [liveSaving, setLiveSaving] = useState(false);
   const conversationIdFromQuery = new URLSearchParams(location.search).get("conversationId") || "";
+  const threadScrollRef = useRef(null);
 
   useEffect(() => {
     let active = true;
@@ -305,6 +306,12 @@ function Chats() {
     activeSession?.lead?.collectedData && typeof activeSession.lead.collectedData === "object"
       ? activeSession.lead.collectedData
       : {};
+
+  useEffect(() => {
+    const el = threadScrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [active?.id, messages.length, mobileShowThread]);
 
   const openThread = (id) => {
     setSelectedId(id);
@@ -544,7 +551,7 @@ function Chats() {
                 </div>
               ) : null}
 
-              <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+              <div ref={threadScrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
                 {Object.keys(leadCollected).length > 0 ? (
                   <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-3">
                     <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700">

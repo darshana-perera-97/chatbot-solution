@@ -575,6 +575,33 @@ const sanitizeSessionChatMessages = (raw) => {
   return out.slice(-60);
 };
 
+/** Keep live-agent messages in timeline order when persisting user/assistant-only payloads. */
+const mergeAgentMessagesPreservingOrder = (existingMessages, incomingUserAssistant) => {
+  const existing = sanitizeSessionChatMessages(existingMessages);
+  const incoming = sanitizeSessionChatMessages(
+    (incomingUserAssistant || []).filter((entry) => entry?.role !== "agent")
+  );
+  if (!existing.some((entry) => entry.role === "agent")) {
+    return incoming;
+  }
+
+  const merged = [];
+  let incomingIdx = 0;
+  for (const entry of existing) {
+    if (entry.role === "agent") {
+      merged.push(entry);
+      continue;
+    }
+    if (incomingIdx < incoming.length) {
+      merged.push(incoming[incomingIdx++]);
+    }
+  }
+  while (incomingIdx < incoming.length) {
+    merged.push(incoming[incomingIdx++]);
+  }
+  return sanitizeSessionChatMessages(merged);
+};
+
 const normalizeFieldKey = (label) =>
   String(label || "")
     .trim()
@@ -1643,7 +1670,8 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
     const existingSession = getTestChatSessionByConversation(userId, conversationId);
     const liveAgentEnabled = Boolean(existingSession?.liveAgentEnabled);
     if (liveAgentEnabled) {
-      saveTestChatSession(userId, conversationId, cleaned, {
+      const mergedMessages = mergeAgentMessagesPreservingOrder(existingSession?.messages, cleaned);
+      saveTestChatSession(userId, conversationId, mergedMessages, {
         liveAgentEnabled: true,
         ...sessionChannelOpts,
       });

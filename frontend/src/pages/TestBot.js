@@ -3,6 +3,7 @@ import { Send, Trash2 } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { AssistantAttachments } from "../components/AssistantAttachments";
+import { CHAT_SESSION_POLL_MS, normalizeSessionMessages } from "../chatSessionMessages";
 
 const conversationStorageKey = (userId) =>
   `workspace_testbot_conversation_id_${userId || "anonymous"}`;
@@ -58,6 +59,7 @@ function TestBot() {
   const [conversationId, setConversationId] = useState("");
   const [sessionLoading, setSessionLoading] = useState(true);
   const [collectedData, setCollectedData] = useState({});
+  const [liveAgentEnabled, setLiveAgentEnabled] = useState(false);
   const bottomRef = useRef(null);
 
   const profile = getWorkspaceUserProfile();
@@ -137,22 +139,14 @@ function TestBot() {
             ? data.lead.collectedData
             : {};
         setCollectedData(leadCollected);
-        const normalized = savedMessages
-          .filter((line) => line && (line.role === "assistant" || line.role === "user" || line.role === "agent"))
-          .map((line) => ({
-            role: line.role,
-            content: typeof line.content === "string" ? line.content : "",
-            ...(Array.isArray(line.attachments) && line.attachments.length > 0
-              ? { attachments: line.attachments }
-              : {}),
-          }))
-          .filter((line) => line.content.trim().length > 0);
+        const normalized = normalizeSessionMessages(savedMessages);
 
         if (normalized.length > 0) {
           setLines(normalized);
         } else {
           setLines(greetingText ? [{ role: "assistant", content: greetingText }] : []);
         }
+        setLiveAgentEnabled(Boolean(data?.session?.liveAgentEnabled));
       } catch (err) {
         if (!active) return;
         setLines(greetingText ? [{ role: "assistant", content: greetingText }] : []);
@@ -166,6 +160,45 @@ function TestBot() {
       active = false;
     };
   }, [agentProfileLoading, conversationId, userId, greetingText]);
+
+  useEffect(() => {
+    if (!userId || !conversationId || agentProfileLoading) return undefined;
+
+    let active = true;
+    let intervalId = null;
+
+    async function refreshSession() {
+      try {
+        const query = `?userId=${encodeURIComponent(userId)}&conversationId=${encodeURIComponent(
+          conversationId
+        )}`;
+        const res = await fetch(apiUrl(`/chat/test/session${query}`));
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !active) return;
+        const savedMessages = Array.isArray(data?.session?.messages) ? data.session.messages : [];
+        const normalized = normalizeSessionMessages(savedMessages);
+        if (normalized.length > 0) {
+          setLines(normalized);
+        }
+        setLiveAgentEnabled(Boolean(data?.session?.liveAgentEnabled));
+      } catch {
+        /* ignore background refresh errors */
+      }
+    }
+
+    if (liveAgentEnabled) {
+      intervalId = setInterval(() => {
+        if (!document.hidden) {
+          void refreshSession();
+        }
+      }, CHAT_SESSION_POLL_MS);
+    }
+
+    return () => {
+      active = false;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [agentProfileLoading, conversationId, liveAgentEnabled, userId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -210,6 +243,7 @@ function TestBot() {
       }
       if (!reply) {
         if (data.liveAgentEnabled || data.aiRepliesDisabled) {
+          setLiveAgentEnabled(Boolean(data.liveAgentEnabled));
           return;
         }
         throw new Error("Empty reply from server");
@@ -239,6 +273,7 @@ function TestBot() {
     setError("");
     setInput("");
     setCollectedData({});
+    setLiveAgentEnabled(false);
     setLines(greetingText ? [{ role: "assistant", content: greetingText }] : []);
   };
 

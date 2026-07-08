@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { AssistantAttachments } from "../components/AssistantAttachments";
+import { CHAT_SESSION_POLL_MS, normalizeSessionMessages } from "../chatSessionMessages";
 
 const WIDGET_WIDTH = 380;
 const WIDGET_HEIGHT = 640;
@@ -47,6 +48,7 @@ function EmbeddedChatbot() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [liveAgentEnabled, setLiveAgentEnabled] = useState(false);
   const [theme, setTheme] = useState({
     primaryColor: "#7C3AED",
     accentColor: "#A78BFA",
@@ -134,19 +136,13 @@ function EmbeddedChatbot() {
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !active) return;
         const messages = Array.isArray(data?.session?.messages) ? data.session.messages : [];
-        const normalized = messages
-          .filter((m) => m && (m.role === "user" || m.role === "assistant" || m.role === "agent"))
-          .map((m) => ({
-            role: m.role,
-            content: String(m.content || ""),
-            ...(Array.isArray(m.attachments) && m.attachments.length > 0 ? { attachments: m.attachments } : {}),
-          }))
-          .filter((m) => m.content.trim());
+        const normalized = normalizeSessionMessages(messages);
         if (normalized.length > 0) {
           setLines(normalized);
         } else {
           setLines([{ role: "assistant", content: "Hi! How can I help you today?" }]);
         }
+        setLiveAgentEnabled(Boolean(data?.session?.liveAgentEnabled));
       } catch {
         if (!active) return;
         setLines([{ role: "assistant", content: "Hi! How can I help you today?" }]);
@@ -157,6 +153,43 @@ function EmbeddedChatbot() {
       active = false;
     };
   }, [userId, conversationId, previewMode]);
+
+  useEffect(() => {
+    if (previewMode || !userId || !conversationId) return undefined;
+
+    let active = true;
+    let intervalId = null;
+
+    async function refreshSession() {
+      try {
+        const q = `?userId=${encodeURIComponent(userId)}&conversationId=${encodeURIComponent(conversationId)}`;
+        const res = await fetch(apiUrl(`/chat/test/session${q}`));
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !active) return;
+        const messages = Array.isArray(data?.session?.messages) ? data.session.messages : [];
+        const normalized = normalizeSessionMessages(messages);
+        if (normalized.length > 0) {
+          setLines(normalized);
+        }
+        setLiveAgentEnabled(Boolean(data?.session?.liveAgentEnabled));
+      } catch {
+        /* ignore background refresh errors */
+      }
+    }
+
+    if (liveAgentEnabled) {
+      intervalId = setInterval(() => {
+        if (!document.hidden) {
+          void refreshSession();
+        }
+      }, CHAT_SESSION_POLL_MS);
+    }
+
+    return () => {
+      active = false;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [conversationId, liveAgentEnabled, previewMode, userId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -195,6 +228,13 @@ function EmbeddedChatbot() {
       if (!res.ok) throw new Error(data.message || "Failed to send");
       const reply = typeof data.reply === "string" ? data.reply.trim() : "";
       const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+      if (!reply) {
+        if (data.liveAgentEnabled || data.aiRepliesDisabled) {
+          setLiveAgentEnabled(Boolean(data.liveAgentEnabled));
+          return;
+        }
+        throw new Error("Empty reply from server");
+      }
       if (reply) {
         setLines([
           ...next,
