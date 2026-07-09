@@ -982,7 +982,7 @@ function createWhatsAppBridge(deps) {
         return;
       }
 
-      if (result.kind === "live_agent") {
+      if (result.kind === "live_agent" || result.kind === "ai_disabled") {
         return;
       }
 
@@ -991,11 +991,6 @@ function createWhatsAppBridge(deps) {
           return (
             "Automatic replies aren't available — the server has no AI API key configured. " +
             "Your message was saved; please contact the workspace owner."
-          );
-        }
-        if (result.kind === "ai_disabled") {
-          return (
-            "AI auto-replies are turned off for this workspace. Your message was saved; an agent will follow up when available."
           );
         }
         if (result.kind === "error") {
