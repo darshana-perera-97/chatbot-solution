@@ -235,10 +235,12 @@ function Dashboard() {
       return parts.length ? parts.join(" · ") : "Linked device active";
     }
     const phase = typeof waStatus?.phase === "string" ? waStatus.phase : "";
-    if (phase && phase !== "disconnected") {
+    if (phase && !["disconnected", "idle"].includes(phase)) {
       return phase === "qr"
         ? "Scan QR in Integrations"
-        : `${phase.charAt(0).toUpperCase() + phase.slice(1)}…`;
+        : phase === "reconnecting"
+          ? "Reconnecting WhatsApp…"
+          : `${phase.charAt(0).toUpperCase() + phase.slice(1)}…`;
     }
     return "Connect in Integrations";
   })();

@@ -22,9 +22,9 @@ function accountConnectivity(account) {
       pulse: false,
     };
   }
-  if (["qr", "authenticated", "initializing"].includes(String(account?.phase || ""))) {
+  if (["qr", "authenticated", "initializing", "reconnecting"].includes(String(account?.phase || ""))) {
     return {
-      label: "Connecting…",
+      label: account?.phase === "reconnecting" ? "Reconnecting…" : "Connecting…",
       ring: "ring-amber-300/80",
       iconColor: "text-amber-500",
       iconBg: "bg-amber-50",
@@ -40,7 +40,7 @@ function accountConnectivity(account) {
       pulse: false,
     };
   }
-  if (account?.phase === "disconnected" || account?.persisted) {
+  if (account?.phase === "disconnected") {
     return {
       label: "Disconnected",
       ring: "ring-orange-300/80",

@@ -2365,6 +2365,52 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "POST" && reqPath === "/integrations/whatsapp/regenerate-qr") {
+    parseJsonBody(
+      req,
+      (parsedBody) => {
+        void (async () => {
+          try {
+            const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
+            if (!sanitizeAgentDetailsUserId(userId)) {
+              return sendJson(res, 400, { message: "Valid userId is required" }, adminCorsHeaders);
+            }
+            const { plan, limit } = getWorkspacePlanContext(userId);
+            const accountId = sanitizeWhatsAppAccountId(parsedBody.accountId, limit) || "1";
+            if (Number(accountId) > limit) {
+              return sendJson(
+                res,
+                403,
+                {
+                  message: `Your ${plan || "current"} plan allows up to ${limit} WhatsApp account(s).`,
+                  plan,
+                  limit,
+                },
+                adminCorsHeaders
+              );
+            }
+            await whatsappBridge.regenerateQr(userId, accountId);
+            return sendJson(
+              res,
+              200,
+              {
+                message: "QR code regenerated",
+                ...whatsappBridge.getStatus(userId, limit),
+                plan,
+              },
+              adminCorsHeaders
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return sendJson(res, 500, { message: msg }, adminCorsHeaders);
+          }
+        })();
+      },
+      () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
+    );
+    return;
+  }
+
   if (req.method === "POST" && reqPath === "/integrations/whatsapp/disconnect") {
     parseJsonBody(
       req,
@@ -2556,19 +2602,48 @@ server.listen(PORT, () => {
     `[whatsapp] auto-connect: initializing ${restartLinks.length} WhatsApp client(s) (saved sessions + disk)…`
   );
   void (async () => {
-    for (const link of restartLinks) {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const reconnectWithRetry = async (link, attempt = 1) => {
       const uid = String(link.userId || "").trim();
       const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
-      if (!sanitizeAgentDetailsUserId(uid)) continue;
+      if (!sanitizeAgentDetailsUserId(uid)) return;
+      const maxAttempts = 3;
       try {
         await whatsappBridge.startLinking(uid, accountId);
+        console.log(`[whatsapp] auto-connect: restored ${uid}::${accountId}`);
       } catch (e) {
+        if (attempt < maxAttempts) {
+          const delayMs = 4000 * attempt;
+          console.warn(
+            `[whatsapp] auto-connect retry ${attempt}/${maxAttempts - 1} for ${uid}::${accountId} in ${delayMs}ms`
+          );
+          await sleep(delayMs);
+          return reconnectWithRetry(link, attempt + 1);
+        }
         console.warn(
           "[whatsapp] auto-connect failed:",
           `${uid}::${accountId}`,
           e instanceof Error ? e.message : String(e)
         );
       }
-    }
+    };
+    await Promise.allSettled(restartLinks.map((link) => reconnectWithRetry(link)));
   })();
+});
+
+async function gracefulShutdown(signal) {
+  console.log(`[server] ${signal} received, shutting down WhatsApp clients…`);
+  try {
+    await whatsappBridge.shutdownAll();
+  } catch {
+    /* ignore */
+  }
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => {
+  void gracefulShutdown("SIGTERM");
+});
+process.on("SIGINT", () => {
+  void gracefulShutdown("SIGINT");
 });

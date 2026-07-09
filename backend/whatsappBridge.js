@@ -559,6 +559,8 @@ function createWhatsAppBridge(deps) {
 
   /** @type {Map<string, object>} */
   const slots = new Map();
+  /** @type {Set<string>} */
+  const reconnecting = new Set();
   const waLog = (workspaceUserId, accountId, message, ...extra) => {
     const prefix = `[whatsapp][user:${workspaceUserId}][account:${accountId}]`;
     if (extra.length) {
@@ -650,6 +652,39 @@ function createWhatsAppBridge(deps) {
       });
   }
 
+  async function ensureConnected(workspaceUserId, accountId = "1") {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe) return;
+    if (!hasPersistedAccountSession(safe, safeAccountId)) return;
+
+    const key = slotKey(safe, safeAccountId);
+    const entry = slots.get(key);
+    if (entry?.phase === "ready") return;
+    if (
+      entry &&
+      ["initializing", "qr", "authenticated", "reconnecting"].includes(entry.phase)
+    ) {
+      return;
+    }
+    if (reconnecting.has(key)) return;
+
+    reconnecting.add(key);
+    try {
+      waLog(safe, safeAccountId, "auto-reconnecting persisted session");
+      await startLinking(safe, safeAccountId);
+    } catch (e) {
+      waLog(
+        safe,
+        safeAccountId,
+        "auto-reconnect failed",
+        e instanceof Error ? e.message : String(e)
+      );
+    } finally {
+      reconnecting.delete(key);
+    }
+  }
+
   function buildAccountStatus(workspaceUserId, accountId, entry) {
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     if (!entry) {
@@ -657,7 +692,7 @@ function createWhatsAppBridge(deps) {
       return {
         accountId: safeAccountId,
         label: `Account ${safeAccountId}`,
-        phase: persisted ? "disconnected" : "idle",
+        phase: persisted ? "reconnecting" : "idle",
         connected: false,
         qrDataUrl: "",
         error: "",
@@ -670,7 +705,11 @@ function createWhatsAppBridge(deps) {
     return {
       accountId: safeAccountId,
       label: `Account ${safeAccountId}`,
-      phase: entry.phase,
+      phase:
+        entry.phase === "disconnected" &&
+        hasPersistedAccountSession(workspaceUserId, safeAccountId)
+          ? "reconnecting"
+          : entry.phase,
       connected: entry.phase === "ready",
       qrDataUrl: entry.qrDataUrl || "",
       error: entry.error || "",
@@ -701,6 +740,14 @@ function createWhatsAppBridge(deps) {
       const accountId = String(i);
       const key = slotKey(safe, accountId);
       const slotEntry = slots.get(key);
+      const persisted = hasPersistedAccountSession(safe, accountId);
+      if (
+        persisted &&
+        (!slotEntry || slotEntry.phase === "disconnected") &&
+        !reconnecting.has(key)
+      ) {
+        void ensureConnected(safe, accountId);
+      }
       if (slotEntry) maybeRefreshProfilePic(slotEntry);
       accounts.push(buildAccountStatus(safe, accountId, slotEntry));
     }
@@ -818,6 +865,7 @@ function createWhatsAppBridge(deps) {
     client.on("authenticated", () => {
       entry.phase = "authenticated";
       entry.qrDataUrl = "";
+      whatsappAutoStart.addLink(safe, safeAccountId);
       waLog(safe, safeAccountId, "account login authenticated");
     });
 
@@ -982,6 +1030,25 @@ function createWhatsAppBridge(deps) {
     return { ok: true };
   }
 
+  async function regenerateQr(workspaceUserId, accountId = "1") {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe) throw new Error("Invalid user id");
+    if (!Client || !LocalAuth) {
+      throw new Error("whatsapp-web.js is not installed. Run npm install in the backend folder.");
+    }
+    const key = slotKey(safe, safeAccountId);
+    const entry = slots.get(key);
+    if (entry?.phase === "ready") {
+      throw new Error("Account is already connected. Disconnect first to link a new device.");
+    }
+    waLog(safe, safeAccountId, "regenerating QR code");
+    await destroyClient(safe, safeAccountId);
+    removeAuthSession(safe, safeAccountId);
+    reconnecting.delete(key);
+    return startLinking(safe, safeAccountId);
+  }
+
   async function resolvePeerPhone(workspaceUserId, accountId, jid) {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
@@ -1010,14 +1077,28 @@ function createWhatsAppBridge(deps) {
     return resolvePeerPhone(workspaceUserId, accountId, jid);
   }
 
+  async function shutdownAll() {
+    const keys = [...slots.keys()];
+    await Promise.allSettled(
+      keys.map((key) => {
+        const parts = key.split("::");
+        if (parts.length !== 2) return Promise.resolve();
+        return destroyClient(parts[0], parts[1]);
+      })
+    );
+  }
+
   return {
     startLinking,
+    regenerateQr,
+    ensureConnected,
     destroyClient,
     disconnectAndForget,
     getStatus,
     sendText,
     resolvePeerPhone,
     resolvePeerPhoneForSession,
+    shutdownAll,
     jidToConversationId,
     isLibraryAvailable: Boolean(Client),
   };

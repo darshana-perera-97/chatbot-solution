@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, Globe, MessageCircle, Plus, X } from "lucide-react";
+import { ArrowRight, Globe, MessageCircle, Plus, RefreshCw, X } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { getWhatsAppAccountLimit, normalizePlan } from "../planConfig";
@@ -165,7 +165,9 @@ function Integrations() {
         accounts[0];
       const targetId = target?.accountId || String(accountId || "1");
       const phase = typeof target?.phase === "string" ? target.phase : "";
-      const shouldRetryStart = !["ready", "qr", "authenticated", "initializing"].includes(phase);
+      const shouldRetryStart = !["ready", "qr", "authenticated", "initializing", "reconnecting"].includes(
+        phase
+      );
       if (shouldRetryStart) {
         const startRes = await fetch(apiUrl("/integrations/whatsapp/start"), {
           method: "POST",
@@ -197,6 +199,27 @@ function Integrations() {
       });
       const body = await startRes.json().catch(() => ({}));
       if (!startRes.ok) throw new Error(body.message || "Could not start WhatsApp client");
+      setWaStatus(body);
+    } catch (e) {
+      setWaModalError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setWaRefreshing(false);
+    }
+  };
+
+  const regenerateQr = async (accountId = activeAccountId) => {
+    if (!userId) return;
+    setActiveAccountId(String(accountId));
+    setWaModalError("");
+    setWaRefreshing(true);
+    try {
+      const res = await fetch(apiUrl("/integrations/whatsapp/regenerate-qr"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, accountId: String(accountId) }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.message || "Could not regenerate QR code");
       setWaStatus(body);
     } catch (e) {
       setWaModalError(e instanceof Error ? e.message : "Request failed");
@@ -270,6 +293,9 @@ function Integrations() {
   const activeConnected = Boolean(activeAccount?.connected || activeAccount?.phase === "ready");
   const activePhase = typeof activeAccount?.phase === "string" ? activeAccount.phase : "";
   const activeAccountLabel = accountLabel(activeAccount) || "Connected";
+  const canRegenerateQr =
+    !activeConnected &&
+    ["qr", "initializing", "authenticated", "error"].includes(activePhase);
 
   return (
     <>
@@ -485,9 +511,13 @@ function Integrations() {
                             <p className="mt-0.5 truncate text-xs text-slate-500">
                               {connected
                                 ? accountLabel(account)
-                                : account.phase === "qr"
-                                  ? "Waiting for scan"
-                                  : "Not linked"}
+                                : account.phase === "reconnecting"
+                                  ? "Restoring session…"
+                                  : account.phase === "qr"
+                                    ? "Waiting for scan"
+                                    : account.phase === "initializing" || account.phase === "authenticated"
+                                      ? "Connecting…"
+                                      : "Not linked"}
                             </p>
                           </span>
                         </button>
@@ -543,11 +573,16 @@ function Integrations() {
 
                 <div className="mt-4 flex min-h-[220px] flex-col items-center justify-center rounded-2xl border border-[#E9DFFF] bg-[#FCFAFF] p-4 shadow-inner">
                   {activeAccount?.qrDataUrl && !activeConnected ? (
-                    <img
-                      src={activeAccount.qrDataUrl}
-                      alt="WhatsApp QR code"
-                      className="h-56 w-56 rounded-xl border border-[#E9DFFF] bg-white p-2 shadow-sm"
-                    />
+                    <>
+                      <img
+                        src={activeAccount.qrDataUrl}
+                        alt="WhatsApp QR code"
+                        className="h-56 w-56 rounded-xl border border-[#E9DFFF] bg-white p-2 shadow-sm"
+                      />
+                      <p className="mt-3 text-center text-xs text-slate-500">
+                        QR codes expire after a short time. Regenerate if scan fails.
+                      </p>
+                    </>
                   ) : null}
                   {activeConnected ? (
                     <div className="text-center">
@@ -573,6 +608,17 @@ function Integrations() {
                 </div>
 
                 <div className="mt-4 flex flex-wrap gap-2">
+                  {canRegenerateQr ? (
+                    <button
+                      type="button"
+                      onClick={() => void regenerateQr(activeAccountId)}
+                      disabled={waRefreshing}
+                      className="inline-flex items-center gap-2 rounded-xl border border-[#E9DFFF] bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-[#FCFAFF]"
+                    >
+                      <RefreshCw size={16} className={waRefreshing ? "animate-spin" : ""} />
+                      {waRefreshing ? "Regenerating…" : "Regenerate QR"}
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     onClick={() => void refreshOrRetryWhatsApp({ accountId: activeAccountId })}
