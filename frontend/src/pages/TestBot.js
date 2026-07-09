@@ -3,7 +3,7 @@ import { Send, Trash2 } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { AssistantAttachments } from "../components/AssistantAttachments";
-import { CHAT_SESSION_POLL_MS, normalizeSessionMessages } from "../chatSessionMessages";
+import { CHAT_SESSION_POLL_FAST_MS, CHAT_SESSION_POLL_MS, normalizeSessionMessages } from "../chatSessionMessages";
 
 const conversationStorageKey = (userId) =>
   `workspace_testbot_conversation_id_${userId || "anonymous"}`;
@@ -191,7 +191,7 @@ function TestBot() {
         if (!document.hidden) {
           void refreshSession();
         }
-      }, CHAT_SESSION_POLL_MS);
+      }, CHAT_SESSION_POLL_FAST_MS);
     }
 
     return () => {

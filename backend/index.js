@@ -1682,7 +1682,8 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
     }
 
     if (!aiRepliesEnabled) {
-      saveTestChatSession(userId, conversationId, cleaned, {
+      const mergedMessages = mergeAgentMessagesPreservingOrder(existingSession?.messages, cleaned);
+      saveTestChatSession(userId, conversationId, mergedMessages, {
         liveAgentEnabled: false,
         ...sessionChannelOpts,
       });
@@ -1718,7 +1719,11 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
     );
     const assistantRecord = { role: "assistant", content: reply };
     if (attachments.length) assistantRecord.attachments = attachments;
-    saveTestChatSession(userId, conversationId, [...cleaned, assistantRecord], {
+    const mergedMessages = mergeAgentMessagesPreservingOrder(existingSession?.messages, [
+      ...cleaned,
+      assistantRecord,
+    ]);
+    saveTestChatSession(userId, conversationId, mergedMessages, {
       liveAgentEnabled: false,
       ...sessionChannelOpts,
     });
@@ -1758,6 +1763,7 @@ const whatsappBridge = createWhatsAppBridge({
   getTestChatSessionByConversation,
   sanitizeChatMessages,
   saveTestChatSession,
+  mergeAgentMessagesPreservingOrder,
 });
 
 const enrichWhatsappSessionPeerPhones = async (userIdRaw, sessions) => {
@@ -2281,29 +2287,72 @@ const server = http.createServer((req, res) => {
       req,
       (parsedBody) => {
         void (async () => {
-          const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
-          const conversationId =
-            typeof parsedBody.conversationId === "string" ? parsedBody.conversationId : "";
-          const message = typeof parsedBody.message === "string" ? parsedBody.message : "";
-          const session = appendLiveAgentMessage(userId, conversationId, message);
-          if (!session) {
-            return sendJson(
-              res,
-              404,
-              { message: "Conversation not found, live mode disabled, or message empty" },
-              adminCorsHeaders
-            );
+          try {
+            const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
+            const conversationId =
+              typeof parsedBody.conversationId === "string" ? parsedBody.conversationId : "";
+            const message = typeof parsedBody.message === "string" ? parsedBody.message : "";
+            let session = appendLiveAgentMessage(userId, conversationId, message);
+            if (!session) {
+              return sendJson(
+                res,
+                404,
+                { message: "Conversation not found, live mode disabled, or message empty" },
+                adminCorsHeaders
+              );
+            }
+
+            let whatsappDelivery = null;
+            if (sanitizeChatSource(session.chatSource) === "whatsapp") {
+              let waPeer =
+                typeof session.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
+              if (!waPeer) {
+                waPeer = whatsappBridge.conversationIdToWhatsappJid(session.conversationId);
+                if (waPeer) {
+                  saveTestChatSession(userId, conversationId, session.messages, {
+                    liveAgentEnabled: true,
+                    whatsappChatId: waPeer,
+                    chatSource: "whatsapp",
+                    whatsappAccountId: session.whatsappAccountId,
+                  });
+                  session =
+                    getTestChatSessionByConversation(userId, conversationId) || session;
+                }
+              }
+              if (waPeer) {
+                const waAccountId =
+                  typeof session.whatsappAccountId === "string"
+                    ? sanitizeWhatsAppAccountId(session.whatsappAccountId) || "1"
+                    : "1";
+                whatsappDelivery = await whatsappBridge.sendText(userId, waAccountId, waPeer, message);
+              } else {
+                whatsappDelivery = {
+                  ok: false,
+                  message: "WhatsApp chat id is missing for this conversation.",
+                };
+              }
+            }
+
+            const payload = { session };
+            if (whatsappDelivery) payload.whatsappDelivery = whatsappDelivery;
+            if (whatsappDelivery && !whatsappDelivery.ok) {
+              return sendJson(
+                res,
+                502,
+                {
+                  ...payload,
+                  message:
+                    whatsappDelivery.message ||
+                    "Message saved in workspace but could not be delivered on WhatsApp.",
+                },
+                adminCorsHeaders
+              );
+            }
+            return sendJson(res, 200, payload, adminCorsHeaders);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : "Could not send live agent reply";
+            return sendJson(res, 500, { message }, adminCorsHeaders);
           }
-          const waPeer =
-            typeof session.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
-          if (sanitizeChatSource(session.chatSource) === "whatsapp" && waPeer) {
-            const waAccountId =
-              typeof session.whatsappAccountId === "string"
-                ? sanitizeWhatsAppAccountId(session.whatsappAccountId) || "1"
-                : "1";
-            await whatsappBridge.sendText(userId, waAccountId, waPeer, message);
-          }
-          return sendJson(res, 200, { session }, adminCorsHeaders);
         })();
       },
       () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { AssistantAttachments } from "../components/AssistantAttachments";
-import { CHAT_SESSION_POLL_MS, normalizeSessionMessages } from "../chatSessionMessages";
+import { CHAT_SESSION_POLL_FAST_MS, CHAT_SESSION_POLL_MS, normalizeSessionMessages } from "../chatSessionMessages";
 
 const WIDGET_WIDTH = 380;
 const WIDGET_HEIGHT = 640;
@@ -182,7 +182,7 @@ function EmbeddedChatbot() {
         if (!document.hidden) {
           void refreshSession();
         }
-      }, CHAT_SESSION_POLL_MS);
+      }, CHAT_SESSION_POLL_FAST_MS);
     }
 
     return () => {

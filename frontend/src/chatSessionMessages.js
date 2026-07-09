@@ -1,4 +1,7 @@
 export const CHAT_SESSION_POLL_MS = 4000;
+export const CHAT_SESSION_POLL_FAST_MS = 2000;
+export const CHATS_OPERATOR_POLL_MS = 2000;
+export const CHATS_OPERATOR_POLL_FAST_MS = 1500;
 
 export function normalizeSessionMessages(rawMessages) {
   if (!Array.isArray(rawMessages)) return [];

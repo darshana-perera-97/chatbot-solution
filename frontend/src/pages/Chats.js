@@ -4,6 +4,7 @@ import { useLocation } from "react-router-dom";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { AssistantAttachments } from "../components/AssistantAttachments";
+import { CHATS_OPERATOR_POLL_FAST_MS, CHATS_OPERATOR_POLL_MS } from "../chatSessionMessages";
 
 function formatConversationTime(iso) {
   const date = Date.parse(String(iso || ""));
@@ -203,6 +204,16 @@ function Chats() {
   const conversationIdFromQuery = new URLSearchParams(location.search).get("conversationId") || "";
   const threadScrollRef = useRef(null);
 
+  const needsFastRefresh = useMemo(
+    () =>
+      sessions.some(
+        (session) =>
+          Boolean(session?.liveAgentEnabled) ||
+          String(session?.chatSource || "").toLowerCase() === "whatsapp"
+      ),
+    [sessions]
+  );
+
   useEffect(() => {
     let active = true;
     let intervalId = null;
@@ -252,17 +263,18 @@ function Chats() {
     }
 
     loadChats(false);
+    const pollMs = needsFastRefresh ? CHATS_OPERATOR_POLL_FAST_MS : CHATS_OPERATOR_POLL_MS;
     intervalId = setInterval(() => {
       if (!document.hidden) {
         void loadChats(true);
       }
-    }, 4000);
+    }, pollMs);
 
     return () => {
       active = false;
       if (intervalId) clearInterval(intervalId);
     };
-  }, [userId, conversationIdFromQuery]);
+  }, [userId, conversationIdFromQuery, needsFastRefresh]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -364,7 +376,14 @@ function Chats() {
         }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.message || "Could not send live agent reply");
+      if (!res.ok) {
+        if (data?.session) {
+          setSessions((prev) =>
+            prev.map((session) => (session.id === data.session?.id ? data.session : session))
+          );
+        }
+        throw new Error(data.message || "Could not send live agent reply");
+      }
       const updated = data?.session;
       setLiveDraft("");
       setSessions((prev) =>

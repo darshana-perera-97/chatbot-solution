@@ -342,6 +342,26 @@ function jidToConversationId(jid) {
   return `wa_${safe}`;
 }
 
+/** Best-effort reverse of {@link jidToConversationId} when whatsappChatId was not persisted. */
+function conversationIdToWhatsappJid(conversationId) {
+  const safe = String(conversationId || "").trim();
+  if (!safe.startsWith("wa_")) return "";
+  const rest = safe.slice(3);
+  if (!rest) return "";
+  if (rest.endsWith("_c_us")) return `${rest.slice(0, -5)}@c.us`;
+  if (rest.endsWith("_lid")) return `${rest.slice(0, -4)}@lid`;
+  if (rest.endsWith("_g_us")) return `${rest.slice(0, -5)}@g.us`;
+  const lastUnderscore = rest.lastIndexOf("_");
+  if (lastUnderscore > 0) {
+    const user = rest.slice(0, lastUnderscore);
+    const suffix = rest.slice(lastUnderscore + 1);
+    if (suffix === "us") return `${user}@c.us`;
+    if (suffix === "lid") return `${user}@lid`;
+    if (suffix.length <= 4) return `${user}@${suffix}`;
+  }
+  return "";
+}
+
 function toE164Phone(raw) {
   const digits = String(raw || "").replace(/\D/g, "");
   if (digits.length < 7 || digits.length > 18) return "";
@@ -475,8 +495,58 @@ async function profilePicDataUrlFromClient(client) {
 
 /**
  * WhatsApp Web sends read receipts (`sendSeen`) before the actual message; if that step throws,
- * nothing is delivered. Disable seen + retry without quote when needed.
+ * nothing is delivered. Disable seen + retry via alternate chat ids when needed.
  */
+async function deliverTextToPeer(client, peerJid, text, options = {}) {
+  const trimmed = typeof text === "string" ? text.trim() : "";
+  const peer = typeof peerJid === "string" ? peerJid.trim() : "";
+  if (!trimmed || !peer || !client) {
+    return { ok: false, message: "Missing client, peer, or message text" };
+  }
+
+  const quoteId =
+    typeof options.quotedMessageId === "string" ? options.quotedMessageId.trim() : "";
+
+  const attempt = async (jid, sendOptions = {}) => {
+    try {
+      const sent = await client.sendMessage(jid, trimmed, { sendSeen: false, ...sendOptions });
+      return Boolean(sent);
+    } catch (e) {
+      console.warn("[whatsapp] sendMessage:", e instanceof Error ? e.message : String(e));
+      return false;
+    }
+  };
+
+  if (quoteId && (await attempt(peer, { quotedMessageId: quoteId }))) {
+    return { ok: true };
+  }
+  if (await attempt(peer)) return { ok: true };
+
+  try {
+    if (typeof client.getChatById === "function") {
+      const chat = await client.getChatById(peer);
+      const cid = chat?.id?._serialized;
+      if (cid && cid !== peer && (await attempt(cid))) return { ok: true };
+    }
+  } catch (e) {
+    console.warn("[whatsapp] getChatById:", e instanceof Error ? e.message : String(e));
+  }
+
+  if (peer.endsWith("@lid") && typeof client.getContactLidAndPhone === "function") {
+    try {
+      const rows = await client.getContactLidAndPhone([peer]);
+      for (const row of rows || []) {
+        const pn = typeof row?.pn === "string" ? row.pn.trim() : "";
+        if (pn && (await attempt(pn))) return { ok: true };
+      }
+    } catch (e) {
+      console.warn("[whatsapp] getContactLidAndPhone:", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  return { ok: false, message: "Message was not sent (chat unavailable or WhatsApp not ready?)" };
+}
+
 async function deliverAssistantText(client, msg, text) {
   const trimmed = typeof text === "string" ? text.trim() : "";
   if (!trimmed) return false;
@@ -486,29 +556,15 @@ async function deliverAssistantText(client, msg, text) {
   const quoteId =
     msg.id && typeof msg.id._serialized === "string" ? msg.id._serialized : "";
 
-  const attempt = async (options) => {
-    try {
-      const sent = await client.sendMessage(peer, trimmed, options);
-      return Boolean(sent);
-    } catch (e) {
-      console.warn("[whatsapp] sendMessage:", e instanceof Error ? e.message : String(e));
-      return false;
-    }
-  };
-
-  if (quoteId && (await attempt({ quotedMessageId: quoteId, sendSeen: false }))) return true;
-  if (await attempt({ sendSeen: false })) return true;
+  const direct = await deliverTextToPeer(client, peer, trimmed, { quotedMessageId: quoteId });
+  if (direct.ok) return true;
 
   try {
     const chat = await msg.getChat();
     const cid = chat?.id?._serialized;
     if (cid && cid !== peer) {
-      try {
-        const sent = await client.sendMessage(cid, trimmed, { sendSeen: false });
-        if (sent) return true;
-      } catch (e) {
-        console.warn("[whatsapp] send via chat id:", e instanceof Error ? e.message : String(e));
-      }
+      const viaChat = await deliverTextToPeer(client, cid, trimmed);
+      if (viaChat.ok) return true;
     }
   } catch (e) {
     console.warn("[whatsapp] getChat:", e instanceof Error ? e.message : String(e));
@@ -547,6 +603,7 @@ function isStaleWhatsAppMessage(msg) {
  * @param {function} deps.getTestChatSessionByConversation
  * @param {function} deps.sanitizeChatMessages
  * @param {function} deps.saveTestChatSession
+ * @param {function} deps.mergeAgentMessagesPreservingOrder
  */
 function createWhatsAppBridge(deps) {
   const {
@@ -555,6 +612,7 @@ function createWhatsAppBridge(deps) {
     getTestChatSessionByConversation,
     sanitizeChatMessages,
     saveTestChatSession,
+    mergeAgentMessagesPreservingOrder,
   } = deps;
 
   /** @type {Map<string, object>} */
@@ -769,16 +827,50 @@ function createWhatsAppBridge(deps) {
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     const body = typeof text === "string" ? text.trim() : "";
     const jid = typeof peerJid === "string" ? peerJid.trim() : "";
-    if (!safe || !jid || !body) return { ok: false };
-    const entry = slots.get(slotKey(safe, safeAccountId));
-    if (!entry?.client || entry.phase !== "ready") return { ok: false };
-    try {
-      const sent = await entry.client.sendMessage(jid, body, { sendSeen: false });
-      if (!sent) return { ok: false, message: "Message was not sent (chat unavailable?)" };
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, message: e instanceof Error ? e.message : String(e) };
+    if (!safe || !jid || !body) {
+      return { ok: false, message: "Missing workspace user, WhatsApp peer, or message text" };
     }
+
+    const tryOnClient = async (client) => {
+      if (!client) return null;
+      return deliverTextToPeer(client, jid, body);
+    };
+
+    const primaryKey = slotKey(safe, safeAccountId);
+    const primary = slots.get(primaryKey);
+    if (primary?.client && primary.phase === "ready") {
+      const result = await tryOnClient(primary.client);
+      if (result?.ok) return result;
+      if (result && !result.ok) {
+        waLog(safe, safeAccountId, "live-agent send failed on primary account", result.message || "");
+      }
+    } else {
+      waLog(
+        safe,
+        safeAccountId,
+        `live-agent send skipped: WhatsApp account not ready (phase=${primary?.phase || "missing"})`
+      );
+    }
+
+    for (const [slotId, slotEntry] of slots.entries()) {
+      if (slotId === primaryKey) continue;
+      if (!slotId.startsWith(`${safe}:`)) continue;
+      if (!slotEntry?.client || slotEntry.phase !== "ready") continue;
+      const accountFromSlot = slotId.split("::")[1] || safeAccountId;
+      const result = await tryOnClient(slotEntry.client);
+      if (result?.ok) {
+        waLog(safe, accountFromSlot, "live-agent send succeeded via fallback linked account");
+        return result;
+      }
+    }
+
+    return {
+      ok: false,
+      message:
+        primary?.phase === "ready"
+          ? "Message was not sent (chat unavailable?)"
+          : "WhatsApp is not connected. Link the account and try again.",
+    };
   }
 
   async function startLinking(workspaceUserId, accountId = "1") {
@@ -927,7 +1019,13 @@ function createWhatsAppBridge(deps) {
               role: m.role,
               content: typeof m.content === "string" ? m.content : "",
             }));
-          const messagesStale = sanitizeChatMessages([...priorStale, { role: "user", content: body }]);
+          const incomingStale = sanitizeChatMessages([
+            ...priorStale,
+            { role: "user", content: body },
+          ]);
+          const messagesStale = mergeAgentMessagesPreservingOrder
+            ? mergeAgentMessagesPreservingOrder(existingStale?.messages, incomingStale)
+            : incomingStale;
           const whatsappPeerPhoneStale = await resolvePeerWhatsappPhone(client, msg);
           saveTestChatSession(safe, conversationId, messagesStale, {
             chatSource: "whatsapp",
@@ -1095,6 +1193,7 @@ function createWhatsAppBridge(deps) {
     resolvePeerPhoneForSession,
     shutdownAll,
     jidToConversationId,
+    conversationIdToWhatsappJid,
     isLibraryAvailable: Boolean(Client),
   };
 }
@@ -1102,4 +1201,5 @@ function createWhatsAppBridge(deps) {
 module.exports = {
   createWhatsAppBridge,
   jidToConversationId,
+  conversationIdToWhatsappJid,
 };
