@@ -1,5 +1,6 @@
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const { execSync } = require("child_process");
 const QRCode = require("qrcode");
 const whatsappAutoStart = require("./whatsappAutoStart");
@@ -61,6 +62,89 @@ function hasPersistedAccountSession(workspaceUserId, accountId = "1") {
   return fs.existsSync(resolveAccountSessionDir(workspaceUserId, accountId));
 }
 
+const ELF_MACHINE = {
+  x64: 62, // EM_X86_64
+  arm64: 183, // EM_AARCH64
+  arm: 40, // EM_ARM
+  ia32: 3, // EM_386
+};
+
+function expectedElfMachineForHost() {
+  const arch = os.arch();
+  if (arch === "x64" || arch === "amd64") return ELF_MACHINE.x64;
+  if (arch === "arm64" || arch === "aarch64") return ELF_MACHINE.arm64;
+  if (arch === "arm") return ELF_MACHINE.arm;
+  if (arch === "ia32" || arch === "x86") return ELF_MACHINE.ia32;
+  return null;
+}
+
+function readElfMachineType(filePath) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const header = Buffer.alloc(20);
+    const bytesRead = fs.readSync(fd, header, 0, header.length, 0);
+    if (bytesRead < 20) return null;
+    if (header[0] !== 0x7f || header[1] !== 0x45 || header[2] !== 0x4c || header[3] !== 0x46) {
+      return null;
+    }
+    return header.readUInt16LE(18);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function isCompatibleChromeExecutable(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return false;
+
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+  } catch {
+    return false;
+  }
+
+  if (process.platform !== "linux") return true;
+
+  const expectedMachine = expectedElfMachineForHost();
+  if (expectedMachine == null) return true;
+
+  const actualMachine = readElfMachineType(filePath);
+  if (actualMachine == null) {
+    // Some distros ship a small shell wrapper; allow it and let Chromium start.
+    return true;
+  }
+
+  if (actualMachine !== expectedMachine) {
+    console.warn(
+      `[whatsapp] skipping browser binary (wrong CPU architecture): ${filePath} ` +
+        `(host=${os.arch()}, elf=${actualMachine}, expected=${expectedMachine})`
+    );
+    return false;
+  }
+
+  // Puppeteer occasionally caches linux_arm with an x64 chrome folder.
+  const normalized = filePath.replace(/\\/g, "/");
+  if (
+    (os.arch() === "arm64" || os.arch() === "aarch64") &&
+    normalized.includes("/.cache/puppeteer/") &&
+    normalized.includes("linux_arm") &&
+    normalized.includes("chrome-linux64")
+  ) {
+    console.warn(
+      `[whatsapp] skipping mismatched Puppeteer Chrome cache for ARM Linux: ${filePath}`
+    );
+    return false;
+  }
+
+  return true;
+}
+
+function pickChromeExecutable(candidates) {
+  for (const candidate of candidates) {
+    if (isCompatibleChromeExecutable(candidate)) return candidate;
+  }
+  return "";
+}
+
 function resolveChromeExecutablePath() {
   const fromEnv =
     (typeof process.env.PUPPETEER_EXECUTABLE_PATH === "string" &&
@@ -70,8 +154,14 @@ function resolveChromeExecutablePath() {
     (typeof process.env.CHROME_BIN === "string" && process.env.CHROME_BIN.trim()) ||
     (typeof process.env.CHROMIUM_PATH === "string" && process.env.CHROMIUM_PATH.trim()) ||
     "";
-  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
-  if (fromEnv) return "";
+
+  if (fromEnv) {
+    const envPath = pickChromeExecutable([fromEnv]);
+    if (envPath) return envPath;
+    console.warn(
+      `[whatsapp] configured browser path is missing or incompatible: ${fromEnv}`
+    );
+  }
 
   const candidates = [];
   if (process.platform === "darwin") {
@@ -97,9 +187,8 @@ function resolveChromeExecutablePath() {
     );
   }
 
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
-  }
+  const fromKnownPaths = pickChromeExecutable(candidates);
+  if (fromKnownPaths) return fromKnownPaths;
 
   // Linux distributions often expose browser binaries only on PATH.
   if (process.platform === "linux") {
@@ -119,20 +208,22 @@ function resolveChromeExecutablePath() {
           .trim()
           .split("\n")
           .pop();
-        if (resolved && fs.existsSync(resolved)) return resolved;
+        const fromPath = pickChromeExecutable([resolved]);
+        if (fromPath) return fromPath;
       } catch {
         /* command not found */
       }
     }
   }
 
-  // Last fallback: Puppeteer's own downloaded browser (if present).
+  // Last fallback: Puppeteer's own downloaded browser (if present and compatible).
   try {
     const puppeteer = require("puppeteer");
     if (puppeteer && typeof puppeteer.executablePath === "function") {
       const p = puppeteer.executablePath();
-      if (typeof p === "string" && p.trim() && fs.existsSync(p)) {
-        return p.trim();
+      if (typeof p === "string" && p.trim()) {
+        const fromPuppeteer = pickChromeExecutable([p.trim()]);
+        if (fromPuppeteer) return fromPuppeteer;
       }
     }
   } catch {
@@ -140,6 +231,33 @@ function resolveChromeExecutablePath() {
   }
 
   return "";
+}
+
+function formatBrowserLaunchHelp(baseMessage) {
+  const tips = [
+    "set PUPPETEER_EXECUTABLE_PATH to your Chrome/Chromium binary path",
+  ];
+
+  if (process.platform === "linux") {
+    if (os.arch() === "arm64" || os.arch() === "aarch64") {
+      tips.push(
+        "on ARM Linux install Chromium (e.g. apt install chromium-browser) and point PUPPETEER_EXECUTABLE_PATH at /usr/bin/chromium or /usr/bin/chromium-browser"
+      );
+      tips.push(
+        "remove the broken Puppeteer cache: rm -rf ~/.cache/puppeteer/chrome/linux_arm-*"
+      );
+    } else {
+      tips.push("install Google Chrome or Chromium via your package manager");
+    }
+  }
+
+  if (/Syntax error|wrong CPU architecture|chrome-linux64/i.test(baseMessage)) {
+    tips.unshift(
+      "the configured/downloaded Chrome binary does not match this server's CPU architecture"
+    );
+  }
+
+  return `${baseMessage} | Tip: ${tips.join("; ")}.`;
 }
 
 function buildPuppeteerOptions(executablePath = "") {
@@ -854,10 +972,9 @@ function createWhatsAppBridge(deps) {
     } catch (e) {
       entry.phase = "error";
       const message = e instanceof Error ? e.message : String(e);
-      entry.error =
-        "Failed to launch browser for WhatsApp Web. " +
-        message +
-        " | Tip: set PUPPETEER_EXECUTABLE_PATH to your Chrome/Chromium binary path.";
+      entry.error = formatBrowserLaunchHelp(
+        "Failed to launch browser for WhatsApp Web. " + message
+      );
       waLog(safe, safeAccountId, "initialize failed", entry.error);
       return { ok: false, error: entry.error };
     }
