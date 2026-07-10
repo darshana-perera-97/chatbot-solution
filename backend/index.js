@@ -2392,12 +2392,18 @@ const server = http.createServer((req, res) => {
                 adminCorsHeaders
               );
             }
-            await whatsappBridge.startLinking(userId, accountId);
+            if (whatsappBridge.hasPersistedSession(userId, accountId)) {
+              await whatsappBridge.ensureConnected(userId, accountId);
+            } else {
+              await whatsappBridge.startLinking(userId, accountId);
+            }
             return sendJson(
               res,
               200,
               {
-                message: "WhatsApp client started",
+                message: whatsappBridge.hasPersistedSession(userId, accountId)
+                  ? "Restoring saved WhatsApp session"
+                  : "WhatsApp client started",
                 ...whatsappBridge.getStatus(userId, limit),
                 plan,
               },
@@ -2645,6 +2651,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
+  whatsappAutoStart.syncFromSessionFolders();
   const restartLinks = whatsappAutoStart.readRestoreLinks();
   if (restartLinks.length === 0) return;
   console.log(

@@ -90,6 +90,9 @@ function Integrations() {
   const waConnectedCount =
     Number(waStatus?.connectedCount) ||
     waAccounts.filter((account) => account.connected || account.phase === "ready").length;
+  const waReconnecting = waAccounts.some(
+    (account) => account.persisted && !account.connected && account.phase !== "ready"
+  );
   const activeAccount =
     waAccounts.find((account) => account.accountId === activeAccountId) || waAccounts[0] || null;
 
@@ -165,9 +168,9 @@ function Integrations() {
         accounts[0];
       const targetId = target?.accountId || String(accountId || "1");
       const phase = typeof target?.phase === "string" ? target.phase : "";
-      const shouldRetryStart = !["ready", "qr", "authenticated", "initializing", "reconnecting"].includes(
-        phase
-      );
+      const shouldRetryStart =
+        !target?.persisted &&
+        !["ready", "qr", "authenticated", "initializing", "reconnecting"].includes(phase);
       if (shouldRetryStart) {
         const startRes = await fetch(apiUrl("/integrations/whatsapp/start"), {
           method: "POST",
@@ -317,7 +320,9 @@ function Integrations() {
             const statusLabel = isWa
               ? waConnected
                 ? `${waConnectedCount} connected`
-                : "Not connected"
+                : waReconnecting
+                  ? "Reconnecting…"
+                  : "Not connected"
               : item.statusLabel;
             return (
               <article
@@ -532,7 +537,7 @@ function Integrations() {
                         </span>
                       </div>
                       <div className="mt-2 flex flex-wrap gap-2">
-                        {!connected ? (
+                        {!connected && !account.persisted ? (
                           <button
                             type="button"
                             onClick={() => void startAccountLinking(account.accountId)}
@@ -542,6 +547,10 @@ function Integrations() {
                             <Plus size={14} />
                             Link
                           </button>
+                        ) : !connected && account.persisted ? (
+                          <span className="inline-flex items-center gap-1 rounded-lg border border-[#DDD6FE] bg-[#F8F5FF] px-3 py-1.5 text-xs font-medium text-[#6D28D9]">
+                            Restoring saved session…
+                          </span>
                         ) : (
                           <button
                             type="button"
@@ -597,9 +606,11 @@ function Integrations() {
                   ) : null}
                   {!activeAccount?.qrDataUrl && !activeConnected && activePhase !== "error" ? (
                     <p className="text-center text-sm text-slate-500">
-                      {activePhase === "initializing" || activePhase === "authenticated"
-                        ? "Starting browser session…"
-                        : "Select a slot and tap Link to show a QR code."}
+                      {activePhase === "reconnecting" || activeAccount?.persisted
+                        ? "Restoring your saved WhatsApp session after server restart. This can take up to a minute."
+                        : activePhase === "initializing" || activePhase === "authenticated"
+                          ? "Starting browser session…"
+                          : "Select a slot and tap Link to show a QR code."}
                     </p>
                   ) : null}
                   {activePhase === "error" ? (

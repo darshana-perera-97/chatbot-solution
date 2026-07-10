@@ -159,10 +159,28 @@ function readRestoreUserIds() {
   return [...new Set(readRestoreLinks().map((link) => link.userId))];
 }
 
+/** Persist any on-disk session folders into whatsapp-autostart.json. */
+function syncFromSessionFolders() {
+  const discovered = discoverLinksFromSessionFolders();
+  if (discovered.length === 0) return readLinksRaw();
+  const existing = readLinksRaw();
+  const seen = new Set(existing.map((link) => linkKey(link.userId, link.accountId)));
+  const merged = [...existing];
+  discovered.forEach((link) => {
+    const key = linkKey(link.userId, link.accountId);
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(link);
+  });
+  if (merged.length !== existing.length) writeLinks(merged);
+  return merged;
+}
+
 module.exports = {
   readUserIds,
   readRestoreUserIds,
   readRestoreLinks,
+  syncFromSessionFolders,
   addUserId,
   addLink,
   removeUserId,

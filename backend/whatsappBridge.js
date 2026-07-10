@@ -780,10 +780,27 @@ function createWhatsAppBridge(deps) {
     }
   }
 
+  function persistedReconnectPhase(workspaceUserId, accountId, entryPhase) {
+    if (!hasPersistedAccountSession(workspaceUserId, accountId)) return entryPhase;
+    if (entryPhase === "ready") return "ready";
+    if (["disconnected", "error", "idle"].includes(entryPhase) || !entryPhase) {
+      return "reconnecting";
+    }
+    return entryPhase;
+  }
+
+  function slotNeedsAutoReconnect(workspaceUserId, accountId, slotEntry) {
+    if (!hasPersistedAccountSession(workspaceUserId, accountId)) return false;
+    if (!slotEntry) return true;
+    if (slotEntry.phase === "ready") return false;
+    if (["initializing", "qr", "authenticated"].includes(slotEntry.phase)) return false;
+    return ["disconnected", "error"].includes(slotEntry.phase);
+  }
+
   function buildAccountStatus(workspaceUserId, accountId, entry) {
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const persisted = hasPersistedAccountSession(workspaceUserId, safeAccountId);
     if (!entry) {
-      const persisted = hasPersistedAccountSession(workspaceUserId, safeAccountId);
       return {
         accountId: safeAccountId,
         label: `Account ${safeAccountId}`,
@@ -800,18 +817,14 @@ function createWhatsAppBridge(deps) {
     return {
       accountId: safeAccountId,
       label: `Account ${safeAccountId}`,
-      phase:
-        entry.phase === "disconnected" &&
-        hasPersistedAccountSession(workspaceUserId, safeAccountId)
-          ? "reconnecting"
-          : entry.phase,
+      phase: persistedReconnectPhase(workspaceUserId, safeAccountId, entry.phase),
       connected: entry.phase === "ready",
       qrDataUrl: entry.qrDataUrl || "",
       error: entry.error || "",
       pushname: entry.pushname || "",
       phone: entry.phone || "",
       profilePicDataUrl: typeof entry.profilePicDataUrl === "string" ? entry.profilePicDataUrl : "",
-      persisted: hasPersistedAccountSession(workspaceUserId, safeAccountId),
+      persisted,
     };
   }
 
@@ -835,12 +848,7 @@ function createWhatsAppBridge(deps) {
       const accountId = String(i);
       const key = slotKey(safe, accountId);
       const slotEntry = slots.get(key);
-      const persisted = hasPersistedAccountSession(safe, accountId);
-      if (
-        persisted &&
-        (!slotEntry || slotEntry.phase === "disconnected") &&
-        !reconnecting.has(key)
-      ) {
+      if (slotNeedsAutoReconnect(safe, accountId, slotEntry) && !reconnecting.has(key)) {
         void ensureConnected(safe, accountId);
       }
       if (slotEntry) maybeRefreshProfilePic(slotEntry);
@@ -1025,6 +1033,11 @@ function createWhatsAppBridge(deps) {
       entry.phase = "disconnected";
       entry.error = String(reason || "disconnected");
       waLog(safe, safeAccountId, "disconnected", entry.error);
+      if (hasPersistedAccountSession(safe, safeAccountId)) {
+        setTimeout(() => {
+          void ensureConnected(safe, safeAccountId);
+        }, 5000);
+      }
     });
 
     client.on("message", async (msg) => {
@@ -1326,11 +1339,30 @@ function createWhatsAppBridge(deps) {
     return results;
   }
 
+  function startBackgroundReconnectLoop() {
+    const intervalMs = 30000;
+    const timer = setInterval(() => {
+      whatsappAutoStart.readRestoreLinks().forEach((link) => {
+        const uid = sanitizeAgentDetailsUserId(String(link.userId || "").trim());
+        const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
+        if (!uid) return;
+        const key = slotKey(uid, accountId);
+        const slotEntry = slots.get(key);
+        if (!slotNeedsAutoReconnect(uid, accountId, slotEntry) || reconnecting.has(key)) return;
+        void ensureConnected(uid, accountId);
+      });
+    }, intervalMs);
+    if (typeof timer.unref === "function") timer.unref();
+  }
+
+  startBackgroundReconnectLoop();
+
   return {
     startLinking,
     regenerateQr,
     ensureConnected,
     restorePersistedConnections,
+    hasPersistedSession: hasPersistedAccountSession,
     destroyClient,
     disconnectAndForget,
     getStatus,
