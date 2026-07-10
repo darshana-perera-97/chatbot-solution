@@ -2648,35 +2648,19 @@ server.listen(PORT, () => {
   const restartLinks = whatsappAutoStart.readRestoreLinks();
   if (restartLinks.length === 0) return;
   console.log(
-    `[whatsapp] auto-connect: initializing ${restartLinks.length} WhatsApp client(s) (saved sessions + disk)…`
+    `[whatsapp] auto-connect: restoring ${restartLinks.length} WhatsApp client(s) (saved sessions + disk)…`
   );
   void (async () => {
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const reconnectWithRetry = async (link, attempt = 1) => {
-      const uid = String(link.userId || "").trim();
-      const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
-      if (!sanitizeAgentDetailsUserId(uid)) return;
-      const maxAttempts = 3;
-      try {
-        await whatsappBridge.startLinking(uid, accountId);
-        console.log(`[whatsapp] auto-connect: restored ${uid}::${accountId}`);
-      } catch (e) {
-        if (attempt < maxAttempts) {
-          const delayMs = 4000 * attempt;
-          console.warn(
-            `[whatsapp] auto-connect retry ${attempt}/${maxAttempts - 1} for ${uid}::${accountId} in ${delayMs}ms`
-          );
-          await sleep(delayMs);
-          return reconnectWithRetry(link, attempt + 1);
-        }
-        console.warn(
-          "[whatsapp] auto-connect failed:",
-          `${uid}::${accountId}`,
-          e instanceof Error ? e.message : String(e)
-        );
-      }
-    };
-    await Promise.allSettled(restartLinks.map((link) => reconnectWithRetry(link)));
+    const results = await whatsappBridge.restorePersistedConnections(restartLinks);
+    const restored = results.filter((r) => r.ok).length;
+    const failed = results.filter((r) => !r.ok);
+    console.log(`[whatsapp] auto-connect: ${restored}/${results.length} session(s) ready`);
+    failed.forEach((r) => {
+      console.warn(
+        `[whatsapp] auto-connect failed: ${r.userId}::${r.accountId}`,
+        r.reason || "unknown"
+      );
+    });
   })();
 });
 

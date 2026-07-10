@@ -93,12 +93,43 @@ function readElfMachineType(filePath) {
   }
 }
 
+function resolveBinaryPath(filePath) {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return filePath;
+  }
+}
+
+function isSnapBrowserPath(filePath) {
+  const resolved = resolveBinaryPath(filePath).replace(/\\/g, "/");
+  if (resolved.includes("/snap/")) return true;
+
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return false;
+    const head = fs.readFileSync(filePath, "utf8").slice(0, 1024);
+    if (/snap\.chromium\.chromium|\/snap\/bin\/chromium/i.test(head)) return true;
+  } catch {
+    /* ignore read errors */
+  }
+
+  return false;
+}
+
 function isCompatibleChromeExecutable(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return false;
 
   try {
     fs.accessSync(filePath, fs.constants.X_OK);
   } catch {
+    return false;
+  }
+
+  if (process.platform === "linux" && isSnapBrowserPath(filePath)) {
+    console.warn(
+      `[whatsapp] skipping snap Chromium (incompatible with PM2/systemd): ${filePath}`
+    );
     return false;
   }
 
@@ -176,8 +207,7 @@ function resolveChromeExecutablePath() {
       "/usr/bin/google-chrome-stable",
       "/usr/bin/google-chrome",
       "/usr/bin/chromium-browser",
-      "/usr/bin/chromium",
-      "/snap/bin/chromium"
+      "/usr/bin/chromium"
     );
   }
   if (process.platform === "win32") {
@@ -257,6 +287,12 @@ function formatBrowserLaunchHelp(baseMessage) {
     );
   }
 
+  if (/snap cgroup|snap\.chromium/i.test(baseMessage)) {
+    tips.unshift(
+      "snap Chromium cannot run under PM2/systemd — install apt Chromium (apt install chromium-browser) and set PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium or /usr/bin/chromium-browser"
+    );
+  }
+
   return `${baseMessage} | Tip: ${tips.join("; ")}.`;
 }
 
@@ -280,6 +316,7 @@ function buildPuppeteerOptions(executablePath = "") {
   const opts = {
     // Cold starts can exceed Puppeteer's default 30s on some machines.
     timeout: 120000,
+    protocolTimeout: 120000,
     headless: true,
     args,
   };
@@ -1181,10 +1218,119 @@ function createWhatsAppBridge(deps) {
     );
   }
 
+  async function waitForSlotPhase(workspaceUserId, accountId, acceptPhases, timeoutMs = 180000) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe) return { ok: false, phase: "invalid_user" };
+    const key = slotKey(safe, safeAccountId);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const entry = slots.get(key);
+      if (!entry) return { ok: false, phase: "missing" };
+      if (acceptPhases.includes(entry.phase)) {
+        return { ok: true, phase: entry.phase, entry };
+      }
+      if (entry.phase === "error") {
+        return { ok: false, phase: "error", error: entry.error || "error" };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    const entry = slots.get(key);
+    return {
+      ok: false,
+      phase: entry?.phase || "timeout",
+      error: "Timed out waiting for WhatsApp connection",
+    };
+  }
+
+  /**
+   * Reconnect persisted LocalAuth sessions after server boot (sequential to avoid Chrome overload).
+   */
+  async function restorePersistedConnections(links = null, options = {}) {
+    const toRestore = Array.isArray(links) ? links : whatsappAutoStart.readRestoreLinks();
+    const staggerMs = Number(options.staggerMs) >= 0 ? Number(options.staggerMs) : 3000;
+    const readyTimeoutMs = Number(options.readyTimeoutMs) > 0 ? Number(options.readyTimeoutMs) : 180000;
+    const maxAttempts = Number(options.maxAttempts) > 0 ? Number(options.maxAttempts) : 3;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const results = [];
+
+    for (let i = 0; i < toRestore.length; i += 1) {
+      const link = toRestore[i];
+      const uid = sanitizeAgentDetailsUserId(String(link.userId || "").trim());
+      const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
+      if (!uid) continue;
+
+      if (!hasPersistedAccountSession(uid, accountId)) {
+        waLog(uid, accountId, "skip restore: no persisted session on disk");
+        results.push({ userId: uid, accountId, ok: false, reason: "no_session" });
+        continue;
+      }
+
+      let restored = false;
+      let lastReason = "";
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          waLog(uid, accountId, `restore attempt ${attempt}/${maxAttempts}`);
+          const startResult = await startLinking(uid, accountId);
+          if (!startResult?.ok) {
+            lastReason = startResult?.error || "initialize_failed";
+            if (attempt < maxAttempts) {
+              await sleep(4000 * attempt);
+              continue;
+            }
+            break;
+          }
+
+          if (startResult.alreadyConnected) {
+            restored = true;
+            break;
+          }
+
+          const wait = await waitForSlotPhase(uid, accountId, ["ready"], readyTimeoutMs);
+          if (wait.ok && wait.phase === "ready") {
+            restored = true;
+            break;
+          }
+
+          const phaseNow = slots.get(slotKey(uid, accountId))?.phase || wait.phase;
+          if (phaseNow === "qr") {
+            lastReason = "session_expired_needs_qr";
+            break;
+          }
+          lastReason = wait.error || phaseNow || "not_ready";
+        } catch (e) {
+          lastReason = e instanceof Error ? e.message : String(e);
+        }
+
+        if (attempt < maxAttempts) {
+          const delayMs = 4000 * attempt;
+          waLog(uid, accountId, `restore retry in ${delayMs}ms`, lastReason);
+          await sleep(delayMs);
+        }
+      }
+
+      if (restored) {
+        waLog(uid, accountId, "persisted session restored");
+        results.push({ userId: uid, accountId, ok: true });
+      } else {
+        waLog(uid, accountId, "restore failed", lastReason || "unknown");
+        results.push({ userId: uid, accountId, ok: false, reason: lastReason || "unknown" });
+      }
+
+      if (staggerMs > 0 && i < toRestore.length - 1) {
+        await sleep(staggerMs);
+      }
+    }
+
+    return results;
+  }
+
   return {
     startLinking,
     regenerateQr,
     ensureConnected,
+    restorePersistedConnections,
     destroyClient,
     disconnectAndForget,
     getStatus,
