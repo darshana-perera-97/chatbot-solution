@@ -14,5 +14,5 @@ export function normalizeSessionMessages(rawMessages) {
         ? { attachments: line.attachments }
         : {}),
     }))
-    .filter((line) => line.content.trim().length > 0);
+    .filter((line) => line.content.trim().length > 0 || (Array.isArray(line.attachments) && line.attachments.length > 0));
 }

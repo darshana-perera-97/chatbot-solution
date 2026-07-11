@@ -635,12 +635,70 @@ function isStaleWhatsAppMessage(msg) {
   return ageMs > WHATSAPP_STALE_REPLY_MS;
 }
 
+const MAX_WA_MEDIA_DATA_CHARS = 2_400_000;
+
+async function attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments) {
+  if (!msg?.hasMedia || typeof msg.downloadMedia !== "function") return [];
+  try {
+    const media = await msg.downloadMedia();
+    const mimetype = typeof media?.mimetype === "string" ? media.mimetype.trim().toLowerCase() : "";
+    const rawData = typeof media?.data === "string" ? media.data.replace(/\s/g, "") : "";
+    const filename = typeof media?.filename === "string" ? media.filename.trim() : "";
+    if (!mimetype || !rawData) return [];
+
+    const dataUrl = `data:${mimetype};base64,${rawData}`;
+    if (dataUrl.length > MAX_WA_MEDIA_DATA_CHARS) return [];
+
+    let draft = null;
+    if (mimetype.startsWith("image/")) {
+      draft = [{ kind: "image", imageName: filename || "Image", imageData: dataUrl }];
+    } else if (mimetype.startsWith("video/")) {
+      draft = [{ kind: "video", videoName: filename || "Video", videoData: dataUrl }];
+    } else if (mimetype === "application/pdf" || mimetype === "application/x-pdf") {
+      draft = [{ kind: "pdf", pdfName: filename || "document.pdf", pdfData: dataUrl }];
+    } else {
+      draft = [{ kind: "file", fileName: filename || "File", mimeType: mimetype, fileData: dataUrl }];
+    }
+    return typeof sanitizeMessageAttachments === "function" ? sanitizeMessageAttachments(draft) : draft;
+  } catch {
+    return [];
+  }
+}
+
+async function whatsappMessageToRecord(msg, sanitizeMessageAttachments) {
+  const body = typeof msg?.body === "string" ? msg.body.trim() : "";
+  const role = msg?.fromMe ? "assistant" : "user";
+  const attachments = msg?.hasMedia
+    ? await attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments)
+    : [];
+  if (!body && !attachments.length) return null;
+  const record = { role, content: body };
+  if (attachments.length) record.attachments = attachments;
+  return record;
+}
+
+function priorMessagesFromSession(existing) {
+  return (existing?.messages || [])
+    .filter((m) => m && (m.role === "user" || m.role === "assistant" || m.role === "agent"))
+    .map((m) => {
+      const row = {
+        role: m.role,
+        content: typeof m.content === "string" ? m.content : "",
+      };
+      if (Array.isArray(m.attachments) && m.attachments.length) {
+        row.attachments = m.attachments;
+      }
+      return row;
+    });
+}
+
 /**
  * @param {object} deps
  * @param {function} deps.completeWorkspaceChatTurn
  * @param {function} deps.sanitizeAgentDetailsUserId
  * @param {function} deps.getTestChatSessionByConversation
  * @param {function} deps.sanitizeChatMessages
+ * @param {function} deps.sanitizeMessageAttachments
  * @param {function} deps.saveTestChatSession
  * @param {function} deps.mergeAgentMessagesPreservingOrder
  * @param {function} [deps.onAccountLinkedViaQr]
@@ -651,6 +709,7 @@ function createWhatsAppBridge(deps) {
     sanitizeAgentDetailsUserId,
     getTestChatSessionByConversation,
     sanitizeChatMessages,
+    sanitizeMessageAttachments,
     saveTestChatSession,
     mergeAgentMessagesPreservingOrder,
     onAccountLinkedViaQr,
@@ -892,17 +951,13 @@ function createWhatsAppBridge(deps) {
     let waMessages = [];
     try {
       const fetched = await chat.fetchMessages({ limit: WHATSAPP_SYNC_MESSAGE_LIMIT });
-      waMessages = (Array.isArray(fetched) ? fetched : [])
-        .sort((a, b) => (Number(a?.timestamp) || 0) - (Number(b?.timestamp) || 0))
-        .map((msg) => {
-          const body = typeof msg?.body === "string" ? msg.body.trim() : "";
-          if (!body) return null;
-          return {
-            role: msg.fromMe ? "assistant" : "user",
-            content: body,
-          };
-        })
-        .filter(Boolean);
+      const sorted = (Array.isArray(fetched) ? fetched : []).sort(
+        (a, b) => (Number(a?.timestamp) || 0) - (Number(b?.timestamp) || 0)
+      );
+      const records = await Promise.all(
+        sorted.map((msg) => whatsappMessageToRecord(msg, sanitizeMessageAttachments))
+      );
+      waMessages = records.filter(Boolean);
     } catch (e) {
       waLog(
         safe,
@@ -913,7 +968,7 @@ function createWhatsAppBridge(deps) {
       return { action: "skipped", reason: "fetch_failed" };
     }
 
-    if (!waMessages.length) return { action: "skipped", reason: "no_text_messages" };
+    if (!waMessages.length) return { action: "skipped", reason: "no_messages" };
 
     const existing = getTestChatSessionByConversation(safe, conversationId);
     const hadMessages = Array.isArray(existing?.messages) && existing.messages.length > 0;
@@ -1247,7 +1302,6 @@ function createWhatsAppBridge(deps) {
 
       const jid = msg.from;
       const conversationId = jidToConversationId(jid);
-      const body = typeof msg.body === "string" ? msg.body.trim() : "";
 
       const entryNow = slots.get(key);
       const label =
@@ -1257,21 +1311,15 @@ function createWhatsAppBridge(deps) {
         `WhatsApp ${safeAccountId}`;
 
       if (isStaleWhatsAppMessage(msg)) {
-        if (body) {
+        const incomingStale = await whatsappMessageToRecord(msg, sanitizeMessageAttachments);
+        if (incomingStale) {
           const existingStale = getTestChatSessionByConversation(safe, conversationId);
-          const priorStale = (existingStale?.messages || [])
-            .filter((m) => m && (m.role === "user" || m.role === "assistant"))
-            .map((m) => ({
-              role: m.role,
-              content: typeof m.content === "string" ? m.content : "",
-            }));
-          const incomingStale = sanitizeChatMessages([
-            ...priorStale,
-            { role: "user", content: body },
-          ]);
+          const priorStale = priorMessagesFromSession(existingStale).filter(
+            (m) => m.role === "user" || m.role === "assistant"
+          );
           const messagesStale = mergeAgentMessagesPreservingOrder
-            ? mergeAgentMessagesPreservingOrder(existingStale?.messages, incomingStale)
-            : incomingStale;
+            ? mergeAgentMessagesPreservingOrder(existingStale?.messages, [...priorStale, incomingStale])
+            : [...priorStale, incomingStale];
           const whatsappPeerPhoneStale = await resolvePeerWhatsappPhone(client, msg);
           saveTestChatSession(safe, conversationId, messagesStale, {
             chatSource: "whatsapp",
@@ -1289,37 +1337,55 @@ function createWhatsAppBridge(deps) {
         return;
       }
 
-      if (!body) {
-        if (msg.hasMedia) {
-          try {
-            await msg.reply("Thanks — this bot only handles text messages for now.");
-          } catch {
-            /* ignore */
-          }
-        }
-        return;
-      }
+      const incomingRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments);
+      if (!incomingRecord) return;
 
       const existing = getTestChatSessionByConversation(safe, conversationId);
-      const prior = (existing?.messages || [])
-        .filter((m) => m && (m.role === "user" || m.role === "assistant"))
-        .map((m) => ({
-          role: m.role,
-          content: typeof m.content === "string" ? m.content : "",
-        }));
-      const messages = sanitizeChatMessages([...prior, { role: "user", content: body }]);
+      const prior = priorMessagesFromSession(existing).filter(
+        (m) => m.role === "user" || m.role === "assistant"
+      );
       const whatsappPeerPhone = await resolvePeerWhatsappPhone(client, msg);
-
-      const result = await completeWorkspaceChatTurn({
-        userId: safe,
-        conversationId,
-        messages,
+      const sessionOpts = {
         chatSource: "whatsapp",
         channelAccountName: label,
         whatsappChatId: jid,
         whatsappPeerPhone,
         whatsappAccountId: safeAccountId,
+      };
+
+      if (!incomingRecord.content) {
+        const messagesMediaOnly = mergeAgentMessagesPreservingOrder
+          ? mergeAgentMessagesPreservingOrder(existing?.messages, [...prior, incomingRecord])
+          : [...prior, incomingRecord];
+        saveTestChatSession(safe, conversationId, messagesMediaOnly, sessionOpts);
+        return;
+      }
+
+      const messagesForAi = sanitizeChatMessages([...prior, { role: "user", content: incomingRecord.content }]);
+
+      const result = await completeWorkspaceChatTurn({
+        userId: safe,
+        conversationId,
+        messages: messagesForAi,
+        ...sessionOpts,
       });
+
+      if (Array.isArray(incomingRecord.attachments) && incomingRecord.attachments.length) {
+        const refreshed = getTestChatSessionByConversation(safe, conversationId);
+        if (refreshed?.messages?.length) {
+          const patched = [...refreshed.messages];
+          for (let i = patched.length - 1; i >= 0; i -= 1) {
+            if (patched[i]?.role === "user") {
+              patched[i] = { ...patched[i], attachments: incomingRecord.attachments };
+              break;
+            }
+          }
+          saveTestChatSession(safe, conversationId, patched, {
+            ...sessionOpts,
+            liveAgentEnabled: Boolean(refreshed.liveAgentEnabled),
+          });
+        }
+      }
 
       if (result.kind === "success" && typeof result.reply === "string" && result.reply.trim()) {
         await deliverAssistantText(client, msg, result.reply);

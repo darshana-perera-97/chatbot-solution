@@ -650,12 +650,10 @@ const sanitizeSessionChatMessages = (raw) => {
         ? "agent"
         : null;
     const content = typeof entry?.content === "string" ? entry.content.trim() : "";
-    if (!role || !content) continue;
+    const att = sanitizeMessageAttachments(entry.attachments);
+    if (!role || (!content && !att.length)) continue;
     const msg = { role, content: content.slice(0, 16000) };
-    if (role === "assistant") {
-      const att = sanitizeMessageAttachments(entry.attachments);
-      if (att.length) msg.attachments = att;
-    }
+    if (att.length) msg.attachments = att;
     out.push(msg);
   }
   return out.slice(-60);
@@ -1017,7 +1015,7 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
           ? options.liveAgentEnabled
           : sessions[existingIndex].liveAgentEnabled
       ),
-      lastReplyPreview: conversation[conversation.length - 1]?.content?.slice(0, 300) || "",
+      lastReplyPreview: messagePreviewFromRecord(conversation[conversation.length - 1] || {}),
       updatedAt: nowIso,
     };
   } else {
@@ -1034,7 +1032,7 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
       messages: conversation,
       messageCount: conversation.length,
       liveAgentEnabled: Boolean(options.liveAgentEnabled),
-      lastReplyPreview: conversation[conversation.length - 1]?.content?.slice(0, 300) || "",
+      lastReplyPreview: messagePreviewFromRecord(conversation[conversation.length - 1] || {}),
       createdAt: nowIso,
       updatedAt: nowIso,
     });
@@ -1248,6 +1246,19 @@ const MAX_MESSAGE_ATTACHMENT_PDF_CHARS = MAX_PRODUCT_PDF_DATA_CHARS;
 const MAX_MESSAGE_ATTACHMENTS = 8;
 const MAX_MESSAGE_ATTACHMENT_IMAGES = 6;
 
+const messagePreviewFromRecord = (record) => {
+  const content = typeof record?.content === "string" ? record.content.trim() : "";
+  if (content) return content.slice(0, 300);
+  const attachments = sanitizeMessageAttachments(record?.attachments);
+  if (!attachments.length) return "";
+  const first = attachments[0];
+  if (first.kind === "image") return first.imageName ? `[Image: ${first.imageName}]` : "[Image]";
+  if (first.kind === "pdf") return first.pdfName ? `[PDF: ${first.pdfName}]` : "[PDF]";
+  if (first.kind === "video") return first.videoName ? `[Video: ${first.videoName}]` : "[Video]";
+  if (first.kind === "file") return first.fileName ? `[File: ${first.fileName}]` : "[File]";
+  return "[Media]";
+};
+
 const sanitizeMessageAttachments = (raw) => {
   if (!Array.isArray(raw)) return [];
   const out = [];
@@ -1285,6 +1296,28 @@ const sanitizeMessageAttachments = (raw) => {
       const row = { kind: "image", imageName, imageData };
       if (productTitle) row.productTitle = productTitle;
       out.push(row);
+    } else if (item?.kind === "video") {
+      const videoName =
+        typeof item.videoName === "string" && item.videoName.trim()
+          ? item.videoName.trim().slice(0, 180)
+          : "Video";
+      let videoData = typeof item.videoData === "string" ? item.videoData.trim() : "";
+      if (videoData.length > MAX_MESSAGE_ATTACHMENT_IMAGE_CHARS) videoData = "";
+      if (!/^data:video\//i.test(videoData)) continue;
+      out.push({ kind: "video", videoName, videoData });
+    } else if (item?.kind === "file") {
+      const fileName =
+        typeof item.fileName === "string" && item.fileName.trim()
+          ? item.fileName.trim().slice(0, 180)
+          : "File";
+      const mimeType =
+        typeof item.mimeType === "string" && item.mimeType.trim()
+          ? item.mimeType.trim().slice(0, 120)
+          : "application/octet-stream";
+      let fileData = typeof item.fileData === "string" ? item.fileData.trim() : "";
+      if (fileData.length > MAX_MESSAGE_ATTACHMENT_IMAGE_CHARS) fileData = "";
+      if (!/^data:[^;,]+;base64,/i.test(fileData)) continue;
+      out.push({ kind: "file", fileName, mimeType, fileData });
     }
   }
   return out;
@@ -1848,6 +1881,7 @@ const whatsappBridge = createWhatsAppBridge({
   sanitizeAgentDetailsUserId,
   getTestChatSessionByConversation,
   sanitizeChatMessages,
+  sanitizeMessageAttachments,
   saveTestChatSession,
   mergeAgentMessagesPreservingOrder,
   onAccountLinkedViaQr: (workspaceUserId, accountId, accountDetails = {}) => {

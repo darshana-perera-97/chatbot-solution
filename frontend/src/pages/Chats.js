@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, MoreVertical, Search, Send } from "lucide-react";
 import { useLocation } from "react-router-dom";
 import { apiUrl } from "../apiBase";
@@ -198,7 +198,7 @@ function toThreadMessages(rawMessages) {
       text: typeof item.content === "string" ? item.content : "",
       attachments: Array.isArray(item.attachments) ? item.attachments : [],
     }))
-    .filter((item) => item.text.trim().length > 0);
+    .filter((item) => item.text.trim().length > 0 || item.attachments.length > 0);
 }
 
 function Chats() {
@@ -219,6 +219,8 @@ function Chats() {
   const syncedOnLoadRef = useRef(false);
   const conversationIdFromQuery = new URLSearchParams(location.search).get("conversationId") || "";
   const threadScrollRef = useRef(null);
+  const liveInputRef = useRef(null);
+  const pendingLiveDraftCursorRef = useRef(null);
 
   const needsFastRefresh = useMemo(
     () =>
@@ -471,6 +473,30 @@ function Chats() {
     }
   };
 
+  useLayoutEffect(() => {
+    const cursor = pendingLiveDraftCursorRef.current;
+    const input = liveInputRef.current;
+    if (cursor === null || !input) return;
+    input.selectionStart = cursor;
+    input.selectionEnd = cursor;
+    pendingLiveDraftCursorRef.current = null;
+  }, [liveDraft]);
+
+  const handleLiveDraftKeyDown = (e) => {
+    if (e.key !== "Enter" || !liveAgentEnabled) return;
+    if (e.ctrlKey) {
+      e.preventDefault();
+      const input = e.currentTarget;
+      const start = input.selectionStart ?? liveDraft.length;
+      const end = input.selectionEnd ?? liveDraft.length;
+      pendingLiveDraftCursorRef.current = start + 1;
+      setLiveDraft(`${liveDraft.slice(0, start)}\n${liveDraft.slice(end)}`);
+      return;
+    }
+    e.preventDefault();
+    void sendLiveMessage();
+  };
+
   return (
     <div className="flex min-h-[420px] w-full flex-1 flex-col xl:h-full xl:min-h-0">
       <div className="grid min-h-[360px] flex-1 grid-cols-1 overflow-hidden rounded-3xl border border-[#F0E9FF] bg-white shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0 lg:grid-cols-[minmax(260px,34%)_1fr]">
@@ -697,11 +723,14 @@ function Chats() {
                             {isLiveAgent ? "Live Agent" : "AI Agent"}
                           </p>
                         ) : null}
-                        <p className="whitespace-pre-wrap leading-relaxed">{m.text}</p>
-                        {m.role === "assistant" &&
-                        Array.isArray(m.attachments) &&
-                        m.attachments.length > 0 ? (
-                          <AssistantAttachments attachments={m.attachments} />
+                        {m.text.trim() ? (
+                          <p className="whitespace-pre-wrap leading-relaxed">{m.text}</p>
+                        ) : null}
+                        {Array.isArray(m.attachments) && m.attachments.length > 0 ? (
+                          <AssistantAttachments
+                            attachments={m.attachments}
+                            variant={isCustomer ? "customer" : "default"}
+                          />
                         ) : null}
                       </div>
                     </div>
@@ -716,20 +745,16 @@ function Chats() {
 
               <footer className="shrink-0 border-t border-[#EEE8FF] bg-white p-3 lg:p-4">
                 <div className="flex gap-2 rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-1.5 focus-within:border-[#C4B5FD] focus-within:ring-2 focus-within:ring-[#8B5CF6]/15">
-                  <input
-                    type="text"
+                  <textarea
+                    ref={liveInputRef}
+                    rows={1}
                     value={liveDraft}
                     onChange={(e) => setLiveDraft(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        void sendLiveMessage();
-                      }
-                    }}
+                    onKeyDown={handleLiveDraftKeyDown}
                     placeholder={
                       liveAgentEnabled ? "Type as live agent…" : "Enable Live Agent to reply directly…"
                     }
-                    className="min-w-0 flex-1 bg-transparent px-2 py-2 text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none"
+                    className="min-h-[40px] max-h-32 min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none"
                     disabled={!liveAgentEnabled || liveSaving}
                   />
                   <button
@@ -744,7 +769,7 @@ function Chats() {
                 </div>
                 <p className="mt-2 text-center text-[10px] text-slate-400">
                   {liveAgentEnabled
-                    ? "Live Agent mode active: OpenAI replies are paused for this conversation."
+                    ? "Live Agent mode active: OpenAI replies are paused. Enter to send, Ctrl+Enter for a new line."
                     : "Enable Live Agent to send manual replies from this page."}
                 </p>
               </footer>
