@@ -34,18 +34,31 @@ function sessionSourceStyleKey(session) {
   return "test_bot";
 }
 
-const SOURCE_BADGE_CLASS = {
-  test_bot: "bg-violet-100 text-violet-800 ring-1 ring-violet-200/80",
-  web: "bg-sky-100 text-sky-800 ring-1 ring-sky-200/80",
-  whatsapp: "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-200/80",
-};
-
 function normalizeChatSource(session) {
   const raw = typeof session?.chatSource === "string" ? session.chatSource.trim().toLowerCase() : "";
   if (raw === "web") return "web";
   if (raw === "whatsapp") return "whatsapp";
   return "test_bot";
 }
+
+function getAccountFilterKey(session) {
+  if (normalizeChatSource(session) !== "whatsapp") return null;
+  const accountId =
+    typeof session?.whatsappAccountId === "string" ? session.whatsappAccountId.trim() : "1";
+  return `whatsapp:${accountId || "1"}`;
+}
+
+function whatsAppAccountLabel(account) {
+  if (!account) return "";
+  const parts = [account.pushname, account.phone].filter(Boolean);
+  return parts.length ? parts.join(" · ") : account.label || `Account ${account.accountId}`;
+}
+
+const SOURCE_BADGE_CLASS = {
+  test_bot: "bg-violet-100 text-violet-800 ring-1 ring-violet-200/80",
+  web: "bg-sky-100 text-sky-800 ring-1 ring-sky-200/80",
+  whatsapp: "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-200/80",
+};
 
 function pickVisitorNameFromCollected(collected) {
   if (!collected || typeof collected !== "object") return "";
@@ -197,10 +210,13 @@ function Chats() {
   const [mobileShowThread, setMobileShowThread] = useState(false);
   const [query, setQuery] = useState("");
   const [sessions, setSessions] = useState([]);
+  const [waStatus, setWaStatus] = useState(null);
+  const [accountFilter, setAccountFilter] = useState("all");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [liveDraft, setLiveDraft] = useState("");
   const [liveSaving, setLiveSaving] = useState(false);
+  const syncedOnLoadRef = useRef(false);
   const conversationIdFromQuery = new URLSearchParams(location.search).get("conversationId") || "";
   const threadScrollRef = useRef(null);
 
@@ -230,14 +246,21 @@ function Chats() {
           setSelectedId("");
           return;
         }
-        const res = await fetch(apiUrl(`/chat/test/sessions?userId=${encodeURIComponent(userId)}`));
+        const [res, waRes] = await Promise.all([
+          fetch(apiUrl(`/chat/test/sessions?userId=${encodeURIComponent(userId)}`)),
+          fetch(apiUrl(`/integrations/whatsapp/status?userId=${encodeURIComponent(userId)}`), {
+            cache: "no-store",
+          }),
+        ]);
         const data = await res.json().catch(() => ({}));
+        const waPayload = await waRes.json().catch(() => ({}));
         if (!res.ok) {
           throw new Error(data.message || "Could not load chat sessions");
         }
         if (!active) return;
         const list = Array.isArray(data.sessions) ? data.sessions : [];
         setSessions(list);
+        setWaStatus(waPayload && typeof waPayload === "object" ? waPayload : null);
         setSelectedId((prev) => {
           if (conversationIdFromQuery) {
             const matched = list.find(
@@ -276,9 +299,61 @@ function Chats() {
     };
   }, [userId, conversationIdFromQuery, needsFastRefresh]);
 
+  useEffect(() => {
+    if (!userId || syncedOnLoadRef.current) return;
+    const accounts = Array.isArray(waStatus?.accounts) ? waStatus.accounts : [];
+    const connected = accounts.filter((account) => account.connected || account.phase === "ready");
+    if (!connected.length) return;
+    syncedOnLoadRef.current = true;
+    void (async () => {
+      try {
+        const res = await fetch(apiUrl("/integrations/whatsapp/sync-conversations"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) return;
+        if (Number(data?.created) > 0) {
+          const sessionsRes = await fetch(
+            apiUrl(`/chat/test/sessions?userId=${encodeURIComponent(userId)}`)
+          );
+          const payload = await sessionsRes.json().catch(() => ({}));
+          const list = Array.isArray(payload.sessions) ? payload.sessions : [];
+          if (list.length) setSessions(list);
+        }
+      } catch {
+        /* ignore background sync errors */
+      }
+    })();
+  }, [userId, waStatus]);
+
+  const whatsappAccountOptions = useMemo(() => {
+    const accounts = Array.isArray(waStatus?.accounts) ? waStatus.accounts : [];
+    const connected = accounts.filter((account) => account.connected || account.phase === "ready");
+    const options = [{ value: "all", label: "All sources" }];
+    connected.forEach((account) => {
+      const accountId = String(account.accountId || "1");
+      options.push({
+        value: `whatsapp:${accountId}`,
+        label: whatsAppAccountLabel(account),
+      });
+    });
+    return options;
+  }, [waStatus]);
+
+  const accountFilteredSessions = useMemo(() => {
+    if (accountFilter === "all") return sessions;
+    return sessions.filter((session) => {
+      const key = getAccountFilterKey(session);
+      if (accountFilter.startsWith("whatsapp:")) return key === accountFilter;
+      return true;
+    });
+  }, [accountFilter, sessions]);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const prepared = sessions.map((session, idx) => {
+    const prepared = accountFilteredSessions.map((session, idx) => {
       const messages = toThreadMessages(session.messages);
       const preview = typeof session.lastReplyPreview === "string" && session.lastReplyPreview.trim()
         ? session.lastReplyPreview.trim()
@@ -308,7 +383,7 @@ function Chats() {
         c.preview.toLowerCase().includes(q) ||
         c.sourceLabel.toLowerCase().includes(q)
     );
-  }, [query, sessions]);
+  }, [query, accountFilteredSessions]);
 
   const active = filtered.find((c) => c.id === selectedId) ?? filtered[0] ?? null;
   const activeSession = sessions.find((session) => session.id === active?.id) ?? null;
@@ -431,6 +506,20 @@ function Chats() {
                 className="w-full rounded-xl border border-[#EEE8FF] bg-[#FDFCFF] py-2 pl-9 pr-3 text-sm text-slate-800 placeholder:text-slate-400 focus:border-[#C4B5FD] focus:outline-none focus:ring-2 focus:ring-[#8B5CF6]/20"
               />
             </div>
+            {whatsappAccountOptions.length > 1 ? (
+              <select
+                value={accountFilter}
+                onChange={(e) => setAccountFilter(e.target.value)}
+                className="mt-2 w-full rounded-xl border border-[#EEE8FF] bg-[#FDFCFF] px-3 py-2 text-sm text-slate-800 focus:border-[#C4B5FD] focus:outline-none focus:ring-2 focus:ring-[#8B5CF6]/20"
+                aria-label="Filter by WhatsApp account"
+              >
+                {whatsappAccountOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            ) : null}
           </div>
           <ul className="min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
             {loading ? (

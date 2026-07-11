@@ -619,6 +619,8 @@ async function deliverAssistantText(client, msg, text) {
 }
 
 const WHATSAPP_STALE_REPLY_MS = 2 * 60 * 1000;
+/** Max recent messages to import per chat when syncing WhatsApp conversations. */
+const WHATSAPP_SYNC_MESSAGE_LIMIT = 30;
 
 function getWhatsAppMessageAgeMs(msg) {
   const ts = Number(msg?.timestamp);
@@ -641,6 +643,7 @@ function isStaleWhatsAppMessage(msg) {
  * @param {function} deps.sanitizeChatMessages
  * @param {function} deps.saveTestChatSession
  * @param {function} deps.mergeAgentMessagesPreservingOrder
+ * @param {function} [deps.onAccountLinkedViaQr]
  */
 function createWhatsAppBridge(deps) {
   const {
@@ -650,12 +653,15 @@ function createWhatsAppBridge(deps) {
     sanitizeChatMessages,
     saveTestChatSession,
     mergeAgentMessagesPreservingOrder,
+    onAccountLinkedViaQr,
   } = deps;
 
   /** @type {Map<string, object>} */
   const slots = new Map();
   /** @type {Set<string>} */
   const reconnecting = new Set();
+  /** @type {Set<string>} */
+  const syncingConversations = new Set();
   const waLog = (workspaceUserId, accountId, message, ...extra) => {
     const prefix = `[whatsapp][user:${workspaceUserId}][account:${accountId}]`;
     if (extra.length) {
@@ -867,6 +873,176 @@ function createWhatsAppBridge(deps) {
     };
   }
 
+  async function syncSingleChatToSession(client, workspaceUserId, accountId, chat, label) {
+    if (chat?.isGroup) return { action: "skipped", reason: "group" };
+
+    const rawId = chat?.id;
+    const jid =
+      typeof rawId === "string"
+        ? rawId.trim()
+        : typeof rawId?._serialized === "string"
+          ? rawId._serialized.trim()
+          : "";
+    if (!jid) return { action: "skipped", reason: "no_jid" };
+
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const conversationId = jidToConversationId(jid);
+
+    let waMessages = [];
+    try {
+      const fetched = await chat.fetchMessages({ limit: WHATSAPP_SYNC_MESSAGE_LIMIT });
+      waMessages = (Array.isArray(fetched) ? fetched : [])
+        .sort((a, b) => (Number(a?.timestamp) || 0) - (Number(b?.timestamp) || 0))
+        .map((msg) => {
+          const body = typeof msg?.body === "string" ? msg.body.trim() : "";
+          if (!body) return null;
+          return {
+            role: msg.fromMe ? "assistant" : "user",
+            content: body,
+          };
+        })
+        .filter(Boolean);
+    } catch (e) {
+      waLog(
+        safe,
+        safeAccountId,
+        "sync fetchMessages failed",
+        e instanceof Error ? e.message : String(e)
+      );
+      return { action: "skipped", reason: "fetch_failed" };
+    }
+
+    if (!waMessages.length) return { action: "skipped", reason: "no_text_messages" };
+
+    const existing = getTestChatSessionByConversation(safe, conversationId);
+    const hadMessages = Array.isArray(existing?.messages) && existing.messages.length > 0;
+    const messagesToSave = hadMessages
+      ? existing.messages
+      : sanitizeChatMessages(waMessages);
+
+    let whatsappPeerPhone =
+      typeof existing?.whatsappPeerPhone === "string" ? existing.whatsappPeerPhone.trim() : "";
+    if (!whatsappPeerPhone) {
+      whatsappPeerPhone = await resolvePeerPhoneFromJid(client, jid);
+    }
+
+    saveTestChatSession(safe, conversationId, messagesToSave, {
+      chatSource: "whatsapp",
+      channelAccountName: label,
+      whatsappChatId: jid,
+      whatsappPeerPhone,
+      whatsappAccountId: safeAccountId,
+    });
+
+    return { action: hadMessages ? "updated" : "created" };
+  }
+
+  async function syncConversationsForAccount(workspaceUserId, accountId = "1") {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe) {
+      return { ok: false, accountId: safeAccountId, message: "Invalid user id" };
+    }
+
+    const key = slotKey(safe, safeAccountId);
+    if (syncingConversations.has(key)) {
+      return { ok: false, accountId: safeAccountId, message: "Sync already in progress" };
+    }
+
+    const entry = slots.get(key);
+    if (!entry?.client || entry.phase !== "ready") {
+      return {
+        ok: false,
+        accountId: safeAccountId,
+        message: "WhatsApp account is not connected",
+      };
+    }
+
+    syncingConversations.add(key);
+    try {
+      const client = entry.client;
+      const label =
+        channelLabelFromClient(client) ||
+        entry.pushname ||
+        entry.phone ||
+        `WhatsApp ${safeAccountId}`;
+
+      let chats = [];
+      try {
+        chats = await client.getChats();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        waLog(safe, safeAccountId, "sync getChats failed", msg);
+        return { ok: false, accountId: safeAccountId, message: msg };
+      }
+
+      let created = 0;
+      let updated = 0;
+      let skipped = 0;
+
+      for (const chat of Array.isArray(chats) ? chats : []) {
+        try {
+          const result = await syncSingleChatToSession(client, safe, safeAccountId, chat, label);
+          if (result.action === "created") created += 1;
+          else if (result.action === "updated") updated += 1;
+          else skipped += 1;
+        } catch {
+          skipped += 1;
+        }
+      }
+
+      waLog(
+        safe,
+        safeAccountId,
+        `conversation sync complete (created=${created}, updated=${updated}, skipped=${skipped})`
+      );
+      return { ok: true, accountId: safeAccountId, created, updated, skipped };
+    } finally {
+      syncingConversations.delete(key);
+    }
+  }
+
+  async function syncConversations(workspaceUserId, accountId = null) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    if (!safe) throw new Error("Invalid user id");
+
+    const accountIds = [];
+    if (accountId != null && String(accountId).trim()) {
+      accountIds.push(sanitizeWhatsAppAccountId(accountId) || "1");
+    } else {
+      for (const [slotId, slotEntry] of slots.entries()) {
+        if (!slotId.startsWith(`${safe}::`)) continue;
+        if (!slotEntry?.client || slotEntry.phase !== "ready") continue;
+        accountIds.push(slotId.split("::")[1] || "1");
+      }
+    }
+
+    if (!accountIds.length) {
+      return {
+        ok: false,
+        message: "No connected WhatsApp accounts to sync",
+        created: 0,
+        updated: 0,
+        skipped: 0,
+        results: [],
+      };
+    }
+
+    const results = [];
+    for (const aid of accountIds) {
+      results.push(await syncConversationsForAccount(safe, aid));
+    }
+
+    return {
+      ok: results.some((entry) => entry.ok),
+      created: results.reduce((sum, entry) => sum + (Number(entry.created) || 0), 0),
+      updated: results.reduce((sum, entry) => sum + (Number(entry.updated) || 0), 0),
+      skipped: results.reduce((sum, entry) => sum + (Number(entry.skipped) || 0), 0),
+      results,
+    };
+  }
+
   async function sendText(workspaceUserId, accountId, peerJid, text) {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
@@ -918,9 +1094,10 @@ function createWhatsAppBridge(deps) {
     };
   }
 
-  async function startLinking(workspaceUserId, accountId = "1") {
+  async function startLinking(workspaceUserId, accountId = "1", options = {}) {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const linkIntent = options.linkIntent === "user_qr" ? "user_qr" : "auto_restore";
     if (!safe) throw new Error("Invalid user id");
     if (!Client || !LocalAuth) {
       throw new Error("whatsapp-web.js is not installed. Run npm install in the backend folder.");
@@ -949,6 +1126,7 @@ function createWhatsAppBridge(deps) {
       pushname: "",
       phone: "",
       profilePicDataUrl: "",
+      linkIntent,
       client: null,
     };
     slots.set(key, entry);
@@ -1019,6 +1197,14 @@ function createWhatsAppBridge(deps) {
       entry.phone = wid?.user || "";
       entry.pushname = channelLabelFromClient(client);
       whatsappAutoStart.addLink(safe, safeAccountId);
+      if (entry.linkIntent === "user_qr" && typeof onAccountLinkedViaQr === "function") {
+        onAccountLinkedViaQr(safe, safeAccountId, {
+          pushname: entry.pushname,
+          phone: entry.phone,
+          label: `Account ${safeAccountId}`,
+        });
+      }
+      entry.linkIntent = "auto_restore";
       void profilePicDataUrlFromClient(client).then((dataUrl) => {
         entry.profilePicDataUrl = typeof dataUrl === "string" ? dataUrl : "";
       });
@@ -1027,6 +1213,16 @@ function createWhatsAppBridge(deps) {
         safeAccountId,
         `linked and ready (account=${entry.pushname || "unknown"}${entry.phone ? ` · ${entry.phone}` : ""})`
       );
+      setTimeout(() => {
+        void syncConversationsForAccount(safe, safeAccountId).catch((e) => {
+          waLog(
+            safe,
+            safeAccountId,
+            "auto conversation sync failed",
+            e instanceof Error ? e.message : String(e)
+          );
+        });
+      }, 3000);
     });
 
     client.on("disconnected", (reason) => {
@@ -1189,7 +1385,7 @@ function createWhatsAppBridge(deps) {
     await destroyClient(safe, safeAccountId);
     removeAuthSession(safe, safeAccountId);
     reconnecting.delete(key);
-    return startLinking(safe, safeAccountId);
+    return startLinking(safe, safeAccountId, { linkIntent: "user_qr" });
   }
 
   async function resolvePeerPhone(workspaceUserId, accountId, jid) {
@@ -1367,6 +1563,8 @@ function createWhatsAppBridge(deps) {
     disconnectAndForget,
     getStatus,
     sendText,
+    syncConversations,
+    syncConversationsForAccount,
     resolvePeerPhone,
     resolvePeerPhoneForSession,
     shutdownAll,

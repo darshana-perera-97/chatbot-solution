@@ -39,6 +39,7 @@ const CHATS_PATH = path.join(__dirname, "data", "chats.json");
 const LEADS_PATH = path.join(__dirname, "data", "leads.json");
 const WIDGET_SETTINGS_PATH = path.join(__dirname, "data", "widgetSettings.json");
 const STOCK_LOADS_PATH = path.join(DATA_DIR, "stockLoads.json");
+const WHATSAPP_DISCONNECT_LOGS_PATH = path.join(DATA_DIR, "whatsappDisconnectLogs.json");
 const AGENT_DETAILS_PATH = path.join(__dirname, "data", "agentDetails.json");
 const FRONTEND_BUILD_DIR = path.join(__dirname, "..", "frontend", "build");
 const FRONTEND_INDEX_PATH = path.join(FRONTEND_BUILD_DIR, "index.html");
@@ -550,6 +551,91 @@ const appendStockLoad = (userIdRaw, body) => {
   fs.writeFileSync(targetPath, JSON.stringify({ loads: nextLoads }, null, 2), "utf8");
   return { ok: true, load };
 };
+
+const sanitizeWhatsAppActivityLog = (entry) => {
+  if (!entry || typeof entry !== "object") return null;
+  const id = clampStockLoadString(entry.id, 80);
+  const occurredAt = clampStockLoadString(entry.occurredAt || entry.disconnectedAt, 40);
+  const accountId = clampStockLoadString(entry.accountId, 8) || "1";
+  const pushname = clampStockLoadString(entry.pushname, 120);
+  const phone = clampStockLoadString(entry.phone, 40);
+  const label = clampStockLoadString(entry.label, 120);
+  const event = entry.event === "linked" ? "linked" : "disconnected";
+  const source =
+    clampStockLoadString(entry.source, 80) ||
+    (event === "linked" ? "qr_scan" : "user_disconnect_button");
+  if (!id || !occurredAt) return null;
+  return { id, event, occurredAt, accountId, pushname, phone, label, source };
+};
+
+const ensureWhatsAppActivityLogsFile = (userIdRaw) => {
+  const safeUserId = sanitizeAgentDetailsUserId(String(userIdRaw || ""));
+  if (!safeUserId) return "";
+  const targetPath = resolveUserScopedPath(
+    safeUserId,
+    "whatsappDisconnectLogs.json",
+    WHATSAPP_DISCONNECT_LOGS_PATH
+  );
+  const dir = path.dirname(targetPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  if (!fs.existsSync(targetPath)) {
+    fs.writeFileSync(targetPath, JSON.stringify({ logs: [] }, null, 2), "utf8");
+  }
+  return targetPath;
+};
+
+const readWhatsAppActivityLogsStore = (userIdRaw) => {
+  const safeUserId = sanitizeAgentDetailsUserId(String(userIdRaw || ""));
+  if (!safeUserId) return { logs: [] };
+  const targetPath = ensureWhatsAppActivityLogsFile(userIdRaw);
+  if (!targetPath) return { logs: [] };
+  try {
+    const raw = fs.readFileSync(targetPath, "utf8");
+    const parsed = JSON.parse(raw || "{}");
+    const logs = Array.isArray(parsed.logs) ? parsed.logs : [];
+    const sanitized = logs.map(sanitizeWhatsAppActivityLog).filter(Boolean);
+    return { logs: sanitized };
+  } catch {
+    return { logs: [] };
+  }
+};
+
+const appendWhatsAppActivityLog = (userIdRaw, details = {}) => {
+  const safeUserId = sanitizeAgentDetailsUserId(String(userIdRaw || ""));
+  if (!safeUserId) return null;
+  const accountId = sanitizeWhatsAppAccountId(details.accountId) || "1";
+  const event = details.event === "linked" ? "linked" : "disconnected";
+  const source =
+    typeof details.source === "string" && details.source.trim()
+      ? details.source.trim()
+      : event === "linked"
+      ? "qr_scan"
+      : "user_disconnect_button";
+  const log = sanitizeWhatsAppActivityLog({
+    id: `wal_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    occurredAt: new Date().toISOString(),
+    event,
+    accountId,
+    pushname: details.pushname,
+    phone: details.phone,
+    label: details.label || `Account ${accountId}`,
+    source,
+  });
+  if (!log) return null;
+  const store = readWhatsAppActivityLogsStore(safeUserId);
+  const nextLogs = [log, ...store.logs].slice(0, 500);
+  const targetPath = ensureWhatsAppActivityLogsFile(safeUserId);
+  fs.writeFileSync(targetPath, JSON.stringify({ logs: nextLogs }, null, 2), "utf8");
+  return log;
+};
+
+const appendWhatsAppDisconnectLog = (userIdRaw, details = {}) =>
+  appendWhatsAppActivityLog(userIdRaw, { ...details, event: "disconnected" });
+
+const appendWhatsAppLinkLog = (userIdRaw, details = {}) =>
+  appendWhatsAppActivityLog(userIdRaw, { ...details, event: "linked", source: "qr_scan" });
 
 const sanitizeSessionChatMessages = (raw) => {
   if (!Array.isArray(raw)) return [];
@@ -1764,6 +1850,14 @@ const whatsappBridge = createWhatsAppBridge({
   sanitizeChatMessages,
   saveTestChatSession,
   mergeAgentMessagesPreservingOrder,
+  onAccountLinkedViaQr: (workspaceUserId, accountId, accountDetails = {}) => {
+    appendWhatsAppLinkLog(workspaceUserId, {
+      accountId,
+      pushname: accountDetails.pushname,
+      phone: accountDetails.phone,
+      label: accountDetails.label,
+    });
+  },
 });
 
 const enrichWhatsappSessionPeerPhones = async (userIdRaw, sessions) => {
@@ -1916,6 +2010,7 @@ const server = http.createServer((req, res) => {
       reqPath === "/widget-settings" ||
       reqPath === "/stock-loads" ||
       reqPath === "/leads" ||
+      reqPath === "/logs/whatsapp-disconnects" ||
       reqPath === "/chat/test" ||
       reqPath === "/chat/test/live-agent" ||
       reqPath === "/chat/test/live-message" ||
@@ -2049,6 +2144,68 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "POST" && reqPath === "/integrations/whatsapp/sync-conversations") {
+    parseJsonBody(
+      req,
+      (parsedBody) => {
+        void (async () => {
+          try {
+            const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
+            if (!sanitizeAgentDetailsUserId(userId)) {
+              return sendJson(res, 400, { message: "Valid userId is required" }, adminCorsHeaders);
+            }
+            const { plan, limit } = getWorkspacePlanContext(userId);
+            const accountIdRaw = parsedBody.accountId;
+            const accountId =
+              accountIdRaw != null && String(accountIdRaw).trim()
+                ? sanitizeWhatsAppAccountId(accountIdRaw, limit) || "1"
+                : null;
+            if (accountId && Number(accountId) > limit) {
+              return sendJson(
+                res,
+                403,
+                {
+                  message: `Your ${plan || "current"} plan allows up to ${limit} WhatsApp account(s).`,
+                  plan,
+                  limit,
+                },
+                adminCorsHeaders
+              );
+            }
+            const syncResult = await whatsappBridge.syncConversations(userId, accountId);
+            if (!syncResult.ok) {
+              return sendJson(
+                res,
+                409,
+                {
+                  message: syncResult.message || "Could not sync WhatsApp conversations",
+                  ...syncResult,
+                },
+                adminCorsHeaders
+              );
+            }
+            return sendJson(
+              res,
+              200,
+              {
+                message: `Synced WhatsApp conversations (${syncResult.created} new, ${syncResult.updated} updated)`,
+                ...syncResult,
+                ...whatsappBridge.getStatus(userId, limit),
+                plan,
+              },
+              adminCorsHeaders
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return sendJson(res, 500, { message: msg }, adminCorsHeaders);
+          }
+        })();
+      },
+      () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
+    );
+    return;
+  }
+
   if (req.method === "GET" && reqPath === "/admin/accounts") {
     const accounts = readAccounts();
     return sendJson(res, 200, { accounts }, adminCorsHeaders);
@@ -2106,6 +2263,13 @@ const server = http.createServer((req, res) => {
     const userId = typeof query.userId === "string" ? query.userId : "";
     const leads = getLeadsForUser(userId);
     return sendJson(res, 200, { leads }, adminCorsHeaders);
+  }
+
+  if (req.method === "GET" && reqPath === "/logs/whatsapp-disconnects") {
+    const query = parseQuery(req);
+    const userId = typeof query.userId === "string" ? query.userId : "";
+    const store = readWhatsAppActivityLogsStore(userId);
+    return sendJson(res, 200, store, adminCorsHeaders);
   }
 
   if (req.method === "POST" && reqPath === "/widget-settings") {
@@ -2395,7 +2559,7 @@ const server = http.createServer((req, res) => {
             if (whatsappBridge.hasPersistedSession(userId, accountId)) {
               await whatsappBridge.ensureConnected(userId, accountId);
             } else {
-              await whatsappBridge.startLinking(userId, accountId);
+              await whatsappBridge.startLinking(userId, accountId, { linkIntent: "user_qr" });
             }
             return sendJson(
               res,
@@ -2474,6 +2638,17 @@ const server = http.createServer((req, res) => {
           const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
           const { plan, limit } = getWorkspacePlanContext(userId);
           const accountId = sanitizeWhatsAppAccountId(parsedBody.accountId, limit) || "1";
+          const status = whatsappBridge.getStatus(userId, limit);
+          const account =
+            (Array.isArray(status.accounts) ? status.accounts : []).find(
+              (entry) => String(entry.accountId) === accountId
+            ) || null;
+          appendWhatsAppDisconnectLog(userId, {
+            accountId,
+            pushname: account?.pushname || "",
+            phone: account?.phone || "",
+            label: account?.label || `Account ${accountId}`,
+          });
           await whatsappBridge.disconnectAndForget(userId, accountId);
           return sendJson(
             res,

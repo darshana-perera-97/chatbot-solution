@@ -13,6 +13,7 @@ import Inquiries from "./pages/Inquiries";
 import Knowledgebase from "./pages/Knowledgebase";
 import LandingPage from "./pages/LandingPage";
 import Login from "./pages/Login";
+import Logs from "./pages/Logs";
 import Settings from "./pages/Settings";
 import StockLoads from "./pages/StockLoads";
 import Support from "./pages/Support";
@@ -46,6 +47,7 @@ function App() {
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/chats" element={<Chats />} />
           <Route path="/integrations" element={<Integrations />} />
+          <Route path="/logs" element={<Logs />} />
           <Route path="/knowledgebase" element={<Knowledgebase />} />
           <Route path="/test-bot" element={<TestBot />} />
           <Route

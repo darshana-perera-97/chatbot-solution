@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, Globe, MessageCircle, Plus, RefreshCw, X } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
@@ -70,6 +70,9 @@ function Integrations() {
   const [waStatus, setWaStatus] = useState(null);
   const [waModalError, setWaModalError] = useState("");
   const [waRefreshing, setWaRefreshing] = useState(false);
+  const [waSyncing, setWaSyncing] = useState(false);
+  const [waSyncMessage, setWaSyncMessage] = useState("");
+  const syncedAccountsRef = useRef(new Set());
 
   const waAccounts = useMemo(() => {
     if (Array.isArray(waStatus?.accounts) && waStatus.accounts.length) return waStatus.accounts;
@@ -269,6 +272,22 @@ function Integrations() {
     };
   }, [showWhatsAppConfig, userId]);
 
+  useEffect(() => {
+    if (!userId || !waStatus) return;
+    const accounts = Array.isArray(waStatus.accounts) ? waStatus.accounts : [];
+    accounts.forEach((account) => {
+      const accountId = String(account.accountId || "1");
+      const connected = Boolean(account.connected || account.phase === "ready");
+      if (!connected) {
+        syncedAccountsRef.current.delete(accountId);
+        return;
+      }
+      if (syncedAccountsRef.current.has(accountId)) return;
+      syncedAccountsRef.current.add(accountId);
+      void syncConversations(accountId, { silent: true });
+    });
+  }, [userId, waStatus]);
+
   const openWhatsAppModal = async () => {
     const firstOpenSlot =
       waAccounts.find((account) => !account.connected && account.phase !== "ready")?.accountId || "1";
@@ -286,9 +305,45 @@ function Integrations() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.message || "Disconnect failed");
+      syncedAccountsRef.current.delete(String(accountId));
       setWaStatus(data);
     } catch (e) {
       setWaModalError(e instanceof Error ? e.message : "Disconnect failed");
+    }
+  };
+
+  const syncConversations = async (accountId = activeAccountId, { silent = false } = {}) => {
+    if (!userId) return null;
+    if (!silent) {
+      setWaModalError("");
+      setWaSyncMessage("");
+    }
+    setWaSyncing(true);
+    try {
+      const res = await fetch(apiUrl("/integrations/whatsapp/sync-conversations"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          accountId: accountId != null ? String(accountId) : undefined,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || "Could not sync WhatsApp conversations");
+      if (data && typeof data === "object") setWaStatus(data);
+      const summary =
+        typeof data.message === "string"
+          ? data.message
+          : `Synced (${Number(data.created) || 0} new, ${Number(data.updated) || 0} updated)`;
+      if (!silent) setWaSyncMessage(summary);
+      return data;
+    } catch (e) {
+      if (!silent) {
+        setWaModalError(e instanceof Error ? e.message : "Sync failed");
+      }
+      return null;
+    } finally {
+      setWaSyncing(false);
     }
   };
 
@@ -299,6 +354,9 @@ function Integrations() {
   const canRegenerateQr =
     !activeConnected &&
     ["qr", "initializing", "authenticated", "error"].includes(activePhase);
+  const isRestoringSession =
+    !activeConnected &&
+    (activePhase === "reconnecting" || Boolean(activeAccount?.persisted));
 
   return (
     <>
@@ -482,6 +540,11 @@ function Integrations() {
                 {waModalError}
               </p>
             ) : null}
+            {waSyncMessage ? (
+              <p className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+                {waSyncMessage}
+              </p>
+            ) : null}
 
             {waStatus?.available === false ? (
               <p className="mt-3 rounded-xl border border-[#DDD6FE] bg-[#F8F5FF] px-3 py-2 text-sm text-[#6D28D9]">
@@ -619,6 +682,17 @@ function Integrations() {
                 </div>
 
                 <div className="mt-4 flex flex-wrap gap-2">
+                  {activeConnected ? (
+                    <button
+                      type="button"
+                      onClick={() => void syncConversations(activeAccountId)}
+                      disabled={waSyncing || waRefreshing}
+                      className="inline-flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm font-semibold text-emerald-800 shadow-sm transition hover:bg-emerald-100 disabled:opacity-60"
+                    >
+                      <RefreshCw size={16} className={waSyncing ? "animate-spin" : ""} />
+                      {waSyncing ? "Syncing chats…" : "Sync conversations"}
+                    </button>
+                  ) : null}
                   {canRegenerateQr ? (
                     <button
                       type="button"
@@ -628,6 +702,15 @@ function Integrations() {
                     >
                       <RefreshCw size={16} className={waRefreshing ? "animate-spin" : ""} />
                       {waRefreshing ? "Regenerating…" : "Regenerate QR"}
+                    </button>
+                  ) : null}
+                  {isRestoringSession ? (
+                    <button
+                      type="button"
+                      onClick={() => void disconnectWhatsApp(activeAccountId)}
+                      className="inline-flex items-center gap-2 rounded-xl border border-[#E9DFFF] bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-[#FCFAFF]"
+                    >
+                      Disconnect
                     </button>
                   ) : null}
                   <button

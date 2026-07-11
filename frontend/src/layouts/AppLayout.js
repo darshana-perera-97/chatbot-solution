@@ -12,6 +12,7 @@ import {
   MessageSquare,
   Package,
   Plug,
+  ScrollText,
   Settings,
 } from "lucide-react";
 import { clearWorkspaceUserSession } from "../auth/userSession";
@@ -22,6 +23,7 @@ const navItems = [
   { label: "Dashboard", path: "/dashboard", icon: LayoutDashboard },
   { label: "Chats", path: "/chats", icon: MessageSquare },
   { label: "Integrations", path: "/integrations", icon: Plug },
+  { label: "Logs", path: "/logs", icon: ScrollText },
   { label: "Knowledgebase", path: "/knowledgebase", icon: BookOpen },
   { label: "Test Bot", path: "/test-bot", icon: Bot },
   { label: "Inquiries", path: "/inquiries", icon: Inbox },
