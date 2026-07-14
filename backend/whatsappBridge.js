@@ -674,6 +674,11 @@ async function whatsappMessageToRecord(msg, sanitizeMessageAttachments) {
   if (!body && !attachments.length) return null;
   const record = { role, content: body };
   if (attachments.length) record.attachments = attachments;
+  const ts = Number(msg?.timestamp);
+  if (Number.isFinite(ts) && ts > 0) {
+    const ms = ts < 1e12 ? ts * 1000 : ts;
+    record.createdAt = new Date(ms).toISOString();
+  }
   return record;
 }
 
@@ -972,9 +977,8 @@ function createWhatsAppBridge(deps) {
 
     const existing = getTestChatSessionByConversation(safe, conversationId);
     const hadMessages = Array.isArray(existing?.messages) && existing.messages.length > 0;
-    const messagesToSave = hadMessages
-      ? existing.messages
-      : sanitizeChatMessages(waMessages);
+    // Pass WA records through saveTestChatSession so createdAt/attachments are kept.
+    const messagesToSave = hadMessages ? existing.messages : waMessages;
 
     let whatsappPeerPhone =
       typeof existing?.whatsappPeerPhone === "string" ? existing.whatsappPeerPhone.trim() : "";
@@ -1361,7 +1365,14 @@ function createWhatsAppBridge(deps) {
         return;
       }
 
-      const messagesForAi = sanitizeChatMessages([...prior, { role: "user", content: incomingRecord.content }]);
+      const messagesForAi = sanitizeChatMessages([
+        ...prior,
+        {
+          role: "user",
+          content: incomingRecord.content,
+          ...(incomingRecord.createdAt ? { createdAt: incomingRecord.createdAt } : {}),
+        },
+      ]);
 
       const result = await completeWorkspaceChatTurn({
         userId: safe,

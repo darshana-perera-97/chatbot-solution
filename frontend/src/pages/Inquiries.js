@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Download } from "lucide-react";
+import { CheckCircle2, Circle, Download, Loader2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
@@ -97,7 +97,7 @@ function downloadInquiriesCsv(rows) {
     });
   });
 
-  const headers = ["Name", "Email", "Phone", "Source", "Updated", "Conversation ID", ...extraFieldKeys];
+  const headers = ["Name", "Email", "Phone", "Source", "Updated", "Exported", "Conversation ID", ...extraFieldKeys];
   const lines = [
     headers.map(escapeCsvField).join(","),
     ...rows.map((row) => {
@@ -107,6 +107,7 @@ function downloadInquiriesCsv(rows) {
         getByLabelLike(row, /phone|mobile|contact/i),
         row.sourceLabel || "—",
         formatDate(row.updatedAt || row.createdAt),
+        row.exported ? "Yes" : "No",
         row.conversationId || "",
         ...extraFieldKeys.map((key) => row?.collectedData?.[key] ?? ""),
       ];
@@ -136,9 +137,12 @@ function Inquiries() {
   const [waStatus, setWaStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [actionError, setActionError] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [accountFilter, setAccountFilter] = useState("all");
+  const [exportFilter, setExportFilter] = useState("all");
+  const [exportingIds, setExportingIds] = useState(() => new Set());
 
   useEffect(() => {
     let active = true;
@@ -235,6 +239,9 @@ function Inquiries() {
         if (!row.accountKey || row.accountKey !== accountFilter) return false;
       }
 
+      if (exportFilter === "exported" && !row.exported) return false;
+      if (exportFilter === "not_exported" && row.exported) return false;
+
       if (rangeStart == null && rangeEnd == null) return true;
 
       const stamp = getLeadTimestamp(row);
@@ -243,7 +250,7 @@ function Inquiries() {
       if (rangeEnd != null && stamp > rangeEnd) return false;
       return true;
     });
-  }, [accountFilter, dateFrom, dateTo, enrichedRows]);
+  }, [accountFilter, dateFrom, dateTo, enrichedRows, exportFilter]);
 
   const withEmail = useMemo(() => {
     const hasEmail = (row) =>
@@ -253,7 +260,75 @@ function Inquiries() {
     return filteredRows.filter(hasEmail).length;
   }, [filteredRows]);
 
-  const filtersActive = Boolean(dateFrom || dateTo || accountFilter !== "all");
+  const filtersActive = Boolean(dateFrom || dateTo || accountFilter !== "all" || exportFilter !== "all");
+
+  function applyExportUpdates(updates) {
+    if (!Array.isArray(updates) || !updates.length) return;
+    const byId = new Map();
+    updates.forEach((item) => {
+      const id = String(item?.id || "").trim();
+      if (id) byId.set(id, item);
+    });
+    setRows((prev) =>
+      prev.map((row) => {
+        const id = String(row.id || "").trim();
+        const update = byId.get(id);
+        if (!update) return row;
+        return {
+          ...row,
+          exported: Boolean(update.exported),
+          exportedAt: typeof update.exportedAt === "string" ? update.exportedAt : null,
+        };
+      })
+    );
+  }
+
+  async function setExportStatus(leadIds, exported) {
+    const ids = (Array.isArray(leadIds) ? leadIds : [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean);
+    if (!userId || !ids.length) return false;
+
+    setActionError("");
+    setExportingIds((prev) => {
+      const next = new Set(prev);
+      ids.forEach((id) => next.add(id));
+      return next;
+    });
+
+    try {
+      const res = await fetch(apiUrl("/leads/exported"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, leadIds: ids, exported }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.message || "Could not update export status");
+      }
+      applyExportUpdates(Array.isArray(payload.leads) ? payload.leads : []);
+      return true;
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Could not update export status");
+      return false;
+    } finally {
+      setExportingIds((prev) => {
+        const next = new Set(prev);
+        ids.forEach((id) => next.delete(id));
+        return next;
+      });
+    }
+  }
+
+  async function handleDownloadCsv() {
+    downloadInquiriesCsv(filteredRows);
+    const idsToMark = filteredRows
+      .filter((row) => !row.exported && row.id)
+      .map((row) => String(row.id));
+    if (idsToMark.length) {
+      await setExportStatus(idsToMark, true);
+    }
+  }
 
   return (
     <main className="min-h-0 flex-1 overflow-y-auto rounded-3xl border border-[#F0E9FF] bg-white p-6 shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
@@ -267,7 +342,7 @@ function Inquiries() {
           </div>
           <button
             type="button"
-            onClick={() => downloadInquiriesCsv(filteredRows)}
+            onClick={handleDownloadCsv}
             disabled={loading || filteredRows.length === 0}
             className="inline-flex items-center gap-2 rounded-xl border border-[#E9DFFF] bg-[#FDFCFF] px-4 py-2 text-sm font-semibold text-[#7C3AED] transition hover:bg-[#F6F1FF] disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -287,7 +362,7 @@ function Inquiries() {
       </header>
 
       <section className="mb-4 rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-4">
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           <label className="block text-sm">
             <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-400">
               Start date
@@ -328,8 +403,29 @@ function Inquiries() {
               ))}
             </select>
           </label>
+
+          <label className="block text-sm">
+            <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Export status
+            </span>
+            <select
+              value={exportFilter}
+              onChange={(e) => setExportFilter(e.target.value)}
+              className="w-full rounded-xl border border-[#EEE8FF] bg-white px-3 py-2 text-sm text-slate-800 focus:border-[#C4B5FD] focus:outline-none focus:ring-2 focus:ring-[#8B5CF6]/20"
+            >
+              <option value="all">All</option>
+              <option value="exported">Exported</option>
+              <option value="not_exported">Not exported</option>
+            </select>
+          </label>
         </div>
       </section>
+
+      {actionError ? (
+        <div className="mb-4 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm font-medium text-red-600">
+          {actionError}
+        </div>
+      ) : null}
 
       <section className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF]">
         {loading ? (
@@ -356,37 +452,67 @@ function Inquiries() {
                 </tr>
               </thead>
               <tbody>
-                {filteredRows.map((row) => (
-                  <tr
-                    key={row.id || `${row.conversationId}-${row.updatedAt}`}
-                    className="rounded-xl bg-white shadow-sm"
-                  >
-                    <td className="rounded-l-xl px-3 py-3 text-sm font-semibold text-slate-700">
-                      {getByLabelLike(row, /name|full\s*name/i)}
-                    </td>
-                    <td className="px-3 py-3 text-sm text-slate-600">{getByLabelLike(row, /email/i)}</td>
-                    <td className="px-3 py-3 text-sm text-slate-600">
-                      {getByLabelLike(row, /phone|mobile|contact/i)}
-                    </td>
-                    <td className="px-3 py-3 text-sm text-slate-600">{row.sourceLabel}</td>
-                    <td className="px-3 py-3 text-sm text-slate-500">{formatDate(row.updatedAt)}</td>
-                    <td className="rounded-r-xl px-3 py-3 text-sm text-slate-500">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          navigate(
-                            `/chats?conversationId=${encodeURIComponent(
-                              String(row.conversationId || "")
-                            )}`
-                          )
-                        }
-                        className="rounded-lg border border-[#E9DFFF] bg-[#FDFCFF] px-3 py-1.5 text-xs font-semibold text-[#7C3AED] transition hover:bg-[#F6F1FF]"
-                      >
-                        Open chat
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {filteredRows.map((row) => {
+                  const rowId = String(row.id || "").trim();
+                  const isBusy = rowId ? exportingIds.has(rowId) : false;
+                  return (
+                    <tr
+                      key={row.id || `${row.conversationId}-${row.updatedAt}`}
+                      className="rounded-xl bg-white shadow-sm"
+                    >
+                      <td className="rounded-l-xl px-3 py-3 text-sm font-semibold text-slate-700">
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={!rowId || isBusy}
+                            aria-label={row.exported ? "Mark as not exported" : "Mark as exported"}
+                            title={
+                              row.exported
+                                ? `Exported${row.exportedAt ? ` ${formatDate(row.exportedAt)}` : ""} — click to unmark`
+                                : "Mark as exported"
+                            }
+                            onClick={() => setExportStatus([rowId], !row.exported)}
+                            className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                              row.exported
+                                ? "text-emerald-600 hover:bg-emerald-50"
+                                : "text-slate-300 hover:bg-slate-100 hover:text-slate-500"
+                            }`}
+                          >
+                            {isBusy ? (
+                              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                            ) : row.exported ? (
+                              <CheckCircle2 className="h-4 w-4" aria-hidden />
+                            ) : (
+                              <Circle className="h-4 w-4" aria-hidden />
+                            )}
+                          </button>
+                          <span>{getByLabelLike(row, /name|full\s*name/i)}</span>
+                        </div>
+                      </td>
+                      <td className="px-3 py-3 text-sm text-slate-600">{getByLabelLike(row, /email/i)}</td>
+                      <td className="px-3 py-3 text-sm text-slate-600">
+                        {getByLabelLike(row, /phone|mobile|contact/i)}
+                      </td>
+                      <td className="px-3 py-3 text-sm text-slate-600">{row.sourceLabel}</td>
+                      <td className="px-3 py-3 text-sm text-slate-500">{formatDate(row.updatedAt)}</td>
+                      <td className="rounded-r-xl px-3 py-3 text-sm text-slate-500">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            navigate("/chats", {
+                              state: {
+                                conversationId: String(row.conversationId || ""),
+                              },
+                            })
+                          }
+                          className="rounded-lg border border-[#E9DFFF] bg-[#FDFCFF] px-3 py-1.5 text-xs font-semibold text-[#7C3AED] transition hover:bg-[#F6F1FF]"
+                        >
+                          Open chat
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

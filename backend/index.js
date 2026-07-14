@@ -637,6 +637,27 @@ const appendWhatsAppDisconnectLog = (userIdRaw, details = {}) =>
 const appendWhatsAppLinkLog = (userIdRaw, details = {}) =>
   appendWhatsAppActivityLog(userIdRaw, { ...details, event: "linked", source: "qr_scan" });
 
+const sanitizeMessageCreatedAt = (value) => {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    const ms = Date.parse(trimmed);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    const ms = value < 1e12 ? value * 1000 : value;
+    return new Date(ms).toISOString();
+  }
+  return "";
+};
+
+const stampMessageCreatedAt = (msg, fallbackIso = "") => {
+  if (!msg || typeof msg !== "object") return msg;
+  if (msg.createdAt) return msg;
+  const stamped = sanitizeMessageCreatedAt(fallbackIso) || new Date().toISOString();
+  return { ...msg, createdAt: stamped };
+};
+
 const sanitizeSessionChatMessages = (raw) => {
   if (!Array.isArray(raw)) return [];
   const out = [];
@@ -654,6 +675,8 @@ const sanitizeSessionChatMessages = (raw) => {
     if (!role || (!content && !att.length)) continue;
     const msg = { role, content: content.slice(0, 16000) };
     if (att.length) msg.attachments = att;
+    const createdAt = sanitizeMessageCreatedAt(entry?.createdAt);
+    if (createdAt) msg.createdAt = createdAt;
     out.push(msg);
   }
   return out.slice(-60);
@@ -666,7 +689,21 @@ const mergeAgentMessagesPreservingOrder = (existingMessages, incomingUserAssista
     (incomingUserAssistant || []).filter((entry) => entry?.role !== "agent")
   );
   if (!existing.some((entry) => entry.role === "agent")) {
-    return incoming;
+    const stampedIncoming = [];
+    for (let i = 0; i < incoming.length; i += 1) {
+      const next = incoming[i];
+      const prev = existing[i];
+      if (next.createdAt) {
+        stampedIncoming.push(next);
+      } else if (prev?.role === next.role && prev.createdAt) {
+        stampedIncoming.push({ ...next, createdAt: prev.createdAt });
+      } else if (i >= existing.length) {
+        stampedIncoming.push(stampMessageCreatedAt(next));
+      } else {
+        stampedIncoming.push(next);
+      }
+    }
+    return sanitizeSessionChatMessages(stampedIncoming);
   }
 
   const merged = [];
@@ -677,11 +714,16 @@ const mergeAgentMessagesPreservingOrder = (existingMessages, incomingUserAssista
       continue;
     }
     if (incomingIdx < incoming.length) {
-      merged.push(incoming[incomingIdx++]);
+      const next = incoming[incomingIdx++];
+      if (!next.createdAt && entry.createdAt) {
+        merged.push({ ...next, createdAt: entry.createdAt });
+      } else {
+        merged.push(next.createdAt ? next : stampMessageCreatedAt(next));
+      }
     }
   }
   while (incomingIdx < incoming.length) {
-    merged.push(incoming[incomingIdx++]);
+    merged.push(stampMessageCreatedAt(incoming[incomingIdx++]));
   }
   return sanitizeSessionChatMessages(merged);
 };
@@ -759,6 +801,12 @@ const upsertLeadByConversation = (userIdRaw, conversationIdRaw, fieldLabels, col
 
   if (idx >= 0) {
     payload.createdAt = typeof leads[idx].createdAt === "string" ? leads[idx].createdAt : nowIso;
+    if (leads[idx].exported) {
+      payload.exported = true;
+      if (typeof leads[idx].exportedAt === "string") {
+        payload.exportedAt = leads[idx].exportedAt;
+      }
+    }
     leads[idx] = payload;
   } else {
     payload.createdAt = nowIso;
@@ -767,6 +815,60 @@ const upsertLeadByConversation = (userIdRaw, conversationIdRaw, fieldLabels, col
 
   writeLeadsStore({ leads: leads.slice(0, 1000) }, safeUserId);
   return payload;
+};
+
+const setLeadsExported = (userIdRaw, leadIdsRaw, exportedRaw) => {
+  const safeUserId = sanitizeAgentDetailsUserId(
+    typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
+  );
+  if (!safeUserId) {
+    return { ok: false, statusCode: 400, message: "A valid userId is required", leads: [] };
+  }
+
+  const idList = Array.isArray(leadIdsRaw)
+    ? leadIdsRaw
+        .map((id) => (typeof id === "string" ? id.trim() : String(id || "").trim()))
+        .filter(Boolean)
+    : [];
+  if (!idList.length) {
+    return { ok: false, statusCode: 400, message: "At least one lead id is required", leads: [] };
+  }
+
+  const exported = Boolean(exportedRaw);
+  const nowIso = new Date().toISOString();
+  const idSet = new Set(idList);
+  const store = readLeadsStore(safeUserId);
+  const leads = Array.isArray(store.leads) ? store.leads : [];
+  const updated = [];
+
+  for (let i = 0; i < leads.length; i += 1) {
+    const lead = leads[i];
+    if (String(lead.userId || "") !== safeUserId) continue;
+    const leadId = typeof lead.id === "string" ? lead.id.trim() : "";
+    if (!leadId || !idSet.has(leadId)) continue;
+
+    const next = { ...lead };
+    if (exported) {
+      next.exported = true;
+      next.exportedAt = nowIso;
+    } else {
+      delete next.exported;
+      delete next.exportedAt;
+    }
+    leads[i] = next;
+    updated.push({
+      id: leadId,
+      exported: Boolean(next.exported),
+      exportedAt: typeof next.exportedAt === "string" ? next.exportedAt : null,
+    });
+  }
+
+  if (!updated.length) {
+    return { ok: false, statusCode: 404, message: "No matching leads found", leads: [] };
+  }
+
+  writeLeadsStore({ leads }, safeUserId);
+  return { ok: true, statusCode: 200, message: "Export status updated", leads: updated };
 };
 
 const getLeadsForUser = (userIdRaw) => {
@@ -786,6 +888,8 @@ const getLeadsForUser = (userIdRaw) => {
       fieldLabels: Array.isArray(lead.fieldLabels) ? lead.fieldLabels : [],
       collectedData: lead.collectedData && typeof lead.collectedData === "object" ? lead.collectedData : {},
       collectedCount: Number(lead.collectedCount) || 0,
+      exported: Boolean(lead.exported),
+      exportedAt: typeof lead.exportedAt === "string" ? lead.exportedAt : null,
       createdAt: typeof lead.createdAt === "string" ? lead.createdAt : null,
       updatedAt: typeof lead.updatedAt === "string" ? lead.updatedAt : null,
     }))
@@ -1069,54 +1173,78 @@ const patchTestChatSessionPeerPhone = (userIdRaw, conversationIdRaw, phoneRaw) =
   return getTestChatSessionByConversation(safeUserId, safeConversationId);
 };
 
-const getTestChatSessionsForUser = (userIdRaw) => {
+const mapStoredChatSession = (
+  safeUserId,
+  session,
+  { includeMessages = true, leadLookup = null } = {}
+) => {
+  const conversationId =
+    typeof session.conversationId === "string" ? sanitizeConversationId(session.conversationId) : "";
+  if (!conversationId) return null;
+  const lead = leadLookup
+    ? leadLookup.get(conversationId) || null
+    : getLeadByConversation(safeUserId, conversationId);
+  return {
+    id: typeof session.id === "string" ? session.id : `${Date.now()}`,
+    userId: safeUserId,
+    conversationId,
+    account: session.account && typeof session.account === "object" ? session.account : null,
+    chatSource: sanitizeChatSource(session.chatSource),
+    channelAccountName: sanitizeChannelAccountName(session.channelAccountName),
+    whatsappChatId:
+      typeof session.whatsappChatId === "string" ? sanitizeWhatsappChatId(session.whatsappChatId) : "",
+    whatsappPeerPhone:
+      typeof session.whatsappPeerPhone === "string"
+        ? sanitizeWhatsappPeerPhone(session.whatsappPeerPhone)
+        : "",
+    whatsappAccountId:
+      typeof session.whatsappAccountId === "string"
+        ? sanitizeWhatsAppAccountId(session.whatsappAccountId) || "1"
+        : "1",
+    ...(includeMessages
+      ? { messages: sanitizeSessionChatMessages(session.messages) }
+      : {}),
+    messageCount: Number(session.messageCount) || 0,
+    liveAgentEnabled: Boolean(session.liveAgentEnabled),
+    lastReplyPreview:
+      typeof session.lastReplyPreview === "string" ? session.lastReplyPreview : "",
+    lead: lead
+      ? {
+          fieldLabels: Array.isArray(lead.fieldLabels) ? lead.fieldLabels : [],
+          collectedData:
+            lead.collectedData && typeof lead.collectedData === "object" ? lead.collectedData : {},
+          collectedCount: Number(lead.collectedCount) || 0,
+          updatedAt: typeof lead.updatedAt === "string" ? lead.updatedAt : null,
+        }
+      : null,
+    createdAt: typeof session.createdAt === "string" ? session.createdAt : null,
+    updatedAt: typeof session.updatedAt === "string" ? session.updatedAt : null,
+  };
+};
+
+const getTestChatSessionsForUser = (userIdRaw, options = {}) => {
+  const includeMessages = options.includeMessages !== false;
   const safeUserId = sanitizeAgentDetailsUserId(
     typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
   );
   if (!safeUserId) return [];
   const store = readChatsStore(safeUserId);
   const sessions = Array.isArray(store.sessions) ? store.sessions : [];
+  const leadsStore = readLeadsStore(safeUserId);
+  const leads = Array.isArray(leadsStore.leads) ? leadsStore.leads : [];
+  const leadLookup = new Map();
+  leads.forEach((lead) => {
+    if (String(lead.userId || "") !== safeUserId) return;
+    const conversationId = sanitizeConversationId(String(lead.conversationId || ""));
+    if (!conversationId || leadLookup.has(conversationId)) return;
+    leadLookup.set(conversationId, lead);
+  });
   return sessions
     .filter((session) => String(session.userId || "") === safeUserId)
-    .map((session) => {
-      const conversationId =
-        typeof session.conversationId === "string" ? sanitizeConversationId(session.conversationId) : "";
-      const lead = conversationId ? getLeadByConversation(safeUserId, conversationId) : null;
-      return {
-        id: typeof session.id === "string" ? session.id : `${Date.now()}`,
-        userId: safeUserId,
-        conversationId,
-        account: session.account && typeof session.account === "object" ? session.account : null,
-        chatSource: sanitizeChatSource(session.chatSource),
-        channelAccountName: sanitizeChannelAccountName(session.channelAccountName),
-        whatsappChatId:
-          typeof session.whatsappChatId === "string" ? sanitizeWhatsappChatId(session.whatsappChatId) : "",
-        whatsappPeerPhone:
-          typeof session.whatsappPeerPhone === "string"
-            ? sanitizeWhatsappPeerPhone(session.whatsappPeerPhone)
-            : "",
-        whatsappAccountId:
-          typeof session.whatsappAccountId === "string"
-            ? sanitizeWhatsAppAccountId(session.whatsappAccountId) || "1"
-            : "1",
-        messages: sanitizeSessionChatMessages(session.messages),
-        messageCount: Number(session.messageCount) || 0,
-        liveAgentEnabled: Boolean(session.liveAgentEnabled),
-        lastReplyPreview:
-          typeof session.lastReplyPreview === "string" ? session.lastReplyPreview : "",
-        lead: lead
-          ? {
-              fieldLabels: Array.isArray(lead.fieldLabels) ? lead.fieldLabels : [],
-              collectedData: lead.collectedData && typeof lead.collectedData === "object" ? lead.collectedData : {},
-              collectedCount: Number(lead.collectedCount) || 0,
-              updatedAt: typeof lead.updatedAt === "string" ? lead.updatedAt : null,
-            }
-          : null,
-        createdAt: typeof session.createdAt === "string" ? session.createdAt : null,
-        updatedAt: typeof session.updatedAt === "string" ? session.updatedAt : null,
-      };
-    })
-    .filter((session) => Boolean(session.conversationId))
+    .map((session) =>
+      mapStoredChatSession(safeUserId, session, { includeMessages, leadLookup })
+    )
+    .filter(Boolean)
     .sort((a, b) => Date.parse(b.updatedAt || "") - Date.parse(a.updatedAt || ""));
 };
 
@@ -1128,14 +1256,15 @@ const getTestChatSessionByConversation = (userIdRaw, conversationIdRaw) => {
     typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
   );
   if (!safeUserId || !safeConversationId) return null;
-  const sessions = getTestChatSessionsForUser(safeUserId);
-  return (
-    sessions.find(
-      (session) =>
-        String(session.userId || "") === safeUserId &&
-        String(session.conversationId || "") === safeConversationId
-    ) || null
+  const store = readChatsStore(safeUserId);
+  const sessions = Array.isArray(store.sessions) ? store.sessions : [];
+  const match = sessions.find(
+    (session) =>
+      String(session.userId || "") === safeUserId &&
+      sanitizeConversationId(String(session.conversationId || "")) === safeConversationId
   );
+  if (!match) return null;
+  return mapStoredChatSession(safeUserId, match, { includeMessages: true });
 };
 
 const updateLiveAgentMode = (userIdRaw, conversationIdRaw, enabled) => {
@@ -1167,7 +1296,10 @@ const appendLiveAgentMessage = (userIdRaw, conversationIdRaw, messageTextRaw) =>
   const existing = getTestChatSessionByConversation(safeUserId, safeConversationId);
   if (!existing || !existing.liveAgentEnabled) return null;
 
-  const nextMessages = [...existing.messages, { role: "agent", content: messageText }];
+  const nextMessages = [
+    ...existing.messages,
+    { role: "agent", content: messageText, createdAt: new Date().toISOString() },
+  ];
   saveTestChatSession(safeUserId, safeConversationId, nextMessages, {
     liveAgentEnabled: true,
   });
@@ -1628,7 +1760,10 @@ const sanitizeChatMessages = (raw) => {
     const role = entry?.role === "assistant" ? "assistant" : entry?.role === "user" ? "user" : null;
     const content = typeof entry?.content === "string" ? entry.content.trim() : "";
     if (!role || !content) continue;
-    out.push({ role, content: content.slice(0, 16000) });
+    const msg = { role, content: content.slice(0, 16000) };
+    const createdAt = sanitizeMessageCreatedAt(entry?.createdAt);
+    if (createdAt) msg.createdAt = createdAt;
+    out.push(msg);
   }
   return out.slice(-30);
 };
@@ -1829,14 +1964,21 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
       }
     }
 
-    const reply = await callOpenAIChat(systemPrompt, cleaned);
+    const reply = await callOpenAIChat(
+      systemPrompt,
+      cleaned.map((entry) => ({ role: entry.role, content: entry.content }))
+    );
     const lastUserText = cleaned[cleaned.length - 1]?.content || "";
     const attachments = collectWorkspaceProductAttachments(
       details.productsOrServices,
       lastUserText,
       reply
     );
-    const assistantRecord = { role: "assistant", content: reply };
+    const assistantRecord = {
+      role: "assistant",
+      content: reply,
+      createdAt: new Date().toISOString(),
+    };
     if (attachments.length) assistantRecord.attachments = attachments;
     const mergedMessages = mergeAgentMessagesPreservingOrder(existingSession?.messages, [
       ...cleaned,
@@ -2044,6 +2186,7 @@ const server = http.createServer((req, res) => {
       reqPath === "/widget-settings" ||
       reqPath === "/stock-loads" ||
       reqPath === "/leads" ||
+      reqPath === "/leads/exported" ||
       reqPath === "/logs/whatsapp-disconnects" ||
       reqPath === "/chat/test" ||
       reqPath === "/chat/test/live-agent" ||
@@ -2299,6 +2442,34 @@ const server = http.createServer((req, res) => {
     return sendJson(res, 200, { leads }, adminCorsHeaders);
   }
 
+  if (req.method === "POST" && reqPath === "/leads/exported") {
+    parseJsonBody(
+      req,
+      (parsedBody) => {
+        const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
+        const leadIds = Array.isArray(parsedBody.leadIds)
+          ? parsedBody.leadIds
+          : typeof parsedBody.leadId === "string"
+            ? [parsedBody.leadId]
+            : [];
+        const exported =
+          typeof parsedBody.exported === "boolean" ? parsedBody.exported : true;
+        const result = setLeadsExported(userId, leadIds, exported);
+        if (!result.ok) {
+          return sendJson(res, result.statusCode, { message: result.message }, adminCorsHeaders);
+        }
+        return sendJson(
+          res,
+          200,
+          { message: result.message, leads: result.leads },
+          adminCorsHeaders
+        );
+      },
+      () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
+    );
+    return;
+  }
+
   if (req.method === "GET" && reqPath === "/logs/whatsapp-disconnects") {
     const query = parseQuery(req);
     const userId = typeof query.userId === "string" ? query.userId : "";
@@ -2438,10 +2609,13 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && reqPath === "/chat/test/sessions") {
     const query = parseQuery(req);
     const userId = typeof query.userId === "string" ? query.userId : "";
+    const summary =
+      query.summary === "1" || String(query.summary || "").toLowerCase() === "true";
     void (async () => {
-      const sessions = getTestChatSessionsForUser(userId);
-      const enriched = await enrichWhatsappSessionPeerPhones(userId, sessions);
-      return sendJson(res, 200, { sessions: enriched }, adminCorsHeaders);
+      const sessions = getTestChatSessionsForUser(userId, { includeMessages: !summary });
+      sendJson(res, 200, { sessions }, adminCorsHeaders);
+      // Enrich after responding — peer-phone lookups can stall remote WhatsApp clients.
+      void enrichWhatsappSessionPeerPhones(userId, sessions).catch(() => {});
     })();
     return;
   }

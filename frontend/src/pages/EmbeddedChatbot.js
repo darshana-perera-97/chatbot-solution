@@ -2,7 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { AssistantAttachments } from "../components/AssistantAttachments";
-import { CHAT_SESSION_POLL_FAST_MS, CHAT_SESSION_POLL_MS, normalizeSessionMessages } from "../chatSessionMessages";
+import {
+  CHAT_SESSION_POLL_FAST_MS,
+  CHAT_SESSION_POLL_MS,
+  formatMessageTimestamp,
+  normalizeSessionMessages,
+} from "../chatSessionMessages";
 
 const WIDGET_WIDTH = 380;
 const WIDGET_HEIGHT = 640;
@@ -121,9 +126,14 @@ function EmbeddedChatbot() {
 
   useEffect(() => {
     if (previewMode) {
+      const now = new Date().toISOString();
       setLines([
-        { role: "assistant", content: "Hi! I am your AI assistant. This is preview mode." },
-        { role: "user", content: "Great, I am checking how the widget looks." },
+        {
+          role: "assistant",
+          content: "Hi! I am your AI assistant. This is preview mode.",
+          createdAt: now,
+        },
+        { role: "user", content: "Great, I am checking how the widget looks.", createdAt: now },
       ]);
       return;
     }
@@ -140,12 +150,24 @@ function EmbeddedChatbot() {
         if (normalized.length > 0) {
           setLines(normalized);
         } else {
-          setLines([{ role: "assistant", content: "Hi! How can I help you today?" }]);
+          setLines([
+            {
+              role: "assistant",
+              content: "Hi! How can I help you today?",
+              createdAt: new Date().toISOString(),
+            },
+          ]);
         }
         setLiveAgentEnabled(Boolean(data?.session?.liveAgentEnabled));
       } catch {
         if (!active) return;
-        setLines([{ role: "assistant", content: "Hi! How can I help you today?" }]);
+        setLines([
+          {
+            role: "assistant",
+            content: "Hi! How can I help you today?",
+            createdAt: new Date().toISOString(),
+          },
+        ]);
       }
     }
     loadSession();
@@ -200,13 +222,16 @@ function EmbeddedChatbot() {
     const text = input.trim();
     if (!text || sending) return;
     if (previewMode) {
-      setLines((prev) => [...prev, { role: "user", content: text }]);
+      setLines((prev) => [
+        ...prev,
+        { role: "user", content: text, createdAt: new Date().toISOString() },
+      ]);
       setInput("");
       setError("");
       return;
     }
     if (!userId) return;
-    const userLine = { role: "user", content: text };
+    const userLine = { role: "user", content: text, createdAt: new Date().toISOString() };
     const next = [...lines, userLine];
     const prev = lines;
     setInput("");
@@ -241,6 +266,7 @@ function EmbeddedChatbot() {
           {
             role: "assistant",
             content: reply,
+            createdAt: new Date().toISOString(),
             ...(attachments.length > 0 ? { attachments } : {}),
           },
         ]);
@@ -297,6 +323,7 @@ function EmbeddedChatbot() {
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3">
             {lines.map((line, idx) => {
               const isUser = line.role === "user";
+              const timeLabel = formatMessageTimestamp(line.createdAt);
               return (
                 <div key={`${idx}-${line.role}`} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
                   <div
@@ -317,6 +344,15 @@ function EmbeddedChatbot() {
                     <p className="whitespace-pre-wrap">{line.content}</p>
                     {line.role === "assistant" && Array.isArray(line.attachments) && line.attachments.length > 0 ? (
                       <AssistantAttachments attachments={line.attachments} variant="embed" />
+                    ) : null}
+                    {timeLabel ? (
+                      <p
+                        className={`mt-1.5 text-[10px] font-medium ${
+                          isUser ? "opacity-75" : "text-slate-400"
+                        }`}
+                      >
+                        {timeLabel}
+                      </p>
                     ) : null}
                   </div>
                 </div>

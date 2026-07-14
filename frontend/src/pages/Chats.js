@@ -4,7 +4,13 @@ import { useLocation } from "react-router-dom";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { AssistantAttachments } from "../components/AssistantAttachments";
-import { CHATS_OPERATOR_POLL_FAST_MS, CHATS_OPERATOR_POLL_MS } from "../chatSessionMessages";
+import {
+  CHATS_ACTIVE_THREAD_POLL_MS,
+  CHATS_OPERATOR_POLL_FAST_MS,
+  CHATS_OPERATOR_POLL_MS,
+  CHATS_WA_STATUS_POLL_MS,
+  formatMessageTimestamp,
+} from "../chatSessionMessages";
 
 function formatConversationTime(iso) {
   const date = Date.parse(String(iso || ""));
@@ -192,12 +198,16 @@ function toThreadMessages(rawMessages) {
   if (!Array.isArray(rawMessages)) return [];
   return rawMessages
     .filter((item) => item && (item.role === "user" || item.role === "assistant" || item.role === "agent"))
-    .map((item, idx) => ({
-      id: `${idx}-${item.role}`,
-      role: item.role,
-      text: typeof item.content === "string" ? item.content : "",
-      attachments: Array.isArray(item.attachments) ? item.attachments : [],
-    }))
+    .map((item, idx) => {
+      const createdAtMs = Date.parse(String(item.createdAt || ""));
+      return {
+        id: `${idx}-${item.role}`,
+        role: item.role,
+        text: typeof item.content === "string" ? item.content : "",
+        attachments: Array.isArray(item.attachments) ? item.attachments : [],
+        createdAt: Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : "",
+      };
+    })
     .filter((item) => item.text.trim().length > 0 || item.attachments.length > 0);
 }
 
@@ -217,7 +227,10 @@ function Chats() {
   const [liveDraft, setLiveDraft] = useState("");
   const [liveSaving, setLiveSaving] = useState(false);
   const syncedOnLoadRef = useRef(false);
-  const conversationIdFromQuery = new URLSearchParams(location.search).get("conversationId") || "";
+  const conversationIdFromNav =
+    (typeof location.state?.conversationId === "string" && location.state.conversationId.trim()) ||
+    new URLSearchParams(location.search).get("conversationId") ||
+    "";
   const threadScrollRef = useRef(null);
   const liveInputRef = useRef(null);
   const pendingLiveDraftCursorRef = useRef(null);
@@ -232,15 +245,34 @@ function Chats() {
     [sessions]
   );
 
+  const mergeSessionSummary = (prev, list) => {
+    const prevById = new Map(prev.map((session) => [session.id, session]));
+    return list.map((session) => {
+      const existing = prevById.get(session.id);
+      if (!existing) return session;
+      // Keep already-hydrated thread messages when the list poll is summary-only.
+      if (!Array.isArray(session.messages) && Array.isArray(existing.messages)) {
+        return {
+          ...existing,
+          ...session,
+          messages: existing.messages,
+          lead: session.lead ?? existing.lead,
+        };
+      }
+      return { ...existing, ...session };
+    });
+  };
+
+  // Initial list + polling — summary payload (no full message bodies) for faster paint/polls.
   useEffect(() => {
     let active = true;
     let intervalId = null;
 
-    async function loadChats(isBackgroundRefresh = false) {
+    async function loadSessionList(isBackgroundRefresh = false) {
       if (!isBackgroundRefresh) {
         setLoading(true);
+        setError("");
       }
-      setError("");
       try {
         if (!userId) {
           if (!active) return;
@@ -248,25 +280,22 @@ function Chats() {
           setSelectedId("");
           return;
         }
-        const [res, waRes] = await Promise.all([
-          fetch(apiUrl(`/chat/test/sessions?userId=${encodeURIComponent(userId)}`)),
-          fetch(apiUrl(`/integrations/whatsapp/status?userId=${encodeURIComponent(userId)}`), {
-            cache: "no-store",
-          }),
-        ]);
+        const res = await fetch(
+          apiUrl(
+            `/chat/test/sessions?userId=${encodeURIComponent(userId)}&summary=1`
+          )
+        );
         const data = await res.json().catch(() => ({}));
-        const waPayload = await waRes.json().catch(() => ({}));
         if (!res.ok) {
           throw new Error(data.message || "Could not load chat sessions");
         }
         if (!active) return;
         const list = Array.isArray(data.sessions) ? data.sessions : [];
-        setSessions(list);
-        setWaStatus(waPayload && typeof waPayload === "object" ? waPayload : null);
+        setSessions((prev) => (isBackgroundRefresh ? mergeSessionSummary(prev, list) : list));
         setSelectedId((prev) => {
-          if (conversationIdFromQuery) {
+          if (conversationIdFromNav) {
             const matched = list.find(
-              (item) => String(item.conversationId || "") === String(conversationIdFromQuery)
+              (item) => String(item.conversationId || "") === String(conversationIdFromNav)
             );
             if (matched?.id) return matched.id;
           }
@@ -287,19 +316,136 @@ function Chats() {
       }
     }
 
-    loadChats(false);
-    const pollMs = needsFastRefresh ? CHATS_OPERATOR_POLL_FAST_MS : CHATS_OPERATOR_POLL_MS;
-    intervalId = setInterval(() => {
-      if (!document.hidden) {
-        void loadChats(true);
-      }
-    }, pollMs);
+    void loadSessionList(false);
 
     return () => {
       active = false;
       if (intervalId) clearInterval(intervalId);
     };
-  }, [userId, conversationIdFromQuery, needsFastRefresh]);
+  }, [userId, conversationIdFromNav]);
+
+  // Poll session list separately so changing poll speed never re-triggers the loading spinner.
+  useEffect(() => {
+    if (!userId) return undefined;
+    let active = true;
+    const pollMs = needsFastRefresh ? CHATS_OPERATOR_POLL_FAST_MS : CHATS_OPERATOR_POLL_MS;
+
+    async function refreshList() {
+      try {
+        const res = await fetch(
+          apiUrl(
+            `/chat/test/sessions?userId=${encodeURIComponent(userId)}&summary=1`
+          )
+        );
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !active) return;
+        const list = Array.isArray(data.sessions) ? data.sessions : [];
+        setSessions((prev) => mergeSessionSummary(prev, list));
+      } catch {
+        /* keep last good list on background failures */
+      }
+    }
+
+    const intervalId = setInterval(() => {
+      if (!document.hidden) void refreshList();
+    }, pollMs);
+
+    return () => {
+      active = false;
+      clearInterval(intervalId);
+    };
+  }, [userId, needsFastRefresh]);
+
+  // WhatsApp status loads independently so a slow WA check never blocks the chat list.
+  useEffect(() => {
+    let active = true;
+    let intervalId = null;
+
+    async function loadWaStatus() {
+      if (!userId) {
+        if (active) setWaStatus(null);
+        return;
+      }
+      try {
+        const waRes = await fetch(
+          apiUrl(`/integrations/whatsapp/status?userId=${encodeURIComponent(userId)}`),
+          { cache: "no-store" }
+        );
+        const waPayload = await waRes.json().catch(() => ({}));
+        if (!active) return;
+        setWaStatus(waRes.ok && waPayload && typeof waPayload === "object" ? waPayload : null);
+      } catch {
+        if (active) setWaStatus(null);
+      }
+    }
+
+    void loadWaStatus();
+    intervalId = setInterval(() => {
+      if (!document.hidden) void loadWaStatus();
+    }, CHATS_WA_STATUS_POLL_MS);
+
+    return () => {
+      active = false;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [userId]);
+
+  const selectedConversationId = useMemo(() => {
+    const current = sessions.find((session) => session.id === selectedId);
+    return typeof current?.conversationId === "string" ? current.conversationId.trim() : "";
+  }, [sessions, selectedId]);
+
+  // Hydrate full messages for the selected conversation (and keep them fresh while open).
+  useEffect(() => {
+    if (!userId || !selectedId || !selectedConversationId) return undefined;
+    let active = true;
+    let intervalId = null;
+    const conversationId = selectedConversationId;
+
+    async function loadActiveThread() {
+      try {
+        const query = `?userId=${encodeURIComponent(userId)}&conversationId=${encodeURIComponent(
+          conversationId
+        )}`;
+        const res = await fetch(apiUrl(`/chat/test/session${query}`));
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !active) return;
+        const session = data?.session;
+        if (!session || typeof session !== "object") return;
+        const lead =
+          data?.lead && typeof data.lead === "object"
+            ? {
+                fieldLabels: Array.isArray(data.lead.fieldLabels) ? data.lead.fieldLabels : [],
+                collectedData:
+                  data.lead.collectedData && typeof data.lead.collectedData === "object"
+                    ? data.lead.collectedData
+                    : {},
+                collectedCount: Number(data.lead.collectedCount) || 0,
+                updatedAt: typeof data.lead.updatedAt === "string" ? data.lead.updatedAt : null,
+              }
+            : session.lead || null;
+        setSessions((prev) =>
+          prev.map((item) =>
+            item.id === selectedId || item.conversationId === conversationId
+              ? { ...item, ...session, lead: lead ?? item.lead }
+              : item
+          )
+        );
+      } catch {
+        /* ignore background thread refresh errors */
+      }
+    }
+
+    void loadActiveThread();
+    intervalId = setInterval(() => {
+      if (!document.hidden) void loadActiveThread();
+    }, CHATS_ACTIVE_THREAD_POLL_MS);
+
+    return () => {
+      active = false;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [userId, selectedId, selectedConversationId]);
 
   useEffect(() => {
     if (!userId || syncedOnLoadRef.current) return;
@@ -318,11 +464,13 @@ function Chats() {
         if (!res.ok) return;
         if (Number(data?.created) > 0) {
           const sessionsRes = await fetch(
-            apiUrl(`/chat/test/sessions?userId=${encodeURIComponent(userId)}`)
+            apiUrl(
+              `/chat/test/sessions?userId=${encodeURIComponent(userId)}&summary=1`
+            )
           );
           const payload = await sessionsRes.json().catch(() => ({}));
           const list = Array.isArray(payload.sessions) ? payload.sessions : [];
-          if (list.length) setSessions(list);
+          if (list.length) setSessions((prev) => mergeSessionSummary(prev, list));
         }
       } catch {
         /* ignore background sync errors */
@@ -704,6 +852,7 @@ function Chats() {
                 {messages.map((m) => {
                   const isCustomer = m.role === "user";
                   const isLiveAgent = m.role === "agent";
+                  const timeLabel = formatMessageTimestamp(m.createdAt);
                   return (
                     <div
                       key={m.id}
@@ -731,6 +880,15 @@ function Chats() {
                             attachments={m.attachments}
                             variant={isCustomer ? "customer" : "default"}
                           />
+                        ) : null}
+                        {timeLabel ? (
+                          <p
+                            className={`mt-1.5 text-[10px] font-medium ${
+                              isCustomer ? "text-white/75" : "text-slate-400"
+                            }`}
+                          >
+                            {timeLabel}
+                          </p>
                         ) : null}
                       </div>
                     </div>

@@ -105,49 +105,82 @@ function Dashboard() {
     let active = true;
     async function loadLiveData() {
       setLiveDataError("");
-      try {
-        if (!userId) {
+      if (!userId) {
+        if (!active) return;
+        setSessions([]);
+        setLeads([]);
+        setWidgetSettings(null);
+        setAgentDetails(null);
+        return;
+      }
+
+      const errors = [];
+
+      const tasks = [
+        (async () => {
+          const res = await fetch(
+            apiUrl(
+              `/chat/test/sessions?userId=${encodeURIComponent(userId)}&summary=1`
+            )
+          );
+          const payload = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(payload.message || "Could not load user conversations");
+          }
           if (!active) return;
-          setSessions([]);
-          setLeads([]);
-          setWidgetSettings(null);
-          return;
+          setSessions(Array.isArray(payload.sessions) ? payload.sessions : []);
+        })(),
+        (async () => {
+          const res = await fetch(apiUrl(`/leads?userId=${encodeURIComponent(userId)}`));
+          const payload = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(payload.message || "Could not load user leads");
+          }
+          if (!active) return;
+          setLeads(Array.isArray(payload.leads) ? payload.leads : []);
+        })(),
+        (async () => {
+          const res = await fetch(
+            apiUrl(`/agent-details?userId=${encodeURIComponent(userId)}`)
+          );
+          const payload = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(payload?.message || "Could not load user knowledgebase");
+          }
+          if (!active) return;
+          setAgentDetails(
+            payload?.details && typeof payload.details === "object" ? payload.details : null
+          );
+        })(),
+        (async () => {
+          const res = await fetch(
+            apiUrl(`/widget-settings?userId=${encodeURIComponent(userId)}`)
+          );
+          const payload = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(payload.message || "Could not load widget settings");
+          }
+          if (!active) return;
+          setWidgetSettings(
+            payload?.settings && typeof payload.settings === "object" ? payload.settings : null
+          );
+        })(),
+      ];
+
+      const results = await Promise.allSettled(tasks);
+      if (!active) return;
+      results.forEach((result) => {
+        if (result.status === "rejected") {
+          errors.push(
+            result.reason instanceof Error ? result.reason.message : "Could not load live dashboard data"
+          );
         }
-        const [sessionsRes, leadsRes, detailsRes, widgetRes] = await Promise.all([
-          fetch(apiUrl(`/chat/test/sessions?userId=${encodeURIComponent(userId)}`)),
-          fetch(apiUrl(`/leads?userId=${encodeURIComponent(userId)}`)),
-          fetch(apiUrl(`/agent-details?userId=${encodeURIComponent(userId)}`)),
-          fetch(apiUrl(`/widget-settings?userId=${encodeURIComponent(userId)}`)),
-        ]);
-        const sessionsPayload = await sessionsRes.json().catch(() => ({}));
-        const leadsPayload = await leadsRes.json().catch(() => ({}));
-        const detailsPayload = await detailsRes.json().catch(() => ({}));
-        const widgetPayload = await widgetRes.json().catch(() => ({}));
-        if (!sessionsRes.ok) {
-          throw new Error(sessionsPayload.message || "Could not load user conversations");
-        }
-        if (!leadsRes.ok) {
-          throw new Error(leadsPayload.message || "Could not load user leads");
-        }
-        if (!detailsRes.ok) {
-          throw new Error(detailsPayload?.message || "Could not load user knowledgebase");
-        }
-        if (!widgetRes.ok) {
-          throw new Error(widgetPayload.message || "Could not load widget settings");
-        }
-        if (!active) return;
-        setSessions(Array.isArray(sessionsPayload.sessions) ? sessionsPayload.sessions : []);
-        setLeads(Array.isArray(leadsPayload.leads) ? leadsPayload.leads : []);
-        setAgentDetails(detailsPayload?.details && typeof detailsPayload.details === "object" ? detailsPayload.details : null);
-        setWidgetSettings(
-          widgetPayload?.settings && typeof widgetPayload.settings === "object" ? widgetPayload.settings : null
-        );
-      } catch (err) {
-        if (!active) return;
-        setLiveDataError(err instanceof Error ? err.message : "Could not load live dashboard data");
+      });
+      if (errors.length) {
+        setLiveDataError(errors[0]);
       }
     }
-    loadLiveData();
+    void loadLiveData();
     return () => {
       active = false;
     };
@@ -396,12 +429,17 @@ function Dashboard() {
       .map((session, idx) => {
         const messages = Array.isArray(session?.messages) ? session.messages : [];
         const lastMessage = messages[messages.length - 1];
+        const previewFromMessages =
+          typeof lastMessage?.content === "string" && lastMessage.content.trim()
+            ? lastMessage.content.trim()
+            : "";
+        const previewFromMeta =
+          typeof session?.lastReplyPreview === "string" && session.lastReplyPreview.trim()
+            ? session.lastReplyPreview.trim()
+            : "";
         return {
           id: session?.id || `chat-${idx + 1}`,
-          preview:
-            typeof lastMessage?.content === "string" && lastMessage.content.trim()
-              ? lastMessage.content.trim()
-              : "No messages yet.",
+          preview: previewFromMeta || previewFromMessages || "No messages yet.",
           count: Number(session?.messageCount) || 0,
           mode: session?.liveAgentEnabled ? "Live Agent" : "AI Managed",
           updatedAt: session?.updatedAt || session?.createdAt || "",

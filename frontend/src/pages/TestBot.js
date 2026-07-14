@@ -3,7 +3,12 @@ import { Send, Trash2 } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { AssistantAttachments } from "../components/AssistantAttachments";
-import { CHAT_SESSION_POLL_FAST_MS, CHAT_SESSION_POLL_MS, normalizeSessionMessages } from "../chatSessionMessages";
+import {
+  CHAT_SESSION_POLL_FAST_MS,
+  CHAT_SESSION_POLL_MS,
+  formatMessageTimestamp,
+  normalizeSessionMessages,
+} from "../chatSessionMessages";
 
 const conversationStorageKey = (userId) =>
   `workspace_testbot_conversation_id_${userId || "anonymous"}`;
@@ -121,7 +126,11 @@ function TestBot() {
       try {
         if (!userId) {
           if (!active) return;
-          setLines(greetingText ? [{ role: "assistant", content: greetingText }] : []);
+          setLines(
+            greetingText
+              ? [{ role: "assistant", content: greetingText, createdAt: new Date().toISOString() }]
+              : []
+          );
           return;
         }
         const query = `?userId=${encodeURIComponent(userId)}&conversationId=${encodeURIComponent(
@@ -144,12 +153,20 @@ function TestBot() {
         if (normalized.length > 0) {
           setLines(normalized);
         } else {
-          setLines(greetingText ? [{ role: "assistant", content: greetingText }] : []);
+          setLines(
+            greetingText
+              ? [{ role: "assistant", content: greetingText, createdAt: new Date().toISOString() }]
+              : []
+          );
         }
         setLiveAgentEnabled(Boolean(data?.session?.liveAgentEnabled));
       } catch (err) {
         if (!active) return;
-        setLines(greetingText ? [{ role: "assistant", content: greetingText }] : []);
+        setLines(
+          greetingText
+            ? [{ role: "assistant", content: greetingText, createdAt: new Date().toISOString() }]
+            : []
+        );
         setError(err instanceof Error ? err.message : "Could not load previous session");
       } finally {
         if (active) setSessionLoading(false);
@@ -209,7 +226,7 @@ function TestBot() {
     const text = input.trim();
     if (!text || sending) return;
 
-    const userLine = { role: "user", content: text };
+    const userLine = { role: "user", content: text, createdAt: new Date().toISOString() };
     const next = [...lines, userLine];
     const previous = lines;
 
@@ -254,6 +271,7 @@ function TestBot() {
         {
           role: "assistant",
           content: reply,
+          createdAt: new Date().toISOString(),
           ...(attachments.length > 0 ? { attachments } : {}),
         },
       ]);
@@ -274,7 +292,11 @@ function TestBot() {
     setInput("");
     setCollectedData({});
     setLiveAgentEnabled(false);
-    setLines(greetingText ? [{ role: "assistant", content: greetingText }] : []);
+    setLines(
+      greetingText
+        ? [{ role: "assistant", content: greetingText, createdAt: new Date().toISOString() }]
+        : []
+    );
   };
 
   return (
@@ -321,7 +343,9 @@ function TestBot() {
             </div>
           ) : null}
 
-          {lines.map((line, idx) => (
+          {lines.map((line, idx) => {
+            const timeLabel = formatMessageTimestamp(line.createdAt);
+            return (
             <div
               key={`${idx}-${line.role}-${line.content.slice(0, 24)}`}
               className={`flex ${line.role === "user" ? "justify-end" : "justify-start"}`}
@@ -344,9 +368,19 @@ function TestBot() {
                 {line.role === "assistant" && Array.isArray(line.attachments) && line.attachments.length > 0 ? (
                   <AssistantAttachments attachments={line.attachments} />
                 ) : null}
+                {timeLabel ? (
+                  <p
+                    className={`mt-1.5 text-[10px] font-medium ${
+                      line.role === "user" ? "text-white/75" : "text-slate-400"
+                    }`}
+                  >
+                    {timeLabel}
+                  </p>
+                ) : null}
               </div>
             </div>
-          ))}
+            );
+          })}
 
           {sending ? (
             <div className="flex justify-start">
