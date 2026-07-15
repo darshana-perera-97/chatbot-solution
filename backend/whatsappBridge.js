@@ -1628,15 +1628,20 @@ function createWhatsAppBridge(deps) {
         results.push({ userId: uid, accountId, ok: true });
       } else {
         waLog(uid, accountId, "restore failed", lastReason || "unknown");
-        removeAuthSession(uid, accountId);
-        whatsappAutoStart.removeLink(uid, accountId);
-        failedReconnectCounts.delete(slotKey(uid, accountId));
-        const staleKey = slotKey(uid, accountId);
-        const staleEntry = slots.get(staleKey);
-        if (staleEntry && staleEntry.phase !== "ready") {
-          slots.delete(staleKey);
+        const isSessionInvalid =
+          lastReason === "session_expired_needs_qr" ||
+          /auth.?fail/i.test(lastReason);
+        if (isSessionInvalid) {
+          removeAuthSession(uid, accountId);
+          whatsappAutoStart.removeLink(uid, accountId);
+          failedReconnectCounts.delete(slotKey(uid, accountId));
+          const staleKey = slotKey(uid, accountId);
+          const staleEntry = slots.get(staleKey);
+          if (staleEntry && staleEntry.phase !== "ready") {
+            slots.delete(staleKey);
+          }
+          waLog(uid, accountId, "cleared invalid session (reason: " + lastReason + ")");
         }
-        waLog(uid, accountId, "cleared stale session files after failed restore");
         results.push({ userId: uid, accountId, ok: false, reason: lastReason || "unknown" });
       }
 
