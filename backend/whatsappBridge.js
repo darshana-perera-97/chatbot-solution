@@ -726,6 +726,9 @@ function createWhatsAppBridge(deps) {
   const reconnecting = new Set();
   /** @type {Set<string>} */
   const syncingConversations = new Set();
+  /** @type {Map<string, number>} consecutive failed auto-reconnect attempts per slot */
+  const failedReconnectCounts = new Map();
+  const MAX_AUTO_RECONNECT_FAILURES = 5;
   const waLog = (workspaceUserId, accountId, message, ...extra) => {
     const prefix = `[whatsapp][user:${workspaceUserId}][account:${accountId}]`;
     if (extra.length) {
@@ -825,7 +828,10 @@ function createWhatsAppBridge(deps) {
 
     const key = slotKey(safe, safeAccountId);
     const entry = slots.get(key);
-    if (entry?.phase === "ready") return;
+    if (entry?.phase === "ready") {
+      failedReconnectCounts.delete(key);
+      return;
+    }
     if (
       entry &&
       ["initializing", "qr", "authenticated", "reconnecting"].includes(entry.phase)
@@ -834,11 +840,26 @@ function createWhatsAppBridge(deps) {
     }
     if (reconnecting.has(key)) return;
 
+    const failCount = failedReconnectCounts.get(key) || 0;
+    if (failCount >= MAX_AUTO_RECONNECT_FAILURES) {
+      waLog(
+        safe,
+        safeAccountId,
+        `giving up auto-reconnect after ${failCount} consecutive failures — clearing stale session`
+      );
+      removeAuthSession(safe, safeAccountId);
+      whatsappAutoStart.removeLink(safe, safeAccountId);
+      failedReconnectCounts.delete(key);
+      slots.delete(key);
+      return;
+    }
+
     reconnecting.add(key);
     try {
       waLog(safe, safeAccountId, "auto-reconnecting persisted session");
       await startLinking(safe, safeAccountId);
     } catch (e) {
+      failedReconnectCounts.set(key, failCount + 1);
       waLog(
         safe,
         safeAccountId,
@@ -861,6 +882,8 @@ function createWhatsAppBridge(deps) {
 
   function slotNeedsAutoReconnect(workspaceUserId, accountId, slotEntry) {
     if (!hasPersistedAccountSession(workspaceUserId, accountId)) return false;
+    const key = slotKey(workspaceUserId, accountId);
+    if ((failedReconnectCounts.get(key) || 0) >= MAX_AUTO_RECONNECT_FAILURES) return false;
     if (!slotEntry) return true;
     if (slotEntry.phase === "ready") return false;
     if (["initializing", "qr", "authenticated"].includes(slotEntry.phase)) return false;
@@ -1255,6 +1278,7 @@ function createWhatsAppBridge(deps) {
       const wid = client.info?.wid;
       entry.phone = wid?.user || "";
       entry.pushname = channelLabelFromClient(client);
+      failedReconnectCounts.delete(key);
       whatsappAutoStart.addLink(safe, safeAccountId);
       if (entry.linkIntent === "user_qr" && typeof onAccountLinkedViaQr === "function") {
         onAccountLinkedViaQr(safe, safeAccountId, {
@@ -1288,6 +1312,8 @@ function createWhatsAppBridge(deps) {
       entry.phase = "disconnected";
       entry.error = String(reason || "disconnected");
       waLog(safe, safeAccountId, "disconnected", entry.error);
+      const prevFails = failedReconnectCounts.get(key) || 0;
+      failedReconnectCounts.set(key, prevFails + 1);
       if (hasPersistedAccountSession(safe, safeAccountId)) {
         setTimeout(() => {
           void ensureConnected(safe, safeAccountId);
@@ -1597,10 +1623,20 @@ function createWhatsAppBridge(deps) {
       }
 
       if (restored) {
+        failedReconnectCounts.delete(slotKey(uid, accountId));
         waLog(uid, accountId, "persisted session restored");
         results.push({ userId: uid, accountId, ok: true });
       } else {
         waLog(uid, accountId, "restore failed", lastReason || "unknown");
+        removeAuthSession(uid, accountId);
+        whatsappAutoStart.removeLink(uid, accountId);
+        failedReconnectCounts.delete(slotKey(uid, accountId));
+        const staleKey = slotKey(uid, accountId);
+        const staleEntry = slots.get(staleKey);
+        if (staleEntry && staleEntry.phase !== "ready") {
+          slots.delete(staleKey);
+        }
+        waLog(uid, accountId, "cleared stale session files after failed restore");
         results.push({ userId: uid, accountId, ok: false, reason: lastReason || "unknown" });
       }
 

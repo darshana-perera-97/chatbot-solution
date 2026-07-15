@@ -611,9 +611,19 @@ function Integrations() {
                             Link
                           </button>
                         ) : !connected && account.persisted ? (
-                          <span className="inline-flex items-center gap-1 rounded-lg border border-[#DDD6FE] bg-[#F8F5FF] px-3 py-1.5 text-xs font-medium text-[#6D28D9]">
-                            Restoring saved session…
-                          </span>
+                          <>
+                            <span className="inline-flex items-center gap-1 rounded-lg border border-[#DDD6FE] bg-[#F8F5FF] px-3 py-1.5 text-xs font-medium text-[#6D28D9]">
+                              <RefreshCw size={12} className="animate-spin" />
+                              Restoring…
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => void disconnectWhatsApp(account.accountId)}
+                              className="rounded-lg border border-[#E9DFFF] bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                            >
+                              Clear
+                            </button>
+                          </>
                         ) : (
                           <button
                             type="button"
@@ -668,13 +678,33 @@ function Integrations() {
                     </div>
                   ) : null}
                   {!activeAccount?.qrDataUrl && !activeConnected && activePhase !== "error" ? (
-                    <p className="text-center text-sm text-slate-500">
-                      {activePhase === "reconnecting" || activeAccount?.persisted
-                        ? "Restoring your saved WhatsApp session after server restart. This can take up to a minute."
-                        : activePhase === "initializing" || activePhase === "authenticated"
-                          ? "Starting browser session…"
-                          : "Select a slot and tap Link to show a QR code."}
-                    </p>
+                    <div className="text-center">
+                      {activePhase === "reconnecting" || activeAccount?.persisted ? (
+                        <>
+                          <RefreshCw size={20} className="mx-auto mb-2 animate-spin text-slate-400" />
+                          <p className="text-sm text-slate-500">
+                            Restoring your saved WhatsApp session. This can take up to a minute.
+                          </p>
+                          <p className="mt-2 text-xs text-slate-400">
+                            If this takes too long, the saved session may be stale. Click{" "}
+                            <button
+                              type="button"
+                              onClick={() => void disconnectWhatsApp(activeAccountId)}
+                              className="inline font-semibold text-[#6D28D9] underline underline-offset-2 hover:text-[#5B21B6]"
+                            >
+                              Disconnect
+                            </button>{" "}
+                            to clear it and link a fresh account.
+                          </p>
+                        </>
+                      ) : (
+                        <p className="text-sm text-slate-500">
+                          {activePhase === "initializing" || activePhase === "authenticated"
+                            ? "Starting browser session…"
+                            : "Select a slot and tap Link to show a QR code."}
+                        </p>
+                      )}
+                    </div>
                   ) : null}
                   {activePhase === "error" ? (
                     <p className="text-center text-sm text-red-700">{activeAccount?.error || "WhatsApp error"}</p>
