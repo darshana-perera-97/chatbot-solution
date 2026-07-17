@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, MoreVertical, Search, Send } from "lucide-react";
+import { ChevronLeft, MessageSquareDot, MoreVertical, Search, Send } from "lucide-react";
 import { useLocation } from "react-router-dom";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { AssistantAttachments } from "../components/AssistantAttachments";
+import { MessageText } from "../components/MessageText";
 import {
   CHATS_ACTIVE_THREAD_POLL_MS,
   CHATS_OPERATOR_POLL_FAST_MS,
@@ -54,10 +55,30 @@ function getAccountFilterKey(session) {
   return `whatsapp:${accountId || "1"}`;
 }
 
+/** Hide WhatsApp group threads — inbox is personal chats only. */
+function isWhatsAppGroupSession(session) {
+  if (normalizeChatSource(session) !== "whatsapp") return false;
+  const chatId = typeof session?.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
+  if (chatId.toLowerCase().endsWith("@g.us")) return true;
+  const conversationId =
+    typeof session?.conversationId === "string" ? session.conversationId.trim() : "";
+  return conversationId.toLowerCase().endsWith("_g_us");
+}
+
 function whatsAppAccountLabel(account) {
   if (!account) return "";
   const parts = [account.pushname, account.phone].filter(Boolean);
   return parts.length ? parts.join(" · ") : account.label || `Account ${account.accountId}`;
+}
+
+/** Stable id for the latest customer message — used so the sidebar badge does not reappear after it was seen. */
+function liveAgentMessageFingerprint(session, lastRole) {
+  const conversationId =
+    typeof session?.conversationId === "string" ? session.conversationId.trim() : "";
+  if (!conversationId) return "";
+  const messageCount = Number(session?.messageCount) || 0;
+  const role = String(lastRole || "").trim();
+  return `${conversationId}|${messageCount}|${role}`;
 }
 
 const SOURCE_BADGE_CLASS = {
@@ -187,6 +208,14 @@ function conversationPeerSubtitle(session) {
   return whatsappMessagingNumber(session);
 }
 
+function lastMessageSenderLabel(role, peerDisplayName) {
+  if (role === "user") return peerDisplayName || "Customer";
+  if (role === "agent") return "Live Agent";
+  if (role === "main_account") return "Main Account";
+  if (role === "assistant") return "AI Agent";
+  return "";
+}
+
 function avatarInitial(label) {
   const s = String(label || "").trim();
   if (!s) return "U";
@@ -197,15 +226,25 @@ function avatarInitial(label) {
 function toThreadMessages(rawMessages) {
   if (!Array.isArray(rawMessages)) return [];
   return rawMessages
-    .filter((item) => item && (item.role === "user" || item.role === "assistant" || item.role === "agent"))
+    .filter(
+      (item) =>
+        item &&
+        (item.role === "user" ||
+          item.role === "assistant" ||
+          item.role === "agent" ||
+          item.role === "main_account")
+    )
     .map((item, idx) => {
       const createdAtMs = Date.parse(String(item.createdAt || ""));
+      const text = typeof item.content === "string" ? item.content : "";
+      const createdAt = Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : "";
       return {
-        id: `${idx}-${item.role}`,
+        id: `${idx}-${item.role}-${createdAt || "t"}-${text.slice(0, 24)}`,
         role: item.role,
-        text: typeof item.content === "string" ? item.content : "",
+        text,
         attachments: Array.isArray(item.attachments) ? item.attachments : [],
-        createdAt: Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : "",
+        createdAt,
+        deliveryStatus: item.role === "agent" ? "sent" : undefined,
       };
     })
     .filter((item) => item.text.trim().length > 0 || item.attachments.length > 0);
@@ -226,6 +265,11 @@ function Chats() {
   const [error, setError] = useState("");
   const [liveDraft, setLiveDraft] = useState("");
   const [liveSaving, setLiveSaving] = useState(false);
+  /** Optimistic live-agent bubbles shown while WhatsApp/API delivery is in flight. */
+  const [pendingLiveMessages, setPendingLiveMessages] = useState([]);
+  const [listHoverPreview, setListHoverPreview] = useState(null);
+  /** conversationId → fingerprint of the last live-agent customer message the operator has opened. */
+  const [seenLiveFingerprints, setSeenLiveFingerprints] = useState({});
   const syncedOnLoadRef = useRef(false);
   const conversationIdFromNav =
     (typeof location.state?.conversationId === "string" && location.state.conversationId.trim()) ||
@@ -290,7 +334,9 @@ function Chats() {
           throw new Error(data.message || "Could not load chat sessions");
         }
         if (!active) return;
-        const list = Array.isArray(data.sessions) ? data.sessions : [];
+        const list = (Array.isArray(data.sessions) ? data.sessions : []).filter(
+          (session) => !isWhatsAppGroupSession(session)
+        );
         setSessions((prev) => (isBackgroundRefresh ? mergeSessionSummary(prev, list) : list));
         setSelectedId((prev) => {
           if (conversationIdFromNav) {
@@ -299,8 +345,9 @@ function Chats() {
             );
             if (matched?.id) return matched.id;
           }
+          // Keep current selection if it still exists; otherwise leave empty (no auto-open).
           if (prev && list.some((item) => item.id === prev)) return prev;
-          return list[0]?.id || "";
+          return "";
         });
       } catch (err) {
         if (!active) return;
@@ -339,7 +386,9 @@ function Chats() {
         );
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !active) return;
-        const list = Array.isArray(data.sessions) ? data.sessions : [];
+        const list = (Array.isArray(data.sessions) ? data.sessions : []).filter(
+          (session) => !isWhatsAppGroupSession(session)
+        );
         setSessions((prev) => mergeSessionSummary(prev, list));
       } catch {
         /* keep last good list on background failures */
@@ -469,7 +518,9 @@ function Chats() {
             )
           );
           const payload = await sessionsRes.json().catch(() => ({}));
-          const list = Array.isArray(payload.sessions) ? payload.sessions : [];
+          const list = (Array.isArray(payload.sessions) ? payload.sessions : []).filter(
+            (session) => !isWhatsAppGroupSession(session)
+          );
           if (list.length) setSessions((prev) => mergeSessionSummary(prev, list));
         }
       } catch {
@@ -505,23 +556,43 @@ function Chats() {
     const q = query.trim().toLowerCase();
     const prepared = accountFilteredSessions.map((session, idx) => {
       const messages = toThreadMessages(session.messages);
-      const preview = typeof session.lastReplyPreview === "string" && session.lastReplyPreview.trim()
-        ? session.lastReplyPreview.trim()
-        : messages[messages.length - 1]?.text || "No messages yet.";
+      const lastFromThread = messages[messages.length - 1];
+      const preview =
+        typeof session.lastReplyPreview === "string" && session.lastReplyPreview.trim()
+          ? session.lastReplyPreview.trim()
+          : lastFromThread?.text || "No messages yet.";
+      const lastRole =
+        typeof session.lastReplyRole === "string" && session.lastReplyRole.trim()
+          ? session.lastReplyRole.trim()
+          : lastFromThread?.role || "";
       const sourceLabel = formatSessionSourceLabel(session);
       const displayName = conversationPeerDisplayName(session);
       const peerSubtitle = conversationPeerSubtitle(session);
       const whatsappNumber = whatsappMessagingNumber(session);
+      const lastSender = lastMessageSenderLabel(lastRole, displayName);
+      const conversationId =
+        typeof session.conversationId === "string" ? session.conversationId.trim() : "";
+      const sessionId = session.id || `session-${idx}`;
+      const fingerprint = liveAgentMessageFingerprint(session, lastRole);
+      const isSelected = sessionId === selectedId;
+      const hasNewMessage =
+        !isSelected &&
+        Boolean(session.liveAgentEnabled) &&
+        lastRole === "user" &&
+        Boolean(conversationId) &&
+        Boolean(fingerprint) &&
+        seenLiveFingerprints[conversationId] !== fingerprint;
       return {
-        id: session.id || `session-${idx}`,
+        id: sessionId,
         displayName,
         peerSubtitle,
         whatsappNumber,
         preview,
+        lastSender,
         time: formatConversationTime(session.updatedAt || session.createdAt),
         sourceLabel,
         sourceKey: sessionSourceStyleKey(session),
-        unread: 0,
+        hasNewMessage,
       };
     });
     if (!q) return prepared;
@@ -531,13 +602,23 @@ function Chats() {
         c.peerSubtitle.toLowerCase().includes(q) ||
         c.whatsappNumber.toLowerCase().includes(q) ||
         c.preview.toLowerCase().includes(q) ||
+        c.lastSender.toLowerCase().includes(q) ||
         c.sourceLabel.toLowerCase().includes(q)
     );
-  }, [query, accountFilteredSessions]);
+  }, [query, accountFilteredSessions, seenLiveFingerprints, selectedId]);
 
-  const active = filtered.find((c) => c.id === selectedId) ?? filtered[0] ?? null;
+  const active = selectedId ? filtered.find((c) => c.id === selectedId) ?? null : null;
   const activeSession = sessions.find((session) => session.id === active?.id) ?? null;
-  const messages = toThreadMessages(activeSession?.messages);
+  const persistedMessages = toThreadMessages(activeSession?.messages);
+  const pendingForActive = useMemo(() => {
+    const conversationId = activeSession?.conversationId;
+    if (!conversationId) return [];
+    return pendingLiveMessages.filter((item) => item.conversationId === conversationId);
+  }, [activeSession?.conversationId, pendingLiveMessages]);
+  const messages = useMemo(
+    () => [...persistedMessages, ...pendingForActive],
+    [persistedMessages, pendingForActive]
+  );
   const liveAgentEnabled = Boolean(activeSession?.liveAgentEnabled);
   const leadCollected =
     activeSession?.lead?.collectedData && typeof activeSession.lead.collectedData === "object"
@@ -550,9 +631,37 @@ function Chats() {
     el.scrollTop = el.scrollHeight;
   }, [active?.id, messages.length, mobileShowThread]);
 
+  const markLiveMessageSeen = (session) => {
+    if (!session?.liveAgentEnabled) return;
+    const conversationId =
+      typeof session.conversationId === "string" ? session.conversationId.trim() : "";
+    if (!conversationId) return;
+    const threadMessages = toThreadMessages(session.messages);
+    const lastFromThread = threadMessages[threadMessages.length - 1];
+    const lastRole =
+      typeof session.lastReplyRole === "string" && session.lastReplyRole.trim()
+        ? session.lastReplyRole.trim()
+        : lastFromThread?.role || "";
+    if (lastRole !== "user") return;
+    const fingerprint = liveAgentMessageFingerprint(session, lastRole);
+    if (!fingerprint) return;
+    setSeenLiveFingerprints((prev) => {
+      if (prev[conversationId] === fingerprint) return prev;
+      return { ...prev, [conversationId]: fingerprint };
+    });
+  };
+
+  // Mark as seen as soon as this conversation is selected (before paint) so the icon never sticks.
+  useLayoutEffect(() => {
+    if (!activeSession) return;
+    markLiveMessageSeen(activeSession);
+  }, [activeSession]);
+
   const openThread = (id) => {
     setSelectedId(id);
     setMobileShowThread(true);
+    const session = sessions.find((item) => item.id === id);
+    markLiveMessageSeen(session);
   };
 
   const backToList = () => setMobileShowThread(false);
@@ -588,6 +697,19 @@ function Chats() {
     if (!activeSession || !userId || !liveAgentEnabled || liveSaving) return;
     const message = liveDraft.trim();
     if (!message) return;
+    const conversationId = activeSession.conversationId;
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const pendingBubble = {
+      id: pendingId,
+      conversationId,
+      role: "agent",
+      text: message,
+      attachments: [],
+      createdAt: new Date().toISOString(),
+      deliveryStatus: "pending",
+    };
+    setLiveDraft("");
+    setPendingLiveMessages((prev) => [...prev, pendingBubble]);
     setLiveSaving(true);
     setError("");
     try {
@@ -596,7 +718,7 @@ function Chats() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           userId,
-          conversationId: activeSession.conversationId,
+          conversationId,
           message,
         }),
       });
@@ -610,11 +732,13 @@ function Chats() {
         throw new Error(data.message || "Could not send live agent reply");
       }
       const updated = data?.session;
-      setLiveDraft("");
       setSessions((prev) =>
         prev.map((session) => (session.id === updated?.id ? updated : session))
       );
+      setPendingLiveMessages((prev) => prev.filter((item) => item.id !== pendingId));
     } catch (err) {
+      setPendingLiveMessages((prev) => prev.filter((item) => item.id !== pendingId));
+      setLiveDraft((prev) => (prev.trim() ? prev : message));
       setError(err instanceof Error ? err.message : "Could not send live agent reply");
     } finally {
       setLiveSaving(false);
@@ -695,7 +819,10 @@ function Chats() {
               </select>
             ) : null}
           </div>
-          <ul className="min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
+          <ul
+            className="min-h-0 flex-1 space-y-1 overflow-y-auto p-2"
+            onScroll={() => setListHoverPreview(null)}
+          >
             {loading ? (
               <li className="px-3 py-8 text-center text-sm text-slate-400">Loading conversations…</li>
             ) : filtered.length === 0 ? (
@@ -703,24 +830,80 @@ function Chats() {
             ) : (
               filtered.map((c) => {
                 const isActive = c.id === selectedId;
+                const showUnread = Boolean(c.hasNewMessage) && !isActive;
                 return (
                   <li key={c.id}>
                     <button
                       type="button"
                       onClick={() => openThread(c.id)}
+                      onMouseEnter={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const tipWidth = 288;
+                        const left = Math.min(
+                          rect.right + 10,
+                          Math.max(12, window.innerWidth - tipWidth - 12)
+                        );
+                        const top = Math.min(
+                          Math.max(rect.top + rect.height / 2, 72),
+                          window.innerHeight - 72
+                        );
+                        setListHoverPreview({
+                          id: c.id,
+                          top,
+                          left,
+                          sender: c.lastSender,
+                          preview: c.preview,
+                        });
+                      }}
+                      onMouseLeave={() => setListHoverPreview(null)}
+                      onFocus={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const tipWidth = 288;
+                        const left = Math.min(
+                          rect.right + 10,
+                          Math.max(12, window.innerWidth - tipWidth - 12)
+                        );
+                        const top = Math.min(
+                          Math.max(rect.top + rect.height / 2, 72),
+                          window.innerHeight - 72
+                        );
+                        setListHoverPreview({
+                          id: c.id,
+                          top,
+                          left,
+                          sender: c.lastSender,
+                          preview: c.preview,
+                        });
+                      }}
+                      onBlur={() => setListHoverPreview(null)}
                       className={`flex w-full gap-3 rounded-xl px-3 py-2.5 text-left transition ${
                         isActive
                           ? "bg-gradient-to-r from-[#8B5CF6]/12 to-[#A78BFA]/10 ring-1 ring-[#8B5CF6]/25"
                           : "hover:bg-[#F6F1FF]"
                       }`}
                     >
-                      <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[#EEE8FF] bg-[#F4ECFF] text-sm font-bold text-[#7C3AED]">
+                      <div className="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[#EEE8FF] bg-[#F4ECFF] text-sm font-bold text-[#7C3AED]">
                         {avatarInitial(c.displayName)}
+                        {showUnread ? (
+                          <span
+                            className="absolute -right-0.5 -top-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-[#8B5CF6] text-white shadow ring-2 ring-white"
+                            title="New message"
+                            aria-label="New message"
+                          >
+                            <MessageSquareDot size={10} strokeWidth={2.5} aria-hidden />
+                          </span>
+                        ) : null}
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
-                            <span className="truncate font-semibold text-slate-800">{c.displayName}</span>
+                            <span
+                              className={`truncate font-semibold ${
+                                showUnread ? "text-slate-900" : "text-slate-800"
+                              }`}
+                            >
+                              {c.displayName}
+                            </span>
                             {c.whatsappNumber ? (
                               <p className="truncate text-[11px] font-semibold text-emerald-700">
                                 WhatsApp {c.whatsappNumber}
@@ -732,7 +915,13 @@ function Chats() {
                           </span>
                         </div>
                         <div className="mt-0.5 flex items-center gap-2">
-                          <span className="truncate text-xs text-slate-500">{c.preview}</span>
+                          <span
+                            className={`truncate text-xs ${
+                              showUnread ? "font-semibold text-slate-700" : "text-slate-500"
+                            }`}
+                          >
+                            {c.preview}
+                          </span>
                         </div>
                         <div className="mt-1 flex items-center gap-2">
                           <span
@@ -742,11 +931,6 @@ function Chats() {
                           >
                             {c.sourceLabel}
                           </span>
-                          {c.unread > 0 ? (
-                            <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[#8B5CF6] px-1 text-[10px] font-bold text-white">
-                              {c.unread}
-                            </span>
-                          ) : null}
                         </div>
                       </div>
                     </button>
@@ -755,6 +939,22 @@ function Chats() {
               })
             )}
           </ul>
+          {listHoverPreview ? (
+            <div
+              role="tooltip"
+              className="pointer-events-none fixed z-50 max-w-xs -translate-y-1/2 rounded-xl border border-[#EEE8FF] bg-white px-3 py-2.5 shadow-lg shadow-slate-900/10"
+              style={{ top: listHoverPreview.top, left: listHoverPreview.left }}
+            >
+              {listHoverPreview.sender ? (
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-[#7C3AED]">
+                  {listHoverPreview.sender}
+                </p>
+              ) : null}
+              <p className="mt-0.5 text-sm leading-snug text-slate-700 line-clamp-4">
+                {listHoverPreview.preview}
+              </p>
+            </div>
+          ) : null}
         </section>
 
         {/* Thread */}
@@ -796,12 +996,12 @@ function Chats() {
                   </p>
                 </div>
                 <label className="flex items-center gap-2 rounded-lg border border-[#EEE8FF] bg-[#FDFCFF] px-2.5 py-1.5 text-xs font-semibold text-slate-600">
-                  <span>Live Agent</span>
+                  <span>Ai chat disable</span>
                   <button
                     type="button"
                     role="switch"
                     aria-checked={liveAgentEnabled}
-                    aria-label="Toggle Live Agent mode"
+                    aria-label="Toggle Ai chat disable"
                     disabled={liveSaving}
                     onClick={() => void toggleLiveAgent(!liveAgentEnabled)}
                     className={`relative inline-flex h-6 w-11 items-center rounded-full transition ${
@@ -852,7 +1052,15 @@ function Chats() {
                 {messages.map((m) => {
                   const isCustomer = m.role === "user";
                   const isLiveAgent = m.role === "agent";
+                  const isMainAccount = m.role === "main_account";
+                  const isPending = isLiveAgent && m.deliveryStatus === "pending";
+                  const isSent = isLiveAgent && m.deliveryStatus === "sent";
                   const timeLabel = formatMessageTimestamp(m.createdAt);
+                  const senderLabel = isMainAccount
+                    ? "Main Account"
+                    : isLiveAgent
+                    ? "Live Agent"
+                    : "AI Agent";
                   return (
                     <div
                       key={m.id}
@@ -862,18 +1070,39 @@ function Chats() {
                         className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm shadow-sm ${
                           isCustomer
                             ? "rounded-bl-md bg-gradient-to-br from-[#8B5CF6] to-[#7C3AED] text-white"
-                            : isLiveAgent
-                            ? "rounded-br-md border border-emerald-200 bg-emerald-50 text-slate-800"
+                            : isPending
+                            ? "rounded-br-md border border-orange-300 bg-orange-50 text-slate-800"
+                            : isMainAccount
+                            ? "rounded-br-md border border-blue-300 bg-blue-50 text-slate-800"
+                            : isSent || isLiveAgent
+                            ? "rounded-br-md border border-emerald-300 bg-emerald-50 text-slate-800"
                             : "rounded-br-md border border-[#EEE8FF] bg-white text-slate-800"
                         }`}
                       >
                         {!isCustomer ? (
-                          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                            {isLiveAgent ? "Live Agent" : "AI Agent"}
+                          <p
+                            className={`mb-1 text-[10px] font-semibold uppercase tracking-wide ${
+                              isPending
+                                ? "text-orange-600"
+                                : isMainAccount
+                                ? "text-blue-700"
+                                : isLiveAgent
+                                ? "text-emerald-700"
+                                : "text-slate-400"
+                            }`}
+                          >
+                            {senderLabel}
                           </p>
                         ) : null}
                         {m.text.trim() ? (
-                          <p className="whitespace-pre-wrap leading-relaxed">{m.text}</p>
+                          <MessageText
+                            text={m.text}
+                            linkClassName={
+                              isCustomer
+                                ? "underline underline-offset-2 break-all text-white hover:opacity-90"
+                                : "underline underline-offset-2 break-all text-[#6D28D9] hover:opacity-90"
+                            }
+                          />
                         ) : null}
                         {Array.isArray(m.attachments) && m.attachments.length > 0 ? (
                           <AssistantAttachments
@@ -881,15 +1110,19 @@ function Chats() {
                             variant={isCustomer ? "customer" : "default"}
                           />
                         ) : null}
-                        {timeLabel ? (
-                          <p
-                            className={`mt-1.5 text-[10px] font-medium ${
-                              isCustomer ? "text-white/75" : "text-slate-400"
-                            }`}
-                          >
-                            {timeLabel}
-                          </p>
-                        ) : null}
+                        <div
+                          className={`mt-1.5 flex items-center justify-end gap-2 text-[10px] font-medium ${
+                            isCustomer ? "text-white/75" : "text-slate-400"
+                          }`}
+                        >
+                          {isPending ? (
+                            <span className="font-semibold text-orange-600">Sending…</span>
+                          ) : null}
+                          {isSent || (isLiveAgent && !isPending) ? (
+                            <span className="font-semibold text-emerald-600">Sent</span>
+                          ) : null}
+                          {timeLabel ? <span>{timeLabel}</span> : null}
+                        </div>
                       </div>
                     </div>
                   );
@@ -934,8 +1167,10 @@ function Chats() {
             </>
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-slate-400">
-              <p className="text-sm font-medium text-slate-500">No conversation selected</p>
-              <p className="text-xs">Choose a thread from the list.</p>
+              <p className="text-sm font-medium text-slate-500">Select a conversation</p>
+              <p className="max-w-xs text-xs leading-relaxed">
+                Choose a conversation from the side navbar to view the full conversation.
+              </p>
             </div>
           )}
         </section>

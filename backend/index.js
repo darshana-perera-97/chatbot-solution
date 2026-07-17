@@ -3,7 +3,7 @@ const http = require("http");
 const path = require("path");
 const { randomUUID } = require("crypto");
 const dotenv = require("dotenv");
-const { createWhatsAppBridge } = require("./whatsappBridge");
+const { createWhatsAppBridge, isWhatsAppGroupJid } = require("./whatsappBridge");
 const whatsappAutoStart = require("./whatsappAutoStart");
 const {
   ALLOWED_PLANS,
@@ -34,6 +34,7 @@ const adminCorsHeaders = {
 
 const DATA_DIR = path.join(__dirname, "data");
 const ACCOUNTS_PATH = path.join(DATA_DIR, "accounts.json");
+const LOGIN_HISTORY_PATH = path.join(DATA_DIR, "loginHistory.json");
 const METRICS_PATH = path.join(__dirname, "data", "metrics.json");
 const CHATS_PATH = path.join(__dirname, "data", "chats.json");
 const LEADS_PATH = path.join(__dirname, "data", "leads.json");
@@ -41,6 +42,7 @@ const WIDGET_SETTINGS_PATH = path.join(__dirname, "data", "widgetSettings.json")
 const STOCK_LOADS_PATH = path.join(DATA_DIR, "stockLoads.json");
 const WHATSAPP_DISCONNECT_LOGS_PATH = path.join(DATA_DIR, "whatsappDisconnectLogs.json");
 const AGENT_DETAILS_PATH = path.join(__dirname, "data", "agentDetails.json");
+const LOGIN_HISTORY_MAX = 200;
 const FRONTEND_BUILD_DIR = path.join(__dirname, "..", "frontend", "build");
 const FRONTEND_INDEX_PATH = path.join(FRONTEND_BUILD_DIR, "index.html");
 /** Previous location; copied into `data/` on first access if present. */
@@ -167,6 +169,111 @@ const readAccounts = () => {
 const writeAccounts = (accounts) => {
   ensureAccountsFile();
   fs.writeFileSync(ACCOUNTS_PATH, JSON.stringify(accounts, null, 2), "utf8");
+};
+
+const ensureLoginHistoryFile = () => {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(LOGIN_HISTORY_PATH)) {
+    fs.writeFileSync(LOGIN_HISTORY_PATH, JSON.stringify({ logins: [] }, null, 2), "utf8");
+  }
+};
+
+const getClientIp = (req) => {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return normalizeClientIp(forwarded.split(",")[0].trim());
+  }
+  const realIp = req.headers["x-real-ip"];
+  if (typeof realIp === "string" && realIp.trim()) {
+    return normalizeClientIp(realIp.trim());
+  }
+  const remote =
+    req.socket?.remoteAddress ||
+    req.connection?.remoteAddress ||
+    "";
+  return normalizeClientIp(remote);
+};
+
+const normalizeClientIp = (raw) => {
+  let ip = String(raw || "")
+    .trim()
+    .replace(/^::ffff:/i, "");
+  if (!ip || ip === "::1" || ip === "0:0:0:0:0:0:0:1") {
+    return "127.0.0.1";
+  }
+  return ip.slice(0, 80) || "unknown";
+};
+
+const readLoginHistory = () => {
+  ensureLoginHistoryFile();
+  try {
+    const raw = fs.readFileSync(LOGIN_HISTORY_PATH, "utf8");
+    const parsed = JSON.parse(raw || "{}");
+    return Array.isArray(parsed.logins) ? parsed.logins : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeLoginHistory = (logins) => {
+  ensureLoginHistoryFile();
+  fs.writeFileSync(
+    LOGIN_HISTORY_PATH,
+    JSON.stringify({ logins: Array.isArray(logins) ? logins : [] }, null, 2),
+    "utf8"
+  );
+};
+
+const appendLoginHistory = (entry) => {
+  const userId = typeof entry?.userId === "string" ? entry.userId.trim() : "";
+  const username = typeof entry?.username === "string" ? entry.username.trim() : "";
+  const email = typeof entry?.email === "string" ? entry.email.trim() : "";
+  const ip = normalizeClientIp(typeof entry?.ip === "string" ? entry.ip : "");
+  if (!userId && !username && !email) return null;
+  const record = {
+    id: `login_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    userId,
+    username,
+    email,
+    ip,
+    loggedAt: new Date().toISOString(),
+  };
+  const next = [record, ...readLoginHistory()].slice(0, LOGIN_HISTORY_MAX);
+  writeLoginHistory(next);
+  return record;
+};
+
+const getRecentLoginIps = (limit = 8) => {
+  const max = Math.max(1, Math.min(50, Number(limit) || 8));
+  return readLoginHistory()
+    .slice(0, max)
+    .map((entry) => ({
+      id: entry.id || "",
+      userId: entry.userId || "",
+      username: entry.username || "",
+      email: entry.email || "",
+      ip: normalizeClientIp(entry.ip),
+      loggedAt: entry.loggedAt || "",
+    }));
+};
+
+const getLatestLoginForUser = (userIdRaw) => {
+  const userId = typeof userIdRaw === "string" ? userIdRaw.trim() : "";
+  if (!userId) return null;
+  for (const entry of readLoginHistory()) {
+    if (String(entry?.userId || "") !== userId) continue;
+    return {
+      id: entry.id || "",
+      userId: entry.userId || "",
+      username: entry.username || "",
+      email: entry.email || "",
+      ip: normalizeClientIp(entry.ip),
+      loggedAt: entry.loggedAt || "",
+    };
+  }
+  return null;
 };
 
 const createUniqueUserId = (existingAccounts) => {
@@ -658,6 +765,8 @@ const stampMessageCreatedAt = (msg, fallbackIso = "") => {
   return { ...msg, createdAt: stamped };
 };
 
+const isPreservedChatRole = (role) => role === "agent" || role === "main_account";
+
 const sanitizeSessionChatMessages = (raw) => {
   if (!Array.isArray(raw)) return [];
   const out = [];
@@ -669,6 +778,8 @@ const sanitizeSessionChatMessages = (raw) => {
         ? "user"
         : entry?.role === "agent"
         ? "agent"
+        : entry?.role === "main_account"
+        ? "main_account"
         : null;
     const content = typeof entry?.content === "string" ? entry.content.trim() : "";
     const att = sanitizeMessageAttachments(entry.attachments);
@@ -679,16 +790,17 @@ const sanitizeSessionChatMessages = (raw) => {
     if (createdAt) msg.createdAt = createdAt;
     out.push(msg);
   }
-  return out.slice(-60);
+  // Keep a long personal-chat history (WhatsApp sync can import hundreds of messages).
+  return out.slice(-500);
 };
 
-/** Keep live-agent messages in timeline order when persisting user/assistant-only payloads. */
+/** Keep live-agent / main-account messages in timeline order when persisting user/assistant payloads. */
 const mergeAgentMessagesPreservingOrder = (existingMessages, incomingUserAssistant) => {
   const existing = sanitizeSessionChatMessages(existingMessages);
   const incoming = sanitizeSessionChatMessages(
-    (incomingUserAssistant || []).filter((entry) => entry?.role !== "agent")
+    (incomingUserAssistant || []).filter((entry) => !isPreservedChatRole(entry?.role))
   );
-  if (!existing.some((entry) => entry.role === "agent")) {
+  if (!existing.some((entry) => isPreservedChatRole(entry.role))) {
     const stampedIncoming = [];
     for (let i = 0; i < incoming.length; i += 1) {
       const next = incoming[i];
@@ -709,7 +821,7 @@ const mergeAgentMessagesPreservingOrder = (existingMessages, incomingUserAssista
   const merged = [];
   let incomingIdx = 0;
   for (const entry of existing) {
-    if (entry.role === "agent") {
+    if (isPreservedChatRole(entry.role)) {
       merged.push(entry);
       continue;
     }
@@ -1015,6 +1127,17 @@ const sanitizeWhatsappChatId = (raw) => {
   return raw.trim().slice(0, 120);
 };
 
+/** WhatsApp group sessions are excluded — personal chats only. */
+const isWhatsAppGroupSession = (session) => {
+  if (!session || typeof session !== "object") return false;
+  const chatId =
+    typeof session.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
+  if (chatId && isWhatsAppGroupJid(chatId)) return true;
+  const conversationId =
+    typeof session.conversationId === "string" ? session.conversationId.trim() : "";
+  return Boolean(conversationId && isWhatsAppGroupJid(conversationId));
+};
+
 const sanitizeWhatsappPeerPhone = (raw) => {
   if (typeof raw !== "string") return "";
   const trimmed = raw.trim().slice(0, 40);
@@ -1069,6 +1192,10 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
     typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
   );
   if (!safeConversationId) return;
+  // Never persist WhatsApp group chats — personal conversations only.
+  const incomingChatId =
+    options && typeof options.whatsappChatId === "string" ? options.whatsappChatId.trim() : "";
+  if (isWhatsAppGroupJid(safeConversationId) || isWhatsAppGroupJid(incomingChatId)) return;
   const sessionUserId = safeUserId || "__anonymous__";
   const accounts = readAccounts();
   const matchedAccount = safeUserId
@@ -1173,6 +1300,62 @@ const patchTestChatSessionPeerPhone = (userIdRaw, conversationIdRaw, phoneRaw) =
   return getTestChatSessionByConversation(safeUserId, safeConversationId);
 };
 
+/** Last chat line role + preview without fully sanitizing the thread (list poll). */
+const peekLastReplyMeta = (session) => {
+  const storedPreview =
+    typeof session?.lastReplyPreview === "string" ? session.lastReplyPreview.trim() : "";
+  const raw = Array.isArray(session?.messages) ? session.messages : [];
+  for (let i = raw.length - 1; i >= 0; i -= 1) {
+    const entry = raw[i];
+    const role =
+      entry?.role === "assistant"
+        ? "assistant"
+        : entry?.role === "user"
+        ? "user"
+        : entry?.role === "agent"
+        ? "agent"
+        : entry?.role === "main_account"
+        ? "main_account"
+        : null;
+    if (!role) continue;
+    const content = typeof entry?.content === "string" ? entry.content.trim() : "";
+    const attachments = Array.isArray(entry?.attachments) ? entry.attachments : [];
+    if (!content && !attachments.length) continue;
+    let preview = content.slice(0, 300);
+    if (!preview && attachments.length) {
+      const first = attachments[0] || {};
+      if (first.kind === "image") {
+        preview =
+          typeof first.imageName === "string" && first.imageName.trim()
+            ? `[Image: ${first.imageName.trim().slice(0, 80)}]`
+            : "[Image]";
+      } else if (first.kind === "pdf") {
+        preview =
+          typeof first.pdfName === "string" && first.pdfName.trim()
+            ? `[PDF: ${first.pdfName.trim().slice(0, 80)}]`
+            : "[PDF]";
+      } else if (first.kind === "video") {
+        preview =
+          typeof first.videoName === "string" && first.videoName.trim()
+            ? `[Video: ${first.videoName.trim().slice(0, 80)}]`
+            : "[Video]";
+      } else if (first.kind === "file") {
+        preview =
+          typeof first.fileName === "string" && first.fileName.trim()
+            ? `[File: ${first.fileName.trim().slice(0, 80)}]`
+            : "[File]";
+      } else {
+        preview = "[Media]";
+      }
+    }
+    return {
+      lastReplyRole: role,
+      lastReplyPreview: preview || storedPreview,
+    };
+  }
+  return { lastReplyRole: "", lastReplyPreview: storedPreview };
+};
+
 const mapStoredChatSession = (
   safeUserId,
   session,
@@ -1184,6 +1367,7 @@ const mapStoredChatSession = (
   const lead = leadLookup
     ? leadLookup.get(conversationId) || null
     : getLeadByConversation(safeUserId, conversationId);
+  const lastReply = peekLastReplyMeta(session);
   return {
     id: typeof session.id === "string" ? session.id : `${Date.now()}`,
     userId: safeUserId,
@@ -1206,8 +1390,8 @@ const mapStoredChatSession = (
       : {}),
     messageCount: Number(session.messageCount) || 0,
     liveAgentEnabled: Boolean(session.liveAgentEnabled),
-    lastReplyPreview:
-      typeof session.lastReplyPreview === "string" ? session.lastReplyPreview : "",
+    lastReplyPreview: lastReply.lastReplyPreview,
+    lastReplyRole: lastReply.lastReplyRole,
     lead: lead
       ? {
           fieldLabels: Array.isArray(lead.fieldLabels) ? lead.fieldLabels : [],
@@ -1241,6 +1425,7 @@ const getTestChatSessionsForUser = (userIdRaw, options = {}) => {
   });
   return sessions
     .filter((session) => String(session.userId || "") === safeUserId)
+    .filter((session) => !isWhatsAppGroupSession(session))
     .map((session) =>
       mapStoredChatSession(safeUserId, session, { includeMessages, leadLookup })
     )
@@ -1264,6 +1449,7 @@ const getTestChatSessionByConversation = (userIdRaw, conversationIdRaw) => {
       sanitizeConversationId(String(session.conversationId || "")) === safeConversationId
   );
   if (!match) return null;
+  if (isWhatsAppGroupSession(match)) return null;
   return mapStoredChatSession(safeUserId, match, { includeMessages: true });
 };
 
@@ -1757,7 +1943,12 @@ const sanitizeChatMessages = (raw) => {
   if (!Array.isArray(raw)) return [];
   const out = [];
   for (const entry of raw) {
-    const role = entry?.role === "assistant" ? "assistant" : entry?.role === "user" ? "user" : null;
+    const role =
+      entry?.role === "assistant" || entry?.role === "main_account"
+        ? "assistant"
+        : entry?.role === "user"
+        ? "user"
+        : null;
     const content = typeof entry?.content === "string" ? entry.content.trim() : "";
     if (!role || !content) continue;
     const msg = { role, content: content.slice(0, 16000) };
@@ -2179,6 +2370,7 @@ const server = http.createServer((req, res) => {
   if (
     (
       reqPath === "/login" ||
+      reqPath === "/login-history" ||
       reqPath === "/admin/login" ||
       reqPath === "/admin/accounts" ||
       reqPath === "/admin/metrics" ||
@@ -2298,6 +2490,14 @@ const server = http.createServer((req, res) => {
           );
         }
 
+        const clientIp = getClientIp(req);
+        appendLoginHistory({
+          userId: account.id,
+          username: account.username,
+          email: account.email,
+          ip: clientIp,
+        });
+
         return sendJson(
           res,
           200,
@@ -2319,6 +2519,21 @@ const server = http.createServer((req, res) => {
       () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
     );
     return;
+  }
+
+  if (req.method === "GET" && reqPath === "/login-history") {
+    const query = parseQuery(req);
+    const limit = Number(query.limit) || 8;
+    const userId = typeof query.userId === "string" ? query.userId.trim() : "";
+    return sendJson(
+      res,
+      200,
+      {
+        logins: getRecentLoginIps(limit),
+        current: userId ? getLatestLoginForUser(userId) : null,
+      },
+      adminCorsHeaders
+    );
   }
 
   if (req.method === "POST" && reqPath === "/integrations/whatsapp/sync-conversations") {
@@ -2696,7 +2911,17 @@ const server = http.createServer((req, res) => {
                   typeof session.whatsappAccountId === "string"
                     ? sanitizeWhatsAppAccountId(session.whatsappAccountId) || "1"
                     : "1";
-                whatsappDelivery = await whatsappBridge.sendText(userId, waAccountId, waPeer, message);
+                const waPeerPhone =
+                  typeof session.whatsappPeerPhone === "string"
+                    ? session.whatsappPeerPhone.trim()
+                    : "";
+                whatsappDelivery = await whatsappBridge.sendText(
+                  userId,
+                  waAccountId,
+                  waPeer,
+                  message,
+                  { peerPhone: waPeerPhone }
+                );
               } else {
                 whatsappDelivery = {
                   ok: false,
@@ -3033,6 +3258,8 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
+  ensureAccountsFile();
+  ensureLoginHistoryFile();
   console.log(`Server listening on http://localhost:${PORT}`);
   whatsappAutoStart.syncFromSessionFolders();
   const restartLinks = whatsappAutoStart.readRestoreLinks();

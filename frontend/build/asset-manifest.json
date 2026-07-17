@@ -1,7 +1,7 @@
 {
   "files": {
-    "main.css": "/static/css/main.5ba9b70e.css",
-    "main.js": "/static/js/main.4f7393cc.js",
+    "main.css": "/static/css/main.605b8372.css",
+    "main.js": "/static/js/main.928bdb73.js",
     "static/js/453.64aababc.chunk.js": "/static/js/453.64aababc.chunk.js",
     "static/media/nexgenaoLogo.jpeg": "/static/media/nexgenaoLogo.c4340f670d76b0820025.jpeg",
     "index.html": "/index.html",
@@ -10,12 +10,12 @@
     "static/media/avatar-antonion.svg": "/static/media/avatar-antonion.3c6c8049c1af583f9aa7691ca0ab4aba.svg",
     "static/media/avatar-dhea.svg": "/static/media/avatar-dhea.51fa80c4cf78c17b9f4e1c3e2fa768ec.svg",
     "static/media/avatar-rina.svg": "/static/media/avatar-rina.192558def33bb69031f26bd8897fc7f8.svg",
-    "main.5ba9b70e.css.map": "/static/css/main.5ba9b70e.css.map",
-    "main.4f7393cc.js.map": "/static/js/main.4f7393cc.js.map",
+    "main.605b8372.css.map": "/static/css/main.605b8372.css.map",
+    "main.928bdb73.js.map": "/static/js/main.928bdb73.js.map",
     "453.64aababc.chunk.js.map": "/static/js/453.64aababc.chunk.js.map"
   },
   "entrypoints": [
-    "static/css/main.5ba9b70e.css",
-    "static/js/main.4f7393cc.js"
+    "static/css/main.605b8372.css",
+    "static/js/main.928bdb73.js"
   ]
 }

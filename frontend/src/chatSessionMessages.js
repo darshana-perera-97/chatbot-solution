@@ -7,6 +7,11 @@ export const CHATS_WA_STATUS_POLL_MS = 8000;
 /** Active thread refresh while a conversation is open. */
 export const CHATS_ACTIVE_THREAD_POLL_MS = 1500;
 
+/** Split message text into lines so chat bubbles can preserve line breaks. */
+export function splitMessageLines(text) {
+  return String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+}
+
 export function normalizeMessageCreatedAt(value) {
   const ms = Date.parse(String(value || ""));
   return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
@@ -35,7 +40,14 @@ export function formatMessageTimestamp(iso) {
 export function normalizeSessionMessages(rawMessages) {
   if (!Array.isArray(rawMessages)) return [];
   return rawMessages
-    .filter((line) => line && (line.role === "assistant" || line.role === "user" || line.role === "agent"))
+    .filter(
+      (line) =>
+        line &&
+        (line.role === "assistant" ||
+          line.role === "user" ||
+          line.role === "agent" ||
+          line.role === "main_account")
+    )
     .map((line) => {
       const createdAt = normalizeMessageCreatedAt(line.createdAt);
       return {

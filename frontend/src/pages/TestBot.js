@@ -3,6 +3,7 @@ import { Send, Trash2 } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { AssistantAttachments } from "../components/AssistantAttachments";
+import { MessageText } from "../components/MessageText";
 import {
   CHAT_SESSION_POLL_FAST_MS,
   CHAT_SESSION_POLL_MS,
@@ -364,7 +365,15 @@ function TestBot() {
                     {line.role === "agent" ? "Live Agent" : "AI Agent"}
                   </p>
                 ) : null}
-                <p className="whitespace-pre-wrap">{line.content}</p>
+                <MessageText
+                  text={line.content}
+                  className="break-words whitespace-pre-wrap"
+                  linkClassName={
+                    line.role === "user"
+                      ? "underline underline-offset-2 break-all text-white hover:opacity-90"
+                      : "underline underline-offset-2 break-all text-[#6D28D9] hover:opacity-90"
+                  }
+                />
                 {line.role === "assistant" && Array.isArray(line.attachments) && line.attachments.length > 0 ? (
                   <AssistantAttachments attachments={line.attachments} />
                 ) : null}

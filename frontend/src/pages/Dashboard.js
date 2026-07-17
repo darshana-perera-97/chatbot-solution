@@ -5,6 +5,7 @@ import {
   ChevronRight,
   ClipboardList,
   FolderKanban,
+  Globe,
   MessageCircle,
   MoreHorizontal,
   Sparkles,
@@ -36,6 +37,12 @@ import { useNavigate } from "react-router-dom";
 import { apiUrl } from "../apiBase";
 import { LeadQualityCell } from "../components/LeadQualityCell";
 import { consumeWorkspaceLoginPopup, getWorkspaceUserProfile } from "../auth/userSession";
+
+function formatLoginIp(ip) {
+  const value = String(ip || "").trim().replace(/^::ffff:/i, "");
+  if (!value || value === "::1" || value === "0:0:0:0:0:0:0:1") return "127.0.0.1";
+  return value;
+}
 
 const activityData = [
   { day: "Mon", value: 62 },
@@ -78,6 +85,8 @@ function Dashboard() {
   const [aiControlSaving, setAiControlSaving] = useState(false);
   const [liveDataError, setLiveDataError] = useState("");
   const [waStatus, setWaStatus] = useState(null);
+  const [loginIps, setLoginIps] = useState([]);
+  const [currentLoginIp, setCurrentLoginIp] = useState("");
   const userProfile = getWorkspaceUserProfile();
   const userId = userProfile?.id ? String(userProfile.id).trim() : "";
   const displayName =
@@ -111,6 +120,8 @@ function Dashboard() {
         setLeads([]);
         setWidgetSettings(null);
         setAgentDetails(null);
+        setLoginIps([]);
+        setCurrentLoginIp("");
         return;
       }
 
@@ -164,6 +175,22 @@ function Dashboard() {
           setWidgetSettings(
             payload?.settings && typeof payload.settings === "object" ? payload.settings : null
           );
+        })(),
+        (async () => {
+          const res = await fetch(
+            apiUrl(
+              `/login-history?limit=8&userId=${encodeURIComponent(userId)}`
+            )
+          );
+          const payload = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(payload.message || "Could not load login IPs");
+          }
+          if (!active) return;
+          setLoginIps(Array.isArray(payload.logins) ? payload.logins : []);
+          const currentIp =
+            typeof payload?.current?.ip === "string" ? payload.current.ip.trim() : "";
+          setCurrentLoginIp(currentIp ? formatLoginIp(currentIp) : "");
         })(),
       ];
 
@@ -402,6 +429,39 @@ function Dashboard() {
         pending: row?.liveAgent ?? 0,
       };
     });
+  }, [sessions]);
+  const conversationsLast10Days = useMemo(() => {
+    const dayFormatter = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+    const days = [];
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    for (let i = 9; i >= 0; i -= 1) {
+      const d = new Date(startOfToday);
+      d.setDate(startOfToday.getDate() - i);
+      const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      days.push({
+        key,
+        day: dayFormatter.format(d),
+        conversations: 0,
+        messages: 0,
+      });
+    }
+    const byKey = new Map(days.map((item) => [item.key, item]));
+    sessions.forEach((session) => {
+      const stamp = Date.parse(session?.createdAt || session?.updatedAt || "");
+      if (!Number.isFinite(stamp)) return;
+      const d = new Date(stamp);
+      const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      const bucket = byKey.get(key);
+      if (!bucket) return;
+      bucket.conversations += 1;
+      bucket.messages += Number(session?.messageCount) || 0;
+    });
+    return days.map(({ day, conversations, messages }) => ({
+      day,
+      conversations,
+      messages,
+    }));
   }, [sessions]);
   const getByLabelLike = (row, regex) => {
     const entries = Object.entries(row?.collectedData || {});
@@ -722,6 +782,120 @@ function Dashboard() {
             </article>
           </section>
 
+          <section className="grid gap-4 xl:grid-cols-2">
+            <article className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-lg font-semibold text-slate-800">Recent Login IPs</p>
+                  <p className="mt-0.5 text-xs text-slate-400">Last 8 sign-ins by date, time & IP</p>
+                </div>
+                <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[#F4ECFF] text-[#8B5CF6]">
+                  <Globe size={16} aria-hidden />
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="min-w-full border-separate border-spacing-y-2 text-left">
+                  <thead>
+                    <tr className="text-xs uppercase tracking-wide text-slate-400">
+                      <th className="px-3 py-2 font-medium">Date & Time</th>
+                      <th className="px-3 py-2 font-medium">IP Address</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loginIps.map((row) => {
+                      const loggedAt = row.loggedAt ? new Date(row.loggedAt) : null;
+                      const dateLabel =
+                        loggedAt && Number.isFinite(loggedAt.getTime())
+                          ? new Intl.DateTimeFormat(undefined, {
+                              day: "2-digit",
+                              month: "short",
+                              year: "numeric",
+                            }).format(loggedAt)
+                          : "—";
+                      const timeLabel =
+                        loggedAt && Number.isFinite(loggedAt.getTime())
+                          ? new Intl.DateTimeFormat(undefined, {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              second: "2-digit",
+                            }).format(loggedAt)
+                          : "";
+                      return (
+                        <tr
+                          key={row.id || `${row.userId}-${row.loggedAt}`}
+                          className="rounded-xl bg-white shadow-sm"
+                        >
+                          <td className="rounded-l-xl px-3 py-3">
+                            <p className="text-sm font-semibold text-slate-700">{dateLabel}</p>
+                            {timeLabel ? (
+                              <p className="text-[11px] text-slate-400">{timeLabel}</p>
+                            ) : null}
+                          </td>
+                          <td className="rounded-r-xl px-3 py-3 font-mono text-sm font-semibold text-slate-700">
+                            {formatLoginIp(row.ip) || "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {loginIps.length === 0 ? (
+                      <tr>
+                        <td colSpan={2} className="px-3 py-6 text-center text-sm text-slate-500">
+                          No login IPs recorded yet. Sign in again to start tracking.
+                        </td>
+                      </tr>
+                    ) : null}
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
+              <div className="mb-4 flex items-center justify-between">
+                <p className="text-lg font-semibold text-slate-800">Conversations (10 Days)</p>
+                <p className="text-xs text-slate-400">Hover a bar for messages</p>
+              </div>
+              <div className="h-60">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={conversationsLast10Days} barCategoryGap="18%">
+                    <CartesianGrid strokeDasharray="3 3" stroke="#EEE8FF" />
+                    <XAxis dataKey="day" tick={{ fontSize: 11, fill: "#94A3B8" }} interval={0} />
+                    <YAxis tick={{ fontSize: 12, fill: "#94A3B8" }} allowDecimals={false} />
+                    <Tooltip
+                      cursor={{ fill: "rgba(139, 92, 246, 0.06)" }}
+                      content={({ active, payload, label }) => {
+                        if (!active || !payload?.length) return null;
+                        const row = payload[0]?.payload || {};
+                        return (
+                          <div className="rounded-xl border border-[#ECE3FF] bg-white px-3 py-2 text-xs shadow-md">
+                            <p className="font-semibold text-slate-700">{label}</p>
+                            <p className="mt-1 text-slate-600">
+                              Conversations:{" "}
+                              <span className="font-semibold text-[#8B5CF6]">
+                                {Number(row.conversations) || 0}
+                              </span>
+                            </p>
+                            <p className="mt-0.5 text-slate-600">
+                              Messages:{" "}
+                              <span className="font-semibold text-[#FB923C]">
+                                {Number(row.messages) || 0}
+                              </span>
+                            </p>
+                          </div>
+                        );
+                      }}
+                    />
+                    <Bar
+                      dataKey="conversations"
+                      name="Conversations"
+                      fill="#8B5CF6"
+                      radius={[8, 8, 0, 0]}
+                    />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </article>
+          </section>
+
           <section className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <p className="text-lg font-semibold text-slate-800">Recent Inquiries</p>
@@ -814,6 +988,9 @@ function Dashboard() {
             />
             <p className="mt-4 font-semibold text-slate-900">{displayName}</p>
             <p className="text-xs text-slate-400">{displayEmail}</p>
+            {currentLoginIp ? (
+              <p className="mt-1 font-mono text-[11px] text-slate-500">IP: {currentLoginIp}</p>
+            ) : null}
           </div>
 
           <section className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-4">

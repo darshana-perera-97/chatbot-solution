@@ -28,12 +28,15 @@ function formatSessionSourceLabel(session) {
   return "Test Bot";
 }
 
-function getAccountFilterKey(session) {
+function getSourceFilterKey(session) {
   const src = normalizeChatSource(session);
-  if (src !== "whatsapp") return null;
-  const accountId =
-    typeof session?.whatsappAccountId === "string" ? session.whatsappAccountId.trim() : "1";
-  return `whatsapp:${accountId || "1"}`;
+  if (src === "web") return "web";
+  if (src === "whatsapp") {
+    const accountId =
+      typeof session?.whatsappAccountId === "string" ? session.whatsappAccountId.trim() : "1";
+    return `whatsapp:${accountId || "1"}`;
+  }
+  return "test_bot";
 }
 
 function whatsAppAccountLabel(account) {
@@ -140,7 +143,7 @@ function Inquiries() {
   const [actionError, setActionError] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
-  const [accountFilter, setAccountFilter] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
   const [exportFilter, setExportFilter] = useState("all");
   const [exportingIds, setExportingIds] = useState(() => new Set());
 
@@ -211,32 +214,53 @@ function Inquiries() {
           ...row,
           session,
           sourceLabel: session ? formatSessionSourceLabel(session) : "Unknown",
-          accountKey: session ? getAccountFilterKey(session) : null,
+          sourceKey: session ? getSourceFilterKey(session) : null,
         };
       });
   }, [rows, sessionByConversationId]);
 
-  const whatsappAccountOptions = useMemo(() => {
+  const sourceOptions = useMemo(() => {
+    const options = [
+      { value: "all", label: "All sources" },
+      { value: "test_bot", label: "Test Bot" },
+      { value: "web", label: "Web" },
+    ];
+    const seen = new Set(["all", "test_bot", "web"]);
+
     const accounts = Array.isArray(waStatus?.accounts) ? waStatus.accounts : [];
     const connected = accounts.filter((account) => account.connected || account.phase === "ready");
-    const options = [{ value: "all", label: "All WhatsApp accounts" }];
     connected.forEach((account) => {
       const accountId = String(account.accountId || "1");
+      const value = `whatsapp:${accountId}`;
+      if (seen.has(value)) return;
+      seen.add(value);
+      const accLabel = whatsAppAccountLabel(account) || `Account ${accountId}`;
       options.push({
-        value: `whatsapp:${accountId}`,
-        label: whatsAppAccountLabel(account),
+        value,
+        label: `WhatsApp (${accLabel})`,
       });
     });
+
+    enrichedRows.forEach((row) => {
+      const value = row.sourceKey;
+      if (!value || seen.has(value)) return;
+      seen.add(value);
+      options.push({
+        value,
+        label: row.sourceLabel || value,
+      });
+    });
+
     return options;
-  }, [waStatus]);
+  }, [enrichedRows, waStatus]);
 
   const filteredRows = useMemo(() => {
     const rangeStart = dateFrom ? startOfDayMs(dateFrom) : null;
     const rangeEnd = dateTo ? endOfDayMs(dateTo) : null;
 
     return enrichedRows.filter((row) => {
-      if (accountFilter !== "all") {
-        if (!row.accountKey || row.accountKey !== accountFilter) return false;
+      if (sourceFilter !== "all") {
+        if (!row.sourceKey || row.sourceKey !== sourceFilter) return false;
       }
 
       if (exportFilter === "exported" && !row.exported) return false;
@@ -250,7 +274,7 @@ function Inquiries() {
       if (rangeEnd != null && stamp > rangeEnd) return false;
       return true;
     });
-  }, [accountFilter, dateFrom, dateTo, enrichedRows, exportFilter]);
+  }, [dateFrom, dateTo, enrichedRows, exportFilter, sourceFilter]);
 
   const withEmail = useMemo(() => {
     const hasEmail = (row) =>
@@ -260,7 +284,7 @@ function Inquiries() {
     return filteredRows.filter(hasEmail).length;
   }, [filteredRows]);
 
-  const filtersActive = Boolean(dateFrom || dateTo || accountFilter !== "all" || exportFilter !== "all");
+  const filtersActive = Boolean(dateFrom || dateTo || sourceFilter !== "all" || exportFilter !== "all");
 
   function applyExportUpdates(updates) {
     if (!Array.isArray(updates) || !updates.length) return;
@@ -389,14 +413,14 @@ function Inquiries() {
 
           <label className="block text-sm">
             <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-400">
-              WhatsApp account
+              Source
             </span>
             <select
-              value={accountFilter}
-              onChange={(e) => setAccountFilter(e.target.value)}
+              value={sourceFilter}
+              onChange={(e) => setSourceFilter(e.target.value)}
               className="w-full rounded-xl border border-[#EEE8FF] bg-white px-3 py-2 text-sm text-slate-800 focus:border-[#C4B5FD] focus:outline-none focus:ring-2 focus:ring-[#8B5CF6]/20"
             >
-              {whatsappAccountOptions.map((option) => (
+              {sourceOptions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>

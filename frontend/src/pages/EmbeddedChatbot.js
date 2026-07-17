@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { AssistantAttachments } from "../components/AssistantAttachments";
+import { MessageText } from "../components/MessageText";
 import {
   CHAT_SESSION_POLL_FAST_MS,
   CHAT_SESSION_POLL_MS,
@@ -341,7 +342,15 @@ function EmbeddedChatbot() {
                         {line.role === "agent" ? "Live Agent" : "AI Agent"}
                       </p>
                     ) : null}
-                    <p className="whitespace-pre-wrap">{line.content}</p>
+                    <MessageText
+                      text={line.content}
+                      className="break-words whitespace-pre-wrap"
+                      linkClassName={
+                        isUser
+                          ? "underline underline-offset-2 break-all hover:opacity-90"
+                          : "underline underline-offset-2 break-all text-[#6D28D9] hover:opacity-90"
+                      }
+                    />
                     {line.role === "assistant" && Array.isArray(line.attachments) && line.attachments.length > 0 ? (
                       <AssistantAttachments attachments={line.attachments} variant="embed" />
                     ) : null}

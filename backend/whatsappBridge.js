@@ -379,6 +379,27 @@ function jidToConversationId(jid) {
   return `wa_${safe}`;
 }
 
+/** True for WhatsApp group JIDs (`…@g.us`) or conversation ids derived from them (`wa_…_g_us`). */
+function isWhatsAppGroupJid(jidOrConversationId) {
+  const raw = String(jidOrConversationId || "").trim().toLowerCase();
+  if (!raw) return false;
+  if (raw.endsWith("@g.us")) return true;
+  if (raw.endsWith("_g_us")) return true;
+  return false;
+}
+
+function chatJidFromChat(chat) {
+  const rawId = chat?.id;
+  if (typeof rawId === "string") return rawId.trim();
+  if (typeof rawId?._serialized === "string") return rawId._serialized.trim();
+  return "";
+}
+
+function isWhatsAppGroupChat(chat) {
+  if (chat?.isGroup) return true;
+  return isWhatsAppGroupJid(chatJidFromChat(chat));
+}
+
 /** Best-effort reverse of {@link jidToConversationId} when whatsappChatId was not persisted. */
 function conversationIdToWhatsappJid(conversationId) {
   const safe = String(conversationId || "").trim();
@@ -492,10 +513,44 @@ async function resolvePeerPhoneFromJid(client, jid, msg = null) {
   return pnToE164(id);
 }
 
+/** Peer chat JID for inbound (`from`) or outbound (`to` / id.remote) personal messages. */
+function peerJidFromWhatsAppMessage(msg) {
+  if (msg?.fromMe) {
+    const remote = typeof msg?.id?.remote === "string" ? msg.id.remote.trim() : "";
+    if (remote) return remote;
+    const to = typeof msg?.to === "string" ? msg.to.trim() : "";
+    if (to) return to;
+    return "";
+  }
+  return typeof msg?.from === "string" ? msg.from.trim() : String(msg?.from || "").trim();
+}
+
 async function resolvePeerWhatsappPhone(client, msg) {
-  const jid = typeof msg?.from === "string" ? msg.from.trim() : "";
+  const jid = peerJidFromWhatsAppMessage(msg);
   if (!jid) return "";
   return resolvePeerPhoneFromJid(client, jid, msg);
+}
+
+/**
+ * True when the session already has this outbound text (AI reply, live-agent send, or prior sync).
+ * Avoids duplicating messages we ourselves just delivered via WhatsApp Web.
+ */
+function sessionAlreadyHasOutboundContent(existingMessages, content, attachmentsLength = 0) {
+  const normalized = typeof content === "string" ? content.trim() : "";
+  const attLen = Number(attachmentsLength) || 0;
+  if (!normalized && !attLen) return true;
+  const list = Array.isArray(existingMessages) ? existingMessages : [];
+  const start = Math.max(0, list.length - 12);
+  for (let i = list.length - 1; i >= start; i -= 1) {
+    const m = list[i];
+    if (!m || (m.role !== "assistant" && m.role !== "agent" && m.role !== "main_account")) {
+      continue;
+    }
+    const c = typeof m.content === "string" ? m.content.trim() : "";
+    const att = Array.isArray(m.attachments) ? m.attachments.length : 0;
+    if (c === normalized && att === attLen) return true;
+  }
+  return false;
 }
 
 function channelLabelFromClient(client) {
@@ -530,9 +585,26 @@ async function profilePicDataUrlFromClient(client) {
   }
 }
 
+/** Build `digits@c.us` from E.164 / raw phone / pn JID for send fallbacks. */
+function phoneToCusJid(rawPhone) {
+  const s = String(rawPhone || "").trim();
+  if (!s) return "";
+  if (s.includes("@")) {
+    const user = s.split("@")[0].split(":")[0].replace(/\D/g, "");
+    return user.length >= 7 ? `${user}@c.us` : "";
+  }
+  const digits = s.replace(/\D/g, "");
+  return digits.length >= 7 && digits.length <= 18 ? `${digits}@c.us` : "";
+}
+
 /**
  * WhatsApp Web sends read receipts (`sendSeen`) before the actual message; if that step throws,
  * nothing is delivered. Disable seen + retry via alternate chat ids when needed.
+ * Prefer stored peer phone / LID↔PN mapping because many chats are `@lid` and direct send fails.
+ *
+ * Note: whatsapp-web.js often resolves `undefined` even when the message was delivered (chat found
+ * + send succeeded, but no message model returned). Treat non-throwing sends as success once the
+ * chat resolves, and never retry other JIDs after that — retries can duplicate delivery.
  */
 async function deliverTextToPeer(client, peerJid, text, options = {}) {
   const trimmed = typeof text === "string" ? text.trim() : "";
@@ -543,45 +615,122 @@ async function deliverTextToPeer(client, peerJid, text, options = {}) {
 
   const quoteId =
     typeof options.quotedMessageId === "string" ? options.quotedMessageId.trim() : "";
+  const peerPhoneJid = phoneToCusJid(options.peerPhone);
+
+  const candidates = [];
+  const seen = new Set();
+  const pushCandidate = (jid) => {
+    const id = typeof jid === "string" ? jid.trim() : "";
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    candidates.push(id);
+  };
+
+  pushCandidate(peer);
+  pushCandidate(peerPhoneJid);
+
+  let lastError = "";
+
+  const chatExists = async (jid) => {
+    if (!client.pupPage) return null;
+    try {
+      return await client.pupPage.evaluate(async (chatId) => {
+        const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+        return Boolean(chat);
+      }, jid);
+    } catch (e) {
+      console.warn("[whatsapp] chatExists:", jid, e instanceof Error ? e.message : String(e));
+      return null;
+    }
+  };
 
   const attempt = async (jid, sendOptions = {}) => {
+    const exists = await chatExists(jid);
+    if (exists === false) {
+      lastError = `chat not found for ${jid}`;
+      return false;
+    }
     try {
-      const sent = await client.sendMessage(jid, trimmed, { sendSeen: false, ...sendOptions });
-      return Boolean(sent);
+      // waitUntilMsgSent improves odds of a Message return; library still often returns undefined
+      // after a real delivery — do not use Boolean(sent).
+      await client.sendMessage(jid, trimmed, {
+        sendSeen: false,
+        waitUntilMsgSent: true,
+        ...sendOptions,
+      });
+      return true;
     } catch (e) {
-      console.warn("[whatsapp] sendMessage:", e instanceof Error ? e.message : String(e));
+      lastError = e instanceof Error ? e.message : String(e);
+      console.warn("[whatsapp] sendMessage:", jid, lastError);
       return false;
     }
   };
 
-  if (quoteId && (await attempt(peer, { quotedMessageId: quoteId }))) {
-    return { ok: true };
-  }
-  if (await attempt(peer)) return { ok: true };
-
-  try {
-    if (typeof client.getChatById === "function") {
-      const chat = await client.getChatById(peer);
-      const cid = chat?.id?._serialized;
-      if (cid && cid !== peer && (await attempt(cid))) return { ok: true };
-    }
-  } catch (e) {
-    console.warn("[whatsapp] getChatById:", e instanceof Error ? e.message : String(e));
-  }
-
-  if (peer.endsWith("@lid") && typeof client.getContactLidAndPhone === "function") {
+  // Resolve alternate ids before the first send when possible (LID ↔ phone).
+  if (typeof client.getContactLidAndPhone === "function") {
     try {
-      const rows = await client.getContactLidAndPhone([peer]);
+      const rows = await client.getContactLidAndPhone(
+        [peer, peerPhoneJid].filter(Boolean)
+      );
       for (const row of rows || []) {
-        const pn = typeof row?.pn === "string" ? row.pn.trim() : "";
-        if (pn && (await attempt(pn))) return { ok: true };
+        pushCandidate(typeof row?.lid === "string" ? row.lid.trim() : "");
+        pushCandidate(typeof row?.pn === "string" ? row.pn.trim() : "");
+        pushCandidate(phoneToCusJid(row?.pn));
       }
     } catch (e) {
-      console.warn("[whatsapp] getContactLidAndPhone:", e instanceof Error ? e.message : String(e));
+      console.warn(
+        "[whatsapp] getContactLidAndPhone:",
+        e instanceof Error ? e.message : String(e)
+      );
     }
   }
 
-  return { ok: false, message: "Message was not sent (chat unavailable or WhatsApp not ready?)" };
+  if (peerPhoneJid && typeof client.getNumberId === "function") {
+    try {
+      const numberId = await client.getNumberId(peerPhoneJid.replace(/@c\.us$/, ""));
+      const serialized =
+        typeof numberId?._serialized === "string"
+          ? numberId._serialized.trim()
+          : typeof numberId === "string"
+            ? numberId.trim()
+            : "";
+      pushCandidate(serialized);
+    } catch (e) {
+      console.warn("[whatsapp] getNumberId:", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  for (const jid of [...candidates]) {
+    try {
+      if (typeof client.getChatById === "function") {
+        const chat = await client.getChatById(jid);
+        const cid = chat?.id?._serialized;
+        pushCandidate(cid);
+      }
+    } catch (e) {
+      console.warn(
+        "[whatsapp] getChatById:",
+        jid,
+        e instanceof Error ? e.message : String(e)
+      );
+    }
+  }
+
+  if (quoteId) {
+    for (const jid of [...candidates]) {
+      if (await attempt(jid, { quotedMessageId: quoteId })) return { ok: true };
+    }
+  }
+  for (const jid of [...candidates]) {
+    if (await attempt(jid)) return { ok: true };
+  }
+
+  return {
+    ok: false,
+    message: lastError
+      ? `Message was not sent (${lastError})`
+      : "Message was not sent (chat unavailable or WhatsApp not ready?)",
+  };
 }
 
 async function deliverAssistantText(client, msg, text) {
@@ -619,8 +768,8 @@ async function deliverAssistantText(client, msg, text) {
 }
 
 const WHATSAPP_STALE_REPLY_MS = 2 * 60 * 1000;
-/** Max recent messages to import per chat when syncing WhatsApp conversations. */
-const WHATSAPP_SYNC_MESSAGE_LIMIT = 30;
+/** Max recent messages to import per personal chat when syncing WhatsApp conversations. */
+const WHATSAPP_SYNC_MESSAGE_LIMIT = 500;
 
 function getWhatsAppMessageAgeMs(msg) {
   const ts = Number(msg?.timestamp);
@@ -633,6 +782,44 @@ function isStaleWhatsAppMessage(msg) {
   const ageMs = getWhatsAppMessageAgeMs(msg);
   if (ageMs <= 0) return false;
   return ageMs > WHATSAPP_STALE_REPLY_MS;
+}
+
+function messageFingerprint(msg) {
+  const role = typeof msg?.role === "string" ? msg.role : "";
+  const content = typeof msg?.content === "string" ? msg.content.trim() : "";
+  const createdAt = typeof msg?.createdAt === "string" ? msg.createdAt : "";
+  const attCount = Array.isArray(msg?.attachments) ? msg.attachments.length : 0;
+  return `${role}|${createdAt}|${content}|${attCount}`;
+}
+
+/**
+ * Union WhatsApp history into an existing session without dropping live-agent rows
+ * or duplicate messages already stored from prior sync / live receive.
+ */
+function mergeSyncedWhatsAppMessages(existingMessages, waMessages) {
+  const existing = Array.isArray(existingMessages) ? existingMessages.filter(Boolean) : [];
+  const incoming = Array.isArray(waMessages) ? waMessages.filter(Boolean) : [];
+  if (!incoming.length) return existing;
+  if (!existing.length) return incoming;
+
+  const seen = new Set(existing.map(messageFingerprint));
+  const merged = [...existing];
+  for (const msg of incoming) {
+    const key = messageFingerprint(msg);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(msg);
+  }
+
+  merged.sort((a, b) => {
+    const ta = Date.parse(a?.createdAt || "") || 0;
+    const tb = Date.parse(b?.createdAt || "") || 0;
+    if (ta && tb && ta !== tb) return ta - tb;
+    if (ta && !tb) return -1;
+    if (!ta && tb) return 1;
+    return 0;
+  });
+  return merged;
 }
 
 const MAX_WA_MEDIA_DATA_CHARS = 2_400_000;
@@ -667,7 +854,8 @@ async function attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments) {
 
 async function whatsappMessageToRecord(msg, sanitizeMessageAttachments) {
   const body = typeof msg?.body === "string" ? msg.body.trim() : "";
-  const role = msg?.fromMe ? "assistant" : "user";
+  // Phone/desktop sends from the linked WhatsApp account (not AI / live-agent dashboard).
+  const role = msg?.fromMe ? "main_account" : "user";
   const attachments = msg?.hasMedia
     ? await attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments)
     : [];
@@ -684,7 +872,14 @@ async function whatsappMessageToRecord(msg, sanitizeMessageAttachments) {
 
 function priorMessagesFromSession(existing) {
   return (existing?.messages || [])
-    .filter((m) => m && (m.role === "user" || m.role === "assistant" || m.role === "agent"))
+    .filter(
+      (m) =>
+        m &&
+        (m.role === "user" ||
+          m.role === "assistant" ||
+          m.role === "agent" ||
+          m.role === "main_account")
+    )
     .map((m) => {
       const row = {
         role: m.role,
@@ -961,16 +1156,11 @@ function createWhatsAppBridge(deps) {
   }
 
   async function syncSingleChatToSession(client, workspaceUserId, accountId, chat, label) {
-    if (chat?.isGroup) return { action: "skipped", reason: "group" };
+    if (isWhatsAppGroupChat(chat)) return { action: "skipped", reason: "group" };
 
-    const rawId = chat?.id;
-    const jid =
-      typeof rawId === "string"
-        ? rawId.trim()
-        : typeof rawId?._serialized === "string"
-          ? rawId._serialized.trim()
-          : "";
+    const jid = chatJidFromChat(chat);
     if (!jid) return { action: "skipped", reason: "no_jid" };
+    if (isWhatsAppGroupJid(jid)) return { action: "skipped", reason: "group" };
 
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
@@ -999,9 +1189,12 @@ function createWhatsAppBridge(deps) {
     if (!waMessages.length) return { action: "skipped", reason: "no_messages" };
 
     const existing = getTestChatSessionByConversation(safe, conversationId);
-    const hadMessages = Array.isArray(existing?.messages) && existing.messages.length > 0;
-    // Pass WA records through saveTestChatSession so createdAt/attachments are kept.
-    const messagesToSave = hadMessages ? existing.messages : waMessages;
+    const existingMessages = Array.isArray(existing?.messages) ? existing.messages : [];
+    const hadMessages = existingMessages.length > 0;
+    // Always merge WhatsApp personal-chat history so sync keeps receiving new messages.
+    const messagesToSave = hadMessages
+      ? mergeSyncedWhatsAppMessages(existingMessages, waMessages)
+      : waMessages;
 
     let whatsappPeerPhone =
       typeof existing?.whatsappPeerPhone === "string" ? existing.whatsappPeerPhone.trim() : "";
@@ -1063,7 +1256,13 @@ function createWhatsAppBridge(deps) {
       let updated = 0;
       let skipped = 0;
 
-      for (const chat of Array.isArray(chats) ? chats : []) {
+      // Personal chats only — never fetch or store WhatsApp group messages.
+      const personalChats = (Array.isArray(chats) ? chats : []).filter(
+        (chat) => !isWhatsAppGroupChat(chat)
+      );
+      skipped += (Array.isArray(chats) ? chats.length : 0) - personalChats.length;
+
+      for (const chat of personalChats) {
         try {
           const result = await syncSingleChatToSession(client, safe, safeAccountId, chat, label);
           if (result.action === "created") created += 1;
@@ -1125,27 +1324,31 @@ function createWhatsAppBridge(deps) {
     };
   }
 
-  async function sendText(workspaceUserId, accountId, peerJid, text) {
+  async function sendText(workspaceUserId, accountId, peerJid, text, options = {}) {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     const body = typeof text === "string" ? text.trim() : "";
     const jid = typeof peerJid === "string" ? peerJid.trim() : "";
+    const peerPhone =
+      typeof options.peerPhone === "string" ? options.peerPhone.trim() : "";
     if (!safe || !jid || !body) {
       return { ok: false, message: "Missing workspace user, WhatsApp peer, or message text" };
     }
 
     const tryOnClient = async (client) => {
       if (!client) return null;
-      return deliverTextToPeer(client, jid, body);
+      return deliverTextToPeer(client, jid, body, { peerPhone });
     };
 
     const primaryKey = slotKey(safe, safeAccountId);
     const primary = slots.get(primaryKey);
+    let lastFailureMessage = "";
     if (primary?.client && primary.phase === "ready") {
       const result = await tryOnClient(primary.client);
       if (result?.ok) return result;
       if (result && !result.ok) {
-        waLog(safe, safeAccountId, "live-agent send failed on primary account", result.message || "");
+        lastFailureMessage = result.message || "";
+        waLog(safe, safeAccountId, "live-agent send failed on primary account", lastFailureMessage);
       }
     } else {
       waLog(
@@ -1157,7 +1360,7 @@ function createWhatsAppBridge(deps) {
 
     for (const [slotId, slotEntry] of slots.entries()) {
       if (slotId === primaryKey) continue;
-      if (!slotId.startsWith(`${safe}:`)) continue;
+      if (!slotId.startsWith(`${safe}::`)) continue;
       if (!slotEntry?.client || slotEntry.phase !== "ready") continue;
       const accountFromSlot = slotId.split("::")[1] || safeAccountId;
       const result = await tryOnClient(slotEntry.client);
@@ -1165,14 +1368,15 @@ function createWhatsAppBridge(deps) {
         waLog(safe, accountFromSlot, "live-agent send succeeded via fallback linked account");
         return result;
       }
+      if (result && !result.ok) lastFailureMessage = result.message || lastFailureMessage;
     }
 
     return {
       ok: false,
       message:
         primary?.phase === "ready"
-          ? "Message was not sent (chat unavailable?)"
-          : "WhatsApp is not connected. Link the account and try again.",
+          ? lastFailureMessage || "Message was not sent (chat unavailable?)"
+          : "WhatsApp is not connected. Link the account used for this chat and try again.",
     };
   }
 
@@ -1321,16 +1525,89 @@ function createWhatsAppBridge(deps) {
       }
     });
 
-    client.on("message", async (msg) => {
-      if (msg.fromMe) return;
+    /**
+     * Persist messages sent from the linked WhatsApp phone/desktop (fromMe).
+     * The `message` event does not fire for those; `message_create` does.
+     * Do not run AI — only append to the conversation thread.
+     */
+    client.on("message_create", async (msg) => {
+      if (!msg?.fromMe) return;
+
+      const jid = peerJidFromWhatsAppMessage(msg);
+      if (!jid || isWhatsAppGroupJid(jid)) return;
+
       try {
         const chat = await msg.getChat();
-        if (chat.isGroup) return;
+        if (isWhatsAppGroupChat(chat)) return;
       } catch {
         /* ignore */
       }
 
-      const jid = msg.from;
+      try {
+        const outboundRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments);
+        if (!outboundRecord) return;
+
+        const conversationId = jidToConversationId(jid);
+        const existing = getTestChatSessionByConversation(safe, conversationId);
+        const existingMessages = Array.isArray(existing?.messages) ? existing.messages : [];
+        if (
+          sessionAlreadyHasOutboundContent(
+            existingMessages,
+            outboundRecord.content,
+            Array.isArray(outboundRecord.attachments) ? outboundRecord.attachments.length : 0
+          )
+        ) {
+          return;
+        }
+
+        const entryNow = slots.get(key);
+        const label =
+          channelLabelFromClient(client) ||
+          (entryNow && entryNow.pushname) ||
+          (entryNow && entryNow.phone) ||
+          `WhatsApp ${safeAccountId}`;
+
+        // Append directly so main_account rows are not dropped by the agent-merge filter.
+        const nextMessages = [...existingMessages, outboundRecord];
+
+        let whatsappPeerPhone =
+          typeof existing?.whatsappPeerPhone === "string" ? existing.whatsappPeerPhone.trim() : "";
+        if (!whatsappPeerPhone) {
+          whatsappPeerPhone = await resolvePeerPhoneFromJid(client, jid, msg);
+        }
+
+        saveTestChatSession(safe, conversationId, nextMessages, {
+          chatSource: "whatsapp",
+          channelAccountName: label,
+          whatsappChatId: jid,
+          whatsappPeerPhone,
+          whatsappAccountId: safeAccountId,
+          liveAgentEnabled: Boolean(existing?.liveAgentEnabled),
+        });
+      } catch (e) {
+        waLog(
+          safe,
+          safeAccountId,
+          "failed syncing outbound WhatsApp message",
+          e instanceof Error ? e.message : String(e)
+        );
+      }
+    });
+
+    client.on("message", async (msg) => {
+      if (msg.fromMe) return;
+
+      const jid = peerJidFromWhatsAppMessage(msg);
+      // Never read or store group messages — JID check covers getChat() failures.
+      if (!jid || isWhatsAppGroupJid(jid)) return;
+
+      try {
+        const chat = await msg.getChat();
+        if (isWhatsAppGroupChat(chat)) return;
+      } catch {
+        /* ignore */
+      }
+
       const conversationId = jidToConversationId(jid);
 
       const entryNow = slots.get(key);
@@ -1374,6 +1651,11 @@ function createWhatsAppBridge(deps) {
       const prior = priorMessagesFromSession(existing).filter(
         (m) => m.role === "user" || m.role === "assistant"
       );
+      const priorForAi = priorMessagesFromSession(existing)
+        .filter(
+          (m) => m.role === "user" || m.role === "assistant" || m.role === "main_account"
+        )
+        .map((m) => (m.role === "main_account" ? { ...m, role: "assistant" } : m));
       const whatsappPeerPhone = await resolvePeerWhatsappPhone(client, msg);
       const sessionOpts = {
         chatSource: "whatsapp",
@@ -1392,7 +1674,7 @@ function createWhatsAppBridge(deps) {
       }
 
       const messagesForAi = sanitizeChatMessages([
-        ...prior,
+        ...priorForAi,
         {
           role: "user",
           content: incomingRecord.content,
@@ -1696,4 +1978,5 @@ module.exports = {
   createWhatsAppBridge,
   jidToConversationId,
   conversationIdToWhatsappJid,
+  isWhatsAppGroupJid,
 };
