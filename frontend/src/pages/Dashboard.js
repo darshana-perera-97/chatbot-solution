@@ -787,7 +787,7 @@ function Dashboard() {
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
                   <p className="text-lg font-semibold text-slate-800">Recent Login IPs</p>
-                  <p className="mt-0.5 text-xs text-slate-400">Last 8 sign-ins by date, time & IP</p>
+                  <p className="mt-0.5 text-xs text-slate-400">Your last 8 sign-ins</p>
                 </div>
                 <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[#F4ECFF] text-[#8B5CF6]">
                   <Globe size={16} aria-hidden />
@@ -798,12 +798,14 @@ function Dashboard() {
                   <thead>
                     <tr className="text-xs uppercase tracking-wide text-slate-400">
                       <th className="px-3 py-2 font-medium">Date & Time</th>
+                      <th className="px-3 py-2 font-medium">System</th>
                       <th className="px-3 py-2 font-medium">IP Address</th>
                     </tr>
                   </thead>
                   <tbody>
                     {loginIps.map((row) => {
-                      const loggedAt = row.loggedAt ? new Date(row.loggedAt) : null;
+                      const stamp = row.dateTime || row.loggedAt || "";
+                      const loggedAt = stamp ? new Date(stamp) : null;
                       const dateLabel =
                         loggedAt && Number.isFinite(loggedAt.getTime())
                           ? new Intl.DateTimeFormat(undefined, {
@@ -822,7 +824,7 @@ function Dashboard() {
                           : "";
                       return (
                         <tr
-                          key={row.id || `${row.userId}-${row.loggedAt}`}
+                          key={row.id || `${row.userId}-${stamp}`}
                           className="rounded-xl bg-white shadow-sm"
                         >
                           <td className="rounded-l-xl px-3 py-3">
@@ -830,6 +832,9 @@ function Dashboard() {
                             {timeLabel ? (
                               <p className="text-[11px] text-slate-400">{timeLabel}</p>
                             ) : null}
+                          </td>
+                          <td className="px-3 py-3 text-sm text-slate-600">
+                            {row.system || "Unknown"}
                           </td>
                           <td className="rounded-r-xl px-3 py-3 font-mono text-sm font-semibold text-slate-700">
                             {formatLoginIp(row.ip) || "—"}
@@ -839,7 +844,7 @@ function Dashboard() {
                     })}
                     {loginIps.length === 0 ? (
                       <tr>
-                        <td colSpan={2} className="px-3 py-6 text-center text-sm text-slate-500">
+                        <td colSpan={3} className="px-3 py-6 text-center text-sm text-slate-500">
                           No login IPs recorded yet. Sign in again to start tracking.
                         </td>
                       </tr>

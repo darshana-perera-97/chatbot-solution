@@ -206,12 +206,53 @@ const normalizeClientIp = (raw) => {
   return ip.slice(0, 80) || "unknown";
 };
 
+const getClientSystem = (req) => {
+  const ua = String(req.headers["user-agent"] || "").trim();
+  if (!ua) return "Unknown";
+
+  let os = "Unknown";
+  if (/Windows NT/i.test(ua)) os = "Windows";
+  else if (/Mac OS X|Macintosh/i.test(ua)) os = "macOS";
+  else if (/Android/i.test(ua)) os = "Android";
+  else if (/iPhone|iPad|iPod/i.test(ua)) os = "iOS";
+  else if (/Linux/i.test(ua)) os = "Linux";
+
+  let browser = "Browser";
+  if (/Edg\//i.test(ua)) browser = "Edge";
+  else if (/Chrome\//i.test(ua) && !/Edg\//i.test(ua)) browser = "Chrome";
+  else if (/Firefox\//i.test(ua)) browser = "Firefox";
+  else if (/Safari\//i.test(ua) && !/Chrome\//i.test(ua)) browser = "Safari";
+
+  return `${os} · ${browser}`.slice(0, 120);
+};
+
+const sanitizeLoginHistoryEntry = (entry) => {
+  if (!entry || typeof entry !== "object") return null;
+  const userId = typeof entry.userId === "string" ? entry.userId.trim() : "";
+  const dateTime =
+    (typeof entry.dateTime === "string" && entry.dateTime.trim()) ||
+    (typeof entry.loggedAt === "string" && entry.loggedAt.trim()) ||
+    "";
+  const system =
+    (typeof entry.system === "string" && entry.system.trim()) || "Unknown";
+  const ip = normalizeClientIp(entry.ip);
+  if (!userId || !dateTime) return null;
+  return {
+    id: typeof entry.id === "string" ? entry.id : "",
+    userId,
+    dateTime,
+    system: system.slice(0, 120),
+    ip,
+  };
+};
+
 const readLoginHistory = () => {
   ensureLoginHistoryFile();
   try {
     const raw = fs.readFileSync(LOGIN_HISTORY_PATH, "utf8");
     const parsed = JSON.parse(raw || "{}");
-    return Array.isArray(parsed.logins) ? parsed.logins : [];
+    const logins = Array.isArray(parsed.logins) ? parsed.logins : [];
+    return logins.map(sanitizeLoginHistoryEntry).filter(Boolean);
   } catch {
     return [];
   }
@@ -227,53 +268,31 @@ const writeLoginHistory = (logins) => {
 };
 
 const appendLoginHistory = (entry) => {
-  const userId = typeof entry?.userId === "string" ? entry.userId.trim() : "";
-  const username = typeof entry?.username === "string" ? entry.username.trim() : "";
-  const email = typeof entry?.email === "string" ? entry.email.trim() : "";
-  const ip = normalizeClientIp(typeof entry?.ip === "string" ? entry.ip : "");
-  if (!userId && !username && !email) return null;
-  const record = {
+  const record = sanitizeLoginHistoryEntry({
     id: `login_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-    userId,
-    username,
-    email,
-    ip,
-    loggedAt: new Date().toISOString(),
-  };
+    userId: entry?.userId,
+    dateTime: entry?.dateTime || new Date().toISOString(),
+    system: entry?.system,
+    ip: entry?.ip,
+  });
+  if (!record) return null;
   const next = [record, ...readLoginHistory()].slice(0, LOGIN_HISTORY_MAX);
   writeLoginHistory(next);
   return record;
 };
 
-const getRecentLoginIps = (limit = 8) => {
+const getRecentLoginIps = (userIdRaw, limit = 8) => {
+  const userId = typeof userIdRaw === "string" ? userIdRaw.trim() : "";
+  if (!userId) return [];
   const max = Math.max(1, Math.min(50, Number(limit) || 8));
   return readLoginHistory()
-    .slice(0, max)
-    .map((entry) => ({
-      id: entry.id || "",
-      userId: entry.userId || "",
-      username: entry.username || "",
-      email: entry.email || "",
-      ip: normalizeClientIp(entry.ip),
-      loggedAt: entry.loggedAt || "",
-    }));
+    .filter((entry) => entry.userId === userId)
+    .slice(0, max);
 };
 
 const getLatestLoginForUser = (userIdRaw) => {
-  const userId = typeof userIdRaw === "string" ? userIdRaw.trim() : "";
-  if (!userId) return null;
-  for (const entry of readLoginHistory()) {
-    if (String(entry?.userId || "") !== userId) continue;
-    return {
-      id: entry.id || "",
-      userId: entry.userId || "",
-      username: entry.username || "",
-      email: entry.email || "",
-      ip: normalizeClientIp(entry.ip),
-      loggedAt: entry.loggedAt || "",
-    };
-  }
-  return null;
+  const rows = getRecentLoginIps(userIdRaw, 1);
+  return rows[0] || null;
 };
 
 const createUniqueUserId = (existingAccounts) => {
@@ -2493,8 +2512,8 @@ const server = http.createServer((req, res) => {
         const clientIp = getClientIp(req);
         appendLoginHistory({
           userId: account.id,
-          username: account.username,
-          email: account.email,
+          dateTime: new Date().toISOString(),
+          system: getClientSystem(req),
           ip: clientIp,
         });
 
@@ -2525,12 +2544,21 @@ const server = http.createServer((req, res) => {
     const query = parseQuery(req);
     const limit = Number(query.limit) || 8;
     const userId = typeof query.userId === "string" ? query.userId.trim() : "";
+    if (!userId) {
+      return sendJson(
+        res,
+        400,
+        { message: "userId is required", logins: [], current: null },
+        adminCorsHeaders
+      );
+    }
+    const logins = getRecentLoginIps(userId, limit);
     return sendJson(
       res,
       200,
       {
-        logins: getRecentLoginIps(limit),
-        current: userId ? getLatestLoginForUser(userId) : null,
+        logins,
+        current: logins[0] || null,
       },
       adminCorsHeaders
     );
