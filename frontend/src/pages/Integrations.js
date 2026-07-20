@@ -77,7 +77,7 @@ function Integrations() {
   const [waSyncing, setWaSyncing] = useState(false);
   const [waSyncMessage, setWaSyncMessage] = useState("");
   const syncedAccountsRef = useRef(new Set());
-  const restoreAttemptedRef = useRef(new Set());
+  const restoreAttemptTimesRef = useRef(new Map());
 
   const waAccounts = useMemo(() => {
     if (Array.isArray(waStatus?.accounts) && waStatus.accounts.length) return waStatus.accounts;
@@ -246,7 +246,7 @@ function Integrations() {
       try {
         let data = await fetchWaStatus();
         if (!cancelled && data) {
-          data = await restorePersistedWhatsAppAccounts(userId, data, restoreAttemptedRef.current);
+          data = await restorePersistedWhatsAppAccounts(userId, data, restoreAttemptTimesRef.current);
           setWaStatus(data);
         }
       } catch {

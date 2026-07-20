@@ -3,6 +3,9 @@ import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
 import { getWhatsAppAccountLimit, normalizePlan } from "../planConfig";
 
+/** Minimum wait before retrying restore for the same account slot. */
+export const WHATSAPP_RESTORE_RETRY_MS = 15000;
+
 export function accountNeedsWhatsAppRestore(account) {
   if (!account?.persisted) return false;
   if (account.connected || account.phase === "ready") return false;
@@ -11,10 +14,15 @@ export function accountNeedsWhatsAppRestore(account) {
   return true;
 }
 
+export function statusHasAccountsNeedingRestore(status) {
+  const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
+  return accounts.some((account) => accountNeedsWhatsAppRestore(account));
+}
+
 export async function fetchWhatsAppStatus(userId) {
   const safeUserId = typeof userId === "string" ? userId.trim() : "";
   if (!safeUserId) return null;
-  const res = await fetch(apiUrl(`/integrations/whatsapp/status?userId=${encodeURIComponent(safeUserId)}`), {
+  const res = await fetch(apiUrl(`/integrations/whatsapp/status?userId=${encodeURIComponent(userId)}`), {
     cache: "no-store",
   });
   const data = await res.json().catch(() => ({}));
@@ -22,18 +30,34 @@ export async function fetchWhatsAppStatus(userId) {
   return data;
 }
 
-export async function restorePersistedWhatsAppAccounts(userId, status, attempted = new Set()) {
+/**
+ * Ask the server to restore every persisted account that is not online yet.
+ * Retries on a timer — linked accounts should stay connected even after tab closes.
+ */
+export async function restorePersistedWhatsAppAccounts(
+  userId,
+  status,
+  lastAttempts = new Map(),
+  { retryMs = WHATSAPP_RESTORE_RETRY_MS } = {}
+) {
   const safeUserId = typeof userId === "string" ? userId.trim() : "";
   if (!safeUserId || !status) return status;
 
   const accounts = Array.isArray(status.accounts) ? status.accounts : [];
   let latestStatus = status;
+  const now = Date.now();
 
   for (const account of accounts) {
     const accountId = String(account.accountId || "1");
-    if (!accountNeedsWhatsAppRestore(account)) continue;
-    if (attempted.has(accountId)) continue;
-    attempted.add(accountId);
+
+    if (!accountNeedsWhatsAppRestore(account)) {
+      lastAttempts.delete(accountId);
+      continue;
+    }
+
+    const lastAt = lastAttempts.get(accountId) || 0;
+    if (now - lastAt < retryMs) continue;
+    lastAttempts.set(accountId, now);
 
     try {
       const res = await fetch(apiUrl("/integrations/whatsapp/start"), {
@@ -44,11 +68,9 @@ export async function restorePersistedWhatsAppAccounts(userId, status, attempted
       const data = await res.json().catch(() => ({}));
       if (res.ok && data && typeof data === "object") {
         latestStatus = data;
-      } else {
-        attempted.delete(accountId);
       }
     } catch {
-      attempted.delete(accountId);
+      /* next poll will retry */
     }
   }
 
@@ -60,7 +82,7 @@ export function useWhatsAppStatus({ pollIntervalMs = 8000, autoRestore = false }
   const userId = profile?.id ? String(profile.id).trim() : "";
   const planLimit = getWhatsAppAccountLimit(normalizePlan(profile?.plan || "") || profile?.plan);
   const [waStatus, setWaStatus] = useState(null);
-  const restoreAttemptedRef = useRef(new Set());
+  const restoreAttemptTimesRef = useRef(new Map());
 
   const refreshStatus = useCallback(async () => {
     if (!userId) return null;
@@ -73,11 +95,13 @@ export function useWhatsAppStatus({ pollIntervalMs = 8000, autoRestore = false }
     if (!userId) return null;
     try {
       const current =
-        waStatus && typeof waStatus === "object"
-          ? waStatus
-          : await fetchWhatsAppStatus(userId);
+        waStatus && typeof waStatus === "object" ? waStatus : await fetchWhatsAppStatus(userId);
       if (!current) return null;
-      const next = await restorePersistedWhatsAppAccounts(userId, current, restoreAttemptedRef.current);
+      const next = await restorePersistedWhatsAppAccounts(
+        userId,
+        current,
+        restoreAttemptTimesRef.current
+      );
       setWaStatus(next);
       return next;
     } catch {
@@ -88,7 +112,7 @@ export function useWhatsAppStatus({ pollIntervalMs = 8000, autoRestore = false }
   useEffect(() => {
     if (!userId) {
       setWaStatus(null);
-      restoreAttemptedRef.current.clear();
+      restoreAttemptTimesRef.current.clear();
       return undefined;
     }
 
@@ -99,7 +123,11 @@ export function useWhatsAppStatus({ pollIntervalMs = 8000, autoRestore = false }
         let data = await fetchWhatsAppStatus(userId);
         if (cancelled || !data) return;
         if (autoRestore) {
-          data = await restorePersistedWhatsAppAccounts(userId, data, restoreAttemptedRef.current);
+          data = await restorePersistedWhatsAppAccounts(
+            userId,
+            data,
+            restoreAttemptTimesRef.current
+          );
         }
         if (!cancelled) setWaStatus(data);
       } catch {

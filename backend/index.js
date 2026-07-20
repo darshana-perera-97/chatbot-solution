@@ -3018,7 +3018,7 @@ const server = http.createServer((req, res) => {
               );
             }
             if (whatsappBridge.hasPersistedSession(userId, accountId)) {
-              await whatsappBridge.ensureConnected(userId, accountId);
+              await whatsappBridge.ensureConnected(userId, accountId, { force: true });
             } else {
               await whatsappBridge.startLinking(userId, accountId, { linkIntent: "user_qr" });
             }

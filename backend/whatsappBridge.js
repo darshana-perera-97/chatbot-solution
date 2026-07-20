@@ -964,17 +964,21 @@ function createWhatsAppBridge(deps) {
   const watchdogRecovering = new Set();
   // Only count failed reconnect *attempts* (not transient disconnect events).
   // Transient WA/Chrome drops are common and must not wipe a healthy LocalAuth folder.
-  const MAX_AUTO_RECONNECT_FAILURES = 12;
-  const MIN_RECONNECT_INTERVAL_MS = 15000;
-  const BASE_RECONNECT_DELAY_MS = 5000;
-  const MAX_RECONNECT_DELAY_MS = 60000;
-  const RECONNECT_READY_TIMEOUT_MS = 120000;
-  const WATCHDOG_INTERVAL_MS = 60000;
-  const WATCHDOG_STUCK_LINKING_MS = 180000;
-  const WATCHDOG_MISSING_SLOT_MS = 120000;
-  const WATCHDOG_DISCONNECTED_MS = 120000;
+  // Only wipe LocalAuth after repeated QR/auth failures — not transient Chrome drops.
+  const MAX_AUTO_RECONNECT_FAILURES = 30;
+  const MIN_RECONNECT_INTERVAL_MS = 5000;
+  const BASE_RECONNECT_DELAY_MS = 2000;
+  const MAX_RECONNECT_DELAY_MS = 30000;
+  const RECONNECT_READY_TIMEOUT_MS = 180000;
+  const WATCHDOG_INTERVAL_MS = 30000;
+  const WATCHDOG_STUCK_LINKING_MS = 120000;
+  const WATCHDOG_MISSING_SLOT_MS = 45000;
+  const WATCHDOG_DISCONNECTED_MS = 45000;
   const WATCHDOG_RECONNECT_LOCK_MS = RECONNECT_READY_TIMEOUT_MS + 45000;
-  const WATCHDOG_ACTION_COOLDOWN_MS = 90000;
+  const WATCHDOG_ACTION_COOLDOWN_MS = 60000;
+  const CONNECTION_HEALTH_INTERVAL_MS = 45000;
+  const PAGE_KEEPALIVE_INTERVAL_MS = 15000;
+  const BACKGROUND_RECONNECT_INTERVAL_MS = 10000;
   const waLog = (workspaceUserId, accountId, message, ...extra) => {
     const prefix = `[whatsapp][user:${workspaceUserId}][account:${accountId}]`;
     if (extra.length) {
@@ -1045,8 +1049,12 @@ function createWhatsAppBridge(deps) {
       waLog(safe, safeAccountId, `reconnect already pending; skip schedule (${reason})`);
       return;
     }
-    const delay = reconnectBackoffMs.get(key) || BASE_RECONNECT_DELAY_MS;
-    reconnectBackoffMs.set(key, Math.min(MAX_RECONNECT_DELAY_MS, Math.max(BASE_RECONNECT_DELAY_MS, delay * 2)));
+    const priorDelay = reconnectBackoffMs.get(key) || 0;
+    const delay =
+      priorDelay > 0
+        ? Math.min(MAX_RECONNECT_DELAY_MS, Math.max(BASE_RECONNECT_DELAY_MS, priorDelay * 2))
+        : BASE_RECONNECT_DELAY_MS;
+    reconnectBackoffMs.set(key, delay);
     waLog(safe, safeAccountId, `scheduling reconnect in ${delay}ms (${reason})`);
     const timer = setTimeout(() => {
       pendingReconnectTimers.delete(key);
@@ -1054,6 +1062,16 @@ function createWhatsAppBridge(deps) {
     }, delay);
     if (typeof timer.unref === "function") timer.unref();
     pendingReconnectTimers.set(key, timer);
+  }
+
+  function markSlotUnhealthy(entry, workspaceUserId, accountId, reason) {
+    if (!entry) return;
+    if (entry.phase !== "ready") return;
+    waLog(workspaceUserId, accountId, `connection unhealthy (${reason}); scheduling reconnect`);
+    setEntryPhase(entry, "disconnected");
+    entry.error = reason;
+    stopPageKeepAlive(entry);
+    scheduleReconnect(workspaceUserId, accountId, reason);
   }
 
   function setEntryPhase(entry, phase) {
@@ -1083,28 +1101,36 @@ function createWhatsAppBridge(deps) {
   function startPageKeepAlive(entry, workspaceUserId, accountId) {
     stopPageKeepAlive(entry);
     if (!entry?.client) return;
-    // Touch more often than Chrome Memory Saver idle window to keep the WA Web frame alive.
-    const intervalMs = 30000;
     entry.keepAliveTimer = setInterval(() => {
       const page = entry.client?.pupPage;
       if (!page || entry.phase !== "ready") return;
-      void page
-        .evaluate(() => Date.now())
-        .catch((e) => {
+
+      void (async () => {
+        try {
+          if (typeof entry.client.getState === "function") {
+            const state = await entry.client.getState();
+            if (state && state !== "CONNECTED") {
+              markSlotUnhealthy(entry, workspaceUserId, accountId, `state_${String(state).toLowerCase()}`);
+              return;
+            }
+          }
+        } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          if (!isTransientPuppeteerFrameError(e)) return;
-          waLog(
-            workspaceUserId,
-            accountId,
-            "page keep-alive detected detached frame; scheduling reconnect",
-            msg
-          );
-          setEntryPhase(entry, "disconnected");
-          entry.error = msg;
-          stopPageKeepAlive(entry);
-          scheduleReconnect(workspaceUserId, accountId, "detached_frame");
-        });
-    }, intervalMs);
+          if (isTransientPuppeteerFrameError(e)) {
+            markSlotUnhealthy(entry, workspaceUserId, accountId, msg);
+            return;
+          }
+        }
+
+        void page
+          .evaluate(() => Date.now())
+          .catch((e) => {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (!isTransientPuppeteerFrameError(e)) return;
+            markSlotUnhealthy(entry, workspaceUserId, accountId, msg);
+          });
+      })();
+    }, PAGE_KEEPALIVE_INTERVAL_MS);
     if (typeof entry.keepAliveTimer.unref === "function") {
       entry.keepAliveTimer.unref();
     }
@@ -1150,7 +1176,8 @@ function createWhatsAppBridge(deps) {
       });
   }
 
-  async function ensureConnected(workspaceUserId, accountId = "1") {
+  async function ensureConnected(workspaceUserId, accountId = "1", options = {}) {
+    const force = Boolean(options && options.force);
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
     if (!safe) return;
@@ -1172,19 +1199,15 @@ function createWhatsAppBridge(deps) {
 
     const now = Date.now();
     const lastAttemptAt = lastReconnectAttemptAt.get(key) || 0;
-    if (entry && now - lastAttemptAt < MIN_RECONNECT_INTERVAL_MS) return;
+    if (entry && !force && now - lastAttemptAt < MIN_RECONNECT_INTERVAL_MS) return;
 
     const failCount = failedReconnectCounts.get(key) || 0;
     if (failCount >= MAX_AUTO_RECONNECT_FAILURES) {
       waLog(
         safe,
         safeAccountId,
-        `giving up auto-reconnect after ${failCount} consecutive failures — clearing stale session`
+        `auto-reconnect paused after ${failCount} consecutive QR/auth failures — scan QR in Integrations to relink`
       );
-      removeAuthSession(safe, safeAccountId);
-      whatsappAutoStart.removeLink(safe, safeAccountId);
-      clearReconnectState(key);
-      slots.delete(key);
       return;
     }
 
@@ -1198,7 +1221,15 @@ function createWhatsAppBridge(deps) {
         return;
       }
       if (startResult?.pending) {
-        // Another initialize is already in flight — keep waiting without counting a failure.
+        const wait = await waitForSlotPhase(
+          safe,
+          safeAccountId,
+          ["ready", "qr"],
+          RECONNECT_READY_TIMEOUT_MS
+        );
+        if (wait.ok && wait.phase === "ready") {
+          clearReconnectState(key);
+        }
         return;
       }
 
@@ -1215,25 +1246,22 @@ function createWhatsAppBridge(deps) {
         return;
       }
       if (wait.phase === "qr") {
-        // Saved credentials no longer work — stop thrashing Chrome until the user
-        // scans or explicitly clears the session.
         failedReconnectCounts.set(key, failCount + 1);
         waLog(safe, safeAccountId, "auto-reconnect produced QR — session may be stale");
         return;
       }
-      failedReconnectCounts.set(key, failCount + 1);
+      // Transient timeout / Chrome issues — retry without counting as auth failure.
       waLog(
         safe,
         safeAccountId,
-        "auto-reconnect did not reach ready",
+        "auto-reconnect did not reach ready (will retry)",
         wait.error || wait.phase || "not_ready"
       );
     } catch (e) {
-      failedReconnectCounts.set(key, failCount + 1);
       waLog(
         safe,
         safeAccountId,
-        "auto-reconnect failed",
+        "auto-reconnect failed (will retry)",
         e instanceof Error ? e.message : String(e)
       );
     } finally {
@@ -1311,7 +1339,10 @@ function createWhatsAppBridge(deps) {
       const accountId = String(i);
       const key = slotKey(safe, accountId);
       const slotEntry = slots.get(key);
-      if (slotNeedsAutoReconnect(safe, accountId, slotEntry) && !reconnecting.has(key)) {
+      const persisted = hasPersistedAccountSession(safe, accountId);
+      if (persisted && (!slotEntry || slotEntry.phase !== "ready") && !reconnecting.has(key)) {
+        void ensureConnected(safe, accountId);
+      } else if (slotNeedsAutoReconnect(safe, accountId, slotEntry) && !reconnecting.has(key)) {
         void ensureConnected(safe, accountId);
       }
       if (slotEntry) maybeRefreshProfilePic(slotEntry);
@@ -1702,6 +1733,22 @@ function createWhatsAppBridge(deps) {
           );
         });
       }, 3000);
+    });
+
+    client.on("change_state", (state) => {
+      const normalized = String(state || "").toUpperCase();
+      if (!normalized) return;
+      waLog(safe, safeAccountId, "change_state", normalized);
+      if (normalized === "CONNECTED") {
+        if (entry.phase !== "ready") setEntryPhase(entry, "ready");
+        clearReconnectState(key);
+        startPageKeepAlive(entry, safe, safeAccountId);
+        return;
+      }
+      if (["OPENING", "PAIRING"].includes(normalized)) return;
+      if (["CONFLICT", "TIMEOUT", "UNPAIRED", "TOS_BLOCK", "SMB_TOS_BLOCK", "PROXYBLOCK"].includes(normalized)) {
+        markSlotUnhealthy(entry, safe, safeAccountId, `change_state_${normalized.toLowerCase()}`);
+      }
     });
 
     client.on("disconnected", (reason) => {
@@ -2250,23 +2297,85 @@ function createWhatsAppBridge(deps) {
     waLog("system", "watchdog", `connection watchdog started (every ${WATCHDOG_INTERVAL_MS / 1000}s)`);
   }
 
-  function startBackgroundReconnectLoop() {
-    const intervalMs = 30000;
+  function listPersistedAccountLinks() {
+    const seen = new Set();
+    const links = [];
+    whatsappAutoStart.readRestoreLinks().forEach((link) => {
+      const uid = sanitizeAgentDetailsUserId(String(link.userId || "").trim());
+      const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
+      if (!uid || !hasPersistedAccountSession(uid, accountId)) return;
+      const key = slotKey(uid, accountId);
+      if (seen.has(key)) return;
+      seen.add(key);
+      links.push({ userId: uid, accountId });
+    });
+    return links;
+  }
+
+  async function runConnectionHealthCheck() {
+    for (const [key, entry] of slots.entries()) {
+      if (!entry || entry.phase !== "ready" || !entry.client) continue;
+      const parts = String(key).split("::");
+      if (parts.length !== 2) continue;
+      const [uid, accountId] = parts;
+      if (!hasPersistedAccountSession(uid, accountId)) continue;
+
+      try {
+        if (typeof entry.client.getState === "function") {
+          const state = await entry.client.getState();
+          if (state && state !== "CONNECTED") {
+            markSlotUnhealthy(entry, uid, accountId, `health_state_${String(state).toLowerCase()}`);
+            continue;
+          }
+        }
+        const page = entry.client.pupPage;
+        if (page) {
+          await page.evaluate(() => document.hasFocus() || true);
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (isTransientPuppeteerFrameError(e)) {
+          markSlotUnhealthy(entry, uid, accountId, `health_${msg.slice(0, 80)}`);
+        }
+      }
+    }
+  }
+
+  function startConnectionHealthLoop() {
     const timer = setInterval(() => {
-      whatsappAutoStart.readRestoreLinks().forEach((link) => {
-        const uid = sanitizeAgentDetailsUserId(String(link.userId || "").trim());
-        const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
-        if (!uid) return;
+      void runConnectionHealthCheck();
+    }, CONNECTION_HEALTH_INTERVAL_MS);
+    if (typeof timer.unref === "function") timer.unref();
+    waLog(
+      "system",
+      "health",
+      `connection health loop started (every ${CONNECTION_HEALTH_INTERVAL_MS / 1000}s)`
+    );
+  }
+
+  function startBackgroundReconnectLoop() {
+    const timer = setInterval(() => {
+      listPersistedAccountLinks().forEach((link) => {
+        const uid = link.userId;
+        const accountId = link.accountId;
         const key = slotKey(uid, accountId);
         const slotEntry = slots.get(key);
-        if (!slotNeedsAutoReconnect(uid, accountId, slotEntry) || reconnecting.has(key)) return;
+        if (slotEntry?.phase === "ready") return;
+        if (!slotNeedsAutoReconnect(uid, accountId, slotEntry) && slotEntry) return;
+        if (reconnecting.has(key)) return;
         void ensureConnected(uid, accountId);
       });
-    }, intervalMs);
+    }, BACKGROUND_RECONNECT_INTERVAL_MS);
     if (typeof timer.unref === "function") timer.unref();
+    waLog(
+      "system",
+      "reconnect",
+      `background reconnect loop started (every ${BACKGROUND_RECONNECT_INTERVAL_MS / 1000}s)`
+    );
   }
 
   startBackgroundReconnectLoop();
+  startConnectionHealthLoop();
   startConnectionWatchdog();
 
   return {
