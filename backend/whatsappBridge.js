@@ -950,7 +950,19 @@ function createWhatsAppBridge(deps) {
   const syncingConversations = new Set();
   /** @type {Map<string, number>} consecutive failed auto-reconnect attempts per slot */
   const failedReconnectCounts = new Map();
-  const MAX_AUTO_RECONNECT_FAILURES = 5;
+  /** @type {Map<string, number>} last ensureConnected attempt timestamp */
+  const lastReconnectAttemptAt = new Map();
+  /** @type {Map<string, number>} backoff delay before next reconnect after disconnect */
+  const reconnectBackoffMs = new Map();
+  /** @type {Map<string, ReturnType<typeof setTimeout>>} pending scheduled reconnect timers */
+  const pendingReconnectTimers = new Map();
+  // Only count failed reconnect *attempts* (not transient disconnect events).
+  // Transient WA/Chrome drops are common and must not wipe a healthy LocalAuth folder.
+  const MAX_AUTO_RECONNECT_FAILURES = 12;
+  const MIN_RECONNECT_INTERVAL_MS = 15000;
+  const BASE_RECONNECT_DELAY_MS = 5000;
+  const MAX_RECONNECT_DELAY_MS = 60000;
+  const RECONNECT_READY_TIMEOUT_MS = 120000;
   const waLog = (workspaceUserId, accountId, message, ...extra) => {
     const prefix = `[whatsapp][user:${workspaceUserId}][account:${accountId}]`;
     if (extra.length) {
@@ -1012,6 +1024,38 @@ function createWhatsAppBridge(deps) {
     entry.keepAliveTimer = null;
   }
 
+  function scheduleReconnect(workspaceUserId, accountId, reason = "disconnect") {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe || !hasPersistedAccountSession(safe, safeAccountId)) return;
+    const key = slotKey(safe, safeAccountId);
+    if (pendingReconnectTimers.has(key) || reconnecting.has(key)) {
+      waLog(safe, safeAccountId, `reconnect already pending; skip schedule (${reason})`);
+      return;
+    }
+    const delay = reconnectBackoffMs.get(key) || BASE_RECONNECT_DELAY_MS;
+    reconnectBackoffMs.set(key, Math.min(MAX_RECONNECT_DELAY_MS, Math.max(BASE_RECONNECT_DELAY_MS, delay * 2)));
+    waLog(safe, safeAccountId, `scheduling reconnect in ${delay}ms (${reason})`);
+    const timer = setTimeout(() => {
+      pendingReconnectTimers.delete(key);
+      void ensureConnected(safe, safeAccountId);
+    }, delay);
+    if (typeof timer.unref === "function") timer.unref();
+    pendingReconnectTimers.set(key, timer);
+  }
+
+  function clearReconnectState(key) {
+    failedReconnectCounts.delete(key);
+    lastReconnectAttemptAt.delete(key);
+    reconnectBackoffMs.delete(key);
+    reconnecting.delete(key);
+    const timer = pendingReconnectTimers.get(key);
+    if (timer) {
+      clearTimeout(timer);
+      pendingReconnectTimers.delete(key);
+    }
+  }
+
   /**
    * Periodically touch the WA Web page so Chrome Memory Saver does not detach the
    * Puppeteer frame (common cause of "Attempted to use detached Frame").
@@ -1019,7 +1063,8 @@ function createWhatsAppBridge(deps) {
   function startPageKeepAlive(entry, workspaceUserId, accountId) {
     stopPageKeepAlive(entry);
     if (!entry?.client) return;
-    const intervalMs = 45000;
+    // Touch more often than Chrome Memory Saver idle window to keep the WA Web frame alive.
+    const intervalMs = 30000;
     entry.keepAliveTimer = setInterval(() => {
       const page = entry.client?.pupPage;
       if (!page || entry.phase !== "ready") return;
@@ -1037,11 +1082,7 @@ function createWhatsAppBridge(deps) {
           entry.phase = "disconnected";
           entry.error = msg;
           stopPageKeepAlive(entry);
-          if (hasPersistedAccountSession(workspaceUserId, accountId)) {
-            setTimeout(() => {
-              void ensureConnected(workspaceUserId, accountId);
-            }, 2000);
-          }
+          scheduleReconnect(workspaceUserId, accountId, "detached_frame");
         });
     }, intervalMs);
     if (typeof entry.keepAliveTimer.unref === "function") {
@@ -1071,6 +1112,7 @@ function createWhatsAppBridge(deps) {
     await destroyClient(safe, safeAccountId);
     removeAuthSession(safe, safeAccountId);
     whatsappAutoStart.removeLink(safe, safeAccountId);
+    clearReconnectState(key);
   }
 
   function maybeRefreshProfilePic(entry) {
@@ -1095,7 +1137,7 @@ function createWhatsAppBridge(deps) {
     const key = slotKey(safe, safeAccountId);
     const entry = slots.get(key);
     if (entry?.phase === "ready") {
-      failedReconnectCounts.delete(key);
+      clearReconnectState(key);
       return;
     }
     if (
@@ -1106,6 +1148,10 @@ function createWhatsAppBridge(deps) {
     }
     if (reconnecting.has(key)) return;
 
+    const now = Date.now();
+    const lastAttemptAt = lastReconnectAttemptAt.get(key) || 0;
+    if (now - lastAttemptAt < MIN_RECONNECT_INTERVAL_MS) return;
+
     const failCount = failedReconnectCounts.get(key) || 0;
     if (failCount >= MAX_AUTO_RECONNECT_FAILURES) {
       waLog(
@@ -1115,15 +1161,51 @@ function createWhatsAppBridge(deps) {
       );
       removeAuthSession(safe, safeAccountId);
       whatsappAutoStart.removeLink(safe, safeAccountId);
-      failedReconnectCounts.delete(key);
+      clearReconnectState(key);
       slots.delete(key);
       return;
     }
 
     reconnecting.add(key);
+    lastReconnectAttemptAt.set(key, now);
     try {
       waLog(safe, safeAccountId, "auto-reconnecting persisted session");
-      await startLinking(safe, safeAccountId);
+      const startResult = await startLinking(safe, safeAccountId);
+      if (startResult?.alreadyConnected) {
+        clearReconnectState(key);
+        return;
+      }
+      if (startResult?.pending) {
+        // Another initialize is already in flight — keep waiting without counting a failure.
+        return;
+      }
+
+      // Hold the reconnect lock until ready / QR / error so status polls and the
+      // background loop cannot destroy/recreate Chrome mid-restore.
+      const wait = await waitForSlotPhase(
+        safe,
+        safeAccountId,
+        ["ready", "qr"],
+        RECONNECT_READY_TIMEOUT_MS
+      );
+      if (wait.ok && wait.phase === "ready") {
+        clearReconnectState(key);
+        return;
+      }
+      if (wait.phase === "qr") {
+        // Saved credentials no longer work — stop thrashing Chrome until the user
+        // scans or explicitly clears the session.
+        failedReconnectCounts.set(key, failCount + 1);
+        waLog(safe, safeAccountId, "auto-reconnect produced QR — session may be stale");
+        return;
+      }
+      failedReconnectCounts.set(key, failCount + 1);
+      waLog(
+        safe,
+        safeAccountId,
+        "auto-reconnect did not reach ready",
+        wait.error || wait.phase || "not_ready"
+      );
     } catch (e) {
       failedReconnectCounts.set(key, failCount + 1);
       waLog(
@@ -1424,11 +1506,7 @@ function createWhatsAppBridge(deps) {
           primary.phase = "disconnected";
           primary.error = lastFailureMessage;
           stopPageKeepAlive(primary);
-          if (hasPersistedAccountSession(safe, safeAccountId)) {
-            setTimeout(() => {
-              void ensureConnected(safe, safeAccountId);
-            }, 2000);
-          }
+          scheduleReconnect(safe, safeAccountId, "send_detached_frame");
         }
       }
     } else {
@@ -1520,8 +1598,10 @@ function createWhatsAppBridge(deps) {
         clientId: localAuthClientId,
         dataPath: authRoot,
       }),
+      // Prefer this server session, but give a brief window so a second Web client
+      // does not thrash the link into a disconnect loop.
       takeoverOnConflict: true,
-      takeoverTimeoutMs: 0,
+      takeoverTimeoutMs: 10000,
       restartOnAuthFail: true,
       webVersionCache: {
         type: "local",
@@ -1564,6 +1644,13 @@ function createWhatsAppBridge(deps) {
       entry.phone = wid?.user || "";
       entry.pushname = channelLabelFromClient(client);
       failedReconnectCounts.delete(key);
+      lastReconnectAttemptAt.delete(key);
+      reconnectBackoffMs.delete(key);
+      const pendingTimer = pendingReconnectTimers.get(key);
+      if (pendingTimer) {
+        clearTimeout(pendingTimer);
+        pendingReconnectTimers.delete(key);
+      }
       whatsappAutoStart.addLink(safe, safeAccountId);
       startPageKeepAlive(entry, safe, safeAccountId);
       if (entry.linkIntent === "user_qr" && typeof onAccountLinkedViaQr === "function") {
@@ -1599,13 +1686,18 @@ function createWhatsAppBridge(deps) {
       entry.error = String(reason || "disconnected");
       stopPageKeepAlive(entry);
       waLog(safe, safeAccountId, "disconnected", entry.error);
-      const prevFails = failedReconnectCounts.get(key) || 0;
-      failedReconnectCounts.set(key, prevFails + 1);
-      if (hasPersistedAccountSession(safe, safeAccountId)) {
-        setTimeout(() => {
-          void ensureConnected(safe, safeAccountId);
-        }, 5000);
+
+      // Phone/desktop unlinked this Web session — local auth is no longer valid.
+      if (/LOGOUT/i.test(entry.error)) {
+        removeAuthSession(safe, safeAccountId);
+        whatsappAutoStart.removeLink(safe, safeAccountId);
+        clearReconnectState(key);
+        return;
       }
+
+      // Do not count transient disconnects as reconnect failures; only failed
+      // ensureConnected attempts may eventually clear auth.
+      scheduleReconnect(safe, safeAccountId, "disconnected");
     });
 
     /**

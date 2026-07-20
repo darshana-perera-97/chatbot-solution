@@ -22,9 +22,16 @@ function accountConnectivity(account) {
       pulse: false,
     };
   }
-  if (["qr", "authenticated", "initializing", "reconnecting"].includes(String(account?.phase || ""))) {
+  const phase = String(account?.phase || "");
+  const restoring =
+    ["qr", "authenticated", "initializing", "reconnecting"].includes(phase) ||
+    (Boolean(account?.persisted) && !account?.connected);
+  if (restoring) {
     return {
-      label: account?.phase === "reconnecting" ? "Reconnecting…" : "Connecting…",
+      label:
+        phase === "reconnecting" || (account?.persisted && !["qr", "authenticated", "initializing"].includes(phase))
+          ? "Reconnecting…"
+          : "Connecting…",
       ring: "ring-amber-300/80",
       iconColor: "text-amber-500",
       iconBg: "bg-amber-50",

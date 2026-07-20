@@ -685,7 +685,15 @@ function Integrations() {
                   <div className="rounded-xl border border-[#E9DFFF] bg-white p-3 shadow-sm">
                     <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Session</p>
                     <p className="mt-1 text-sm font-semibold text-slate-800">
-                      {activeConnected ? activeAccountLabel : "Not linked"}
+                      {activeConnected
+                        ? activeAccountLabel
+                        : isRestoringSession
+                          ? "Restoring…"
+                          : activePhase === "initializing" ||
+                              activePhase === "authenticated" ||
+                              activePhase === "qr"
+                            ? "Linking…"
+                            : "Not linked"}
                     </p>
                   </div>
                 </div>
