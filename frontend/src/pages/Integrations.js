@@ -296,19 +296,56 @@ function Integrations() {
 
   const disconnectWhatsApp = async (accountId = activeAccountId) => {
     if (!userId) return;
+    const targetId = String(accountId);
+    setActiveAccountId(targetId);
     setWaModalError("");
+    setWaRefreshing(true);
+    // Hide "Restoring…" copy immediately and clear local session flags for this slot.
+    setWaStatus((prev) => {
+      if (!prev || !Array.isArray(prev.accounts)) return prev;
+      return {
+        ...prev,
+        accounts: prev.accounts.map((account) =>
+          String(account.accountId) === targetId
+            ? {
+                ...account,
+                connected: false,
+                persisted: false,
+                phase: "initializing",
+                qrDataUrl: "",
+                error: "",
+                pushname: "",
+                phone: "",
+                profilePicDataUrl: "",
+              }
+            : account
+        ),
+      };
+    });
     try {
       const res = await fetch(apiUrl("/integrations/whatsapp/disconnect"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId, accountId: String(accountId) }),
+        body: JSON.stringify({ userId, accountId: targetId }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.message || "Disconnect failed");
-      syncedAccountsRef.current.delete(String(accountId));
+      syncedAccountsRef.current.delete(targetId);
       setWaStatus(data);
+
+      // Start a fresh link so the QR for a new device appears right away.
+      const startRes = await fetch(apiUrl("/integrations/whatsapp/start"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, accountId: targetId }),
+      });
+      const body = await startRes.json().catch(() => ({}));
+      if (!startRes.ok) throw new Error(body.message || "Could not start WhatsApp client");
+      setWaStatus(body);
     } catch (e) {
       setWaModalError(e instanceof Error ? e.message : "Disconnect failed");
+    } finally {
+      setWaRefreshing(false);
     }
   };
 
