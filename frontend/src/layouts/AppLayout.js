@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { clearWorkspaceUserSession } from "../auth/userSession";
 import { SidebarWhatsAppStatus } from "../components/SidebarWhatsAppStatus";
+import { WhatsAppAutoRestore } from "../components/WhatsAppAutoRestore";
 import nexgenaoLogo from "../assets/nexgenaoLogo.jpeg";
 
 const navItems = [
@@ -37,6 +38,8 @@ function AppLayout() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   return (
+    <>
+      <WhatsAppAutoRestore />
     <div className="min-h-screen bg-[#FCFAFF] xl:h-screen xl:overflow-hidden">
       <div className="box-border grid h-full min-h-0 w-full grid-cols-1 gap-5 p-4 md:p-6 xl:h-full xl:grid-cols-[auto_1fr]">
         <aside
@@ -132,6 +135,7 @@ function AppLayout() {
         </div>
       </div>
     </div>
+    </>
   );
 }
 

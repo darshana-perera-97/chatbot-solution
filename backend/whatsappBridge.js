@@ -1172,7 +1172,7 @@ function createWhatsAppBridge(deps) {
 
     const now = Date.now();
     const lastAttemptAt = lastReconnectAttemptAt.get(key) || 0;
-    if (now - lastAttemptAt < MIN_RECONNECT_INTERVAL_MS) return;
+    if (entry && now - lastAttemptAt < MIN_RECONNECT_INTERVAL_MS) return;
 
     const failCount = failedReconnectCounts.get(key) || 0;
     if (failCount >= MAX_AUTO_RECONNECT_FAILURES) {

@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, Globe, MessageCircle, Plus, RefreshCw, X } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
+import {
+  fetchWhatsAppStatus,
+  restorePersistedWhatsAppAccounts,
+} from "../hooks/useWhatsAppStatus";
 import { getWhatsAppAccountLimit, normalizePlan } from "../planConfig";
 
 /** Channel integrations — extend this list as you add more. */
@@ -73,6 +77,7 @@ function Integrations() {
   const [waSyncing, setWaSyncing] = useState(false);
   const [waSyncMessage, setWaSyncMessage] = useState("");
   const syncedAccountsRef = useRef(new Set());
+  const restoreAttemptedRef = useRef(new Set());
 
   const waAccounts = useMemo(() => {
     if (Array.isArray(waStatus?.accounts) && waStatus.accounts.length) return waStatus.accounts;
@@ -142,12 +147,7 @@ function Integrations() {
 
   const fetchWaStatus = async () => {
     if (!userId) return null;
-    const res = await fetch(apiUrl(`/integrations/whatsapp/status?userId=${encodeURIComponent(userId)}`), {
-      cache: "no-store",
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.message || "Could not load WhatsApp status");
-    return data;
+    return fetchWhatsAppStatus(userId);
   };
 
   const refreshOrRetryWhatsApp = async ({ openModal = false, accountId = activeAccountId } = {}) => {
@@ -171,10 +171,15 @@ function Integrations() {
         accounts[0];
       const targetId = target?.accountId || String(accountId || "1");
       const phase = typeof target?.phase === "string" ? target.phase : "";
-      const shouldRetryStart =
+      const shouldRestorePersisted =
+        Boolean(target?.persisted) &&
+        !target?.connected &&
+        target?.phase !== "ready" &&
+        !["qr", "authenticated", "initializing"].includes(phase);
+      const shouldStartFresh =
         !target?.persisted &&
         !["ready", "qr", "authenticated", "initializing", "reconnecting"].includes(phase);
-      if (shouldRetryStart) {
+      if (shouldRestorePersisted || shouldStartFresh) {
         const startRes = await fetch(apiUrl("/integrations/whatsapp/start"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -239,8 +244,11 @@ function Integrations() {
     let cancelled = false;
     const tick = async () => {
       try {
-        const data = await fetchWaStatus();
-        if (!cancelled && data) setWaStatus(data);
+        let data = await fetchWaStatus();
+        if (!cancelled && data) {
+          data = await restorePersistedWhatsAppAccounts(userId, data, restoreAttemptedRef.current);
+          setWaStatus(data);
+        }
       } catch {
         if (!cancelled) setWaStatus(null);
       }
