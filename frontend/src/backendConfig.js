@@ -4,7 +4,7 @@
 //  */
 //  const defaultBackendOrigin = "http://localhost:1248";
 // const defaultBackendOrigin = "http://93.127.129.102:1248";
-const defaultBackendOrigin = "https://ai-bot.nexgenai.lk";
-// const defaultBackendOrigin = "https://ai-chatbot.nexgenai.lk";
+// const defaultBackendOrigin = "https://ai-bot.nexgenai.lk";
+const defaultBackendOrigin = "https://ai-chatbot.nexgenai.lk";
 
 module.exports = { defaultBackendOrigin };
