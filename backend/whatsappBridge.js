@@ -956,6 +956,12 @@ function createWhatsAppBridge(deps) {
   const reconnectBackoffMs = new Map();
   /** @type {Map<string, ReturnType<typeof setTimeout>>} pending scheduled reconnect timers */
   const pendingReconnectTimers = new Map();
+  /** @type {Map<string, number>} first seen timestamp for persisted session without a ready slot */
+  const orphanedPersistedSince = new Map();
+  /** @type {Map<string, number>} last watchdog force-restart timestamp per slot */
+  const watchdogLastActionAt = new Map();
+  /** @type {Set<string>} slots currently undergoing watchdog recovery */
+  const watchdogRecovering = new Set();
   // Only count failed reconnect *attempts* (not transient disconnect events).
   // Transient WA/Chrome drops are common and must not wipe a healthy LocalAuth folder.
   const MAX_AUTO_RECONNECT_FAILURES = 12;
@@ -963,6 +969,12 @@ function createWhatsAppBridge(deps) {
   const BASE_RECONNECT_DELAY_MS = 5000;
   const MAX_RECONNECT_DELAY_MS = 60000;
   const RECONNECT_READY_TIMEOUT_MS = 120000;
+  const WATCHDOG_INTERVAL_MS = 60000;
+  const WATCHDOG_STUCK_LINKING_MS = 180000;
+  const WATCHDOG_MISSING_SLOT_MS = 120000;
+  const WATCHDOG_DISCONNECTED_MS = 120000;
+  const WATCHDOG_RECONNECT_LOCK_MS = RECONNECT_READY_TIMEOUT_MS + 45000;
+  const WATCHDOG_ACTION_COOLDOWN_MS = 90000;
   const waLog = (workspaceUserId, accountId, message, ...extra) => {
     const prefix = `[whatsapp][user:${workspaceUserId}][account:${accountId}]`;
     if (extra.length) {
@@ -1044,6 +1056,14 @@ function createWhatsAppBridge(deps) {
     pendingReconnectTimers.set(key, timer);
   }
 
+  function setEntryPhase(entry, phase) {
+    if (!entry) return;
+    if (entry.phase !== phase) {
+      entry.phase = phase;
+      entry.phaseSince = Date.now();
+    }
+  }
+
   function clearReconnectState(key) {
     failedReconnectCounts.delete(key);
     lastReconnectAttemptAt.delete(key);
@@ -1079,7 +1099,7 @@ function createWhatsAppBridge(deps) {
             "page keep-alive detected detached frame; scheduling reconnect",
             msg
           );
-          entry.phase = "disconnected";
+          setEntryPhase(entry, "disconnected");
           entry.error = msg;
           stopPageKeepAlive(entry);
           scheduleReconnect(workspaceUserId, accountId, "detached_frame");
@@ -1113,6 +1133,8 @@ function createWhatsAppBridge(deps) {
     removeAuthSession(safe, safeAccountId);
     whatsappAutoStart.removeLink(safe, safeAccountId);
     clearReconnectState(key);
+    orphanedPersistedSince.delete(key);
+    watchdogLastActionAt.delete(key);
   }
 
   function maybeRefreshProfilePic(entry) {
@@ -1503,7 +1525,7 @@ function createWhatsAppBridge(deps) {
         lastFailureMessage = result.message || "";
         waLog(safe, safeAccountId, "live-agent send failed on primary account", lastFailureMessage);
         if (isTransientPuppeteerFrameError(lastFailureMessage)) {
-          primary.phase = "disconnected";
+          setEntryPhase(primary, "disconnected");
           primary.error = lastFailureMessage;
           stopPageKeepAlive(primary);
           scheduleReconnect(safe, safeAccountId, "send_detached_frame");
@@ -1566,6 +1588,7 @@ function createWhatsAppBridge(deps) {
     const entry = {
       accountId: safeAccountId,
       phase: "initializing",
+      phaseSince: Date.now(),
       qrDataUrl: "",
       error: "",
       pushname: "",
@@ -1615,30 +1638,30 @@ function createWhatsAppBridge(deps) {
     client.on("qr", async (qr) => {
       try {
         entry.qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, width: 280 });
-        entry.phase = "qr";
+        setEntryPhase(entry, "qr");
         waLog(safe, safeAccountId, "qr generated; waiting for device link scan");
       } catch (e) {
         entry.error = e instanceof Error ? e.message : String(e);
-        entry.phase = "error";
+        setEntryPhase(entry, "error");
         waLog(safe, safeAccountId, "failed generating qr", entry.error);
       }
     });
 
     client.on("authenticated", () => {
-      entry.phase = "authenticated";
+      setEntryPhase(entry, "authenticated");
       entry.qrDataUrl = "";
       whatsappAutoStart.addLink(safe, safeAccountId);
       waLog(safe, safeAccountId, "account login authenticated");
     });
 
     client.on("auth_failure", (m) => {
-      entry.phase = "error";
+      setEntryPhase(entry, "error");
       entry.error = String(m || "auth_failure");
       waLog(safe, safeAccountId, "auth failure", entry.error);
     });
 
     client.on("ready", () => {
-      entry.phase = "ready";
+      setEntryPhase(entry, "ready");
       entry.qrDataUrl = "";
       const wid = client.info?.wid;
       entry.phone = wid?.user || "";
@@ -1682,7 +1705,7 @@ function createWhatsAppBridge(deps) {
     });
 
     client.on("disconnected", (reason) => {
-      entry.phase = "disconnected";
+      setEntryPhase(entry, "disconnected");
       entry.error = String(reason || "disconnected");
       stopPageKeepAlive(entry);
       waLog(safe, safeAccountId, "disconnected", entry.error);
@@ -1917,7 +1940,7 @@ function createWhatsAppBridge(deps) {
       await client.initialize();
       waLog(safe, safeAccountId, "client initialize() called successfully");
     } catch (e) {
-      entry.phase = "error";
+      setEntryPhase(entry, "error");
       const message = e instanceof Error ? e.message : String(e);
       entry.error = formatBrowserLaunchHelp(
         "Failed to launch browser for WhatsApp Web. " + message
@@ -2110,6 +2133,123 @@ function createWhatsAppBridge(deps) {
     return results;
   }
 
+  function watchdogCanAct(key, now) {
+    if (watchdogRecovering.has(key)) return false;
+    const lastAction = watchdogLastActionAt.get(key) || 0;
+    return now - lastAction >= WATCHDOG_ACTION_COOLDOWN_MS;
+  }
+
+  function phaseAgeMs(entry, now) {
+    const since = Number(entry?.phaseSince);
+    if (Number.isFinite(since) && since > 0) return now - since;
+    return Number.POSITIVE_INFINITY;
+  }
+
+  async function forceWatchdogRestart(workspaceUserId, accountId, reason) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe || !hasPersistedAccountSession(safe, safeAccountId)) return;
+    const key = slotKey(safe, safeAccountId);
+    const now = Date.now();
+    if (!watchdogCanAct(key, now)) return;
+
+    watchdogRecovering.add(key);
+    watchdogLastActionAt.set(key, now);
+    try {
+      waLog(safe, safeAccountId, `watchdog: forcing reconnect (${reason})`);
+      clearReconnectState(key);
+      reconnectBackoffMs.delete(key);
+      await destroyClient(safe, safeAccountId);
+      orphanedPersistedSince.delete(key);
+      void ensureConnected(safe, safeAccountId);
+    } catch (e) {
+      waLog(
+        safe,
+        safeAccountId,
+        "watchdog restart failed",
+        e instanceof Error ? e.message : String(e)
+      );
+    } finally {
+      watchdogRecovering.delete(key);
+    }
+  }
+
+  async function runConnectionWatchdog() {
+    const now = Date.now();
+    const links = whatsappAutoStart.readRestoreLinks();
+
+    for (const link of links) {
+      const uid = sanitizeAgentDetailsUserId(String(link.userId || "").trim());
+      const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
+      if (!uid) continue;
+      if (!hasPersistedAccountSession(uid, accountId)) {
+        orphanedPersistedSince.delete(slotKey(uid, accountId));
+        continue;
+      }
+
+      const key = slotKey(uid, accountId);
+      if ((failedReconnectCounts.get(key) || 0) >= MAX_AUTO_RECONNECT_FAILURES) continue;
+      if (!watchdogCanAct(key, now)) continue;
+
+      const entry = slots.get(key);
+
+      if (!entry) {
+        const since = orphanedPersistedSince.get(key) || now;
+        if (!orphanedPersistedSince.has(key)) orphanedPersistedSince.set(key, since);
+        if (now - since >= WATCHDOG_MISSING_SLOT_MS) {
+          await forceWatchdogRestart(uid, accountId, "missing_slot");
+        }
+        continue;
+      }
+
+      orphanedPersistedSince.delete(key);
+
+      if (entry.phase === "ready") continue;
+
+      const stuckMs = phaseAgeMs(entry, now);
+      const reconnectLockAge = now - (lastReconnectAttemptAt.get(key) || 0);
+
+      if (reconnecting.has(key) && reconnectLockAge >= WATCHDOG_RECONNECT_LOCK_MS) {
+        await forceWatchdogRestart(uid, accountId, "stuck_reconnect_lock");
+        continue;
+      }
+
+      if (["initializing", "authenticated"].includes(entry.phase) && stuckMs >= WATCHDOG_STUCK_LINKING_MS) {
+        await forceWatchdogRestart(uid, accountId, `stuck_${entry.phase}`);
+        continue;
+      }
+
+      if (
+        entry.phase === "qr" &&
+        entry.linkIntent !== "user_qr" &&
+        stuckMs >= WATCHDOG_STUCK_LINKING_MS
+      ) {
+        await forceWatchdogRestart(uid, accountId, "stale_restore_qr");
+        continue;
+      }
+
+      if (["disconnected", "error"].includes(entry.phase)) {
+        const waitingOnTimer = pendingReconnectTimers.has(key);
+        const reconnectInFlight = reconnecting.has(key);
+        if (
+          !waitingOnTimer &&
+          !reconnectInFlight &&
+          stuckMs >= WATCHDOG_DISCONNECTED_MS
+        ) {
+          await forceWatchdogRestart(uid, accountId, `stuck_${entry.phase}`);
+        }
+      }
+    }
+  }
+
+  function startConnectionWatchdog() {
+    const timer = setInterval(() => {
+      void runConnectionWatchdog();
+    }, WATCHDOG_INTERVAL_MS);
+    if (typeof timer.unref === "function") timer.unref();
+    waLog("system", "watchdog", `connection watchdog started (every ${WATCHDOG_INTERVAL_MS / 1000}s)`);
+  }
+
   function startBackgroundReconnectLoop() {
     const intervalMs = 30000;
     const timer = setInterval(() => {
@@ -2127,6 +2267,7 @@ function createWhatsAppBridge(deps) {
   }
 
   startBackgroundReconnectLoop();
+  startConnectionWatchdog();
 
   return {
     startLinking,
