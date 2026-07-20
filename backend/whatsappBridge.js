@@ -310,7 +310,15 @@ function buildPuppeteerOptions(executablePath = "") {
     "--disable-gpu",
     "--disable-extensions",
     "--no-first-run",
-    "--no-default-browser-check"
+    "--no-default-browser-check",
+    // Chrome Memory Saver / site isolation can detach the WA Web frame after idle,
+    // causing "Attempted to use detached Frame …" on sendMessage / page.evaluate.
+    // Combine into one --disable-features (Chrome keeps only the last occurrence).
+    "--disable-features=IsolateOrigins,site-per-process,MemorySaverMode",
+    "--memory-pressure-off",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding"
   );
 
   const opts = {
@@ -326,6 +334,17 @@ function buildPuppeteerOptions(executablePath = "") {
   }
 
   return opts;
+}
+
+function isTransientPuppeteerFrameError(err) {
+  const msg = err instanceof Error ? err.message : String(err || "");
+  return /detached Frame|Execution context was destroyed|Session closed|Target closed|Protocol error/i.test(
+    msg
+  );
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function releaseLinuxProfileDir(profileDir) {
@@ -645,25 +664,33 @@ async function deliverTextToPeer(client, peerJid, text, options = {}) {
   };
 
   const attempt = async (jid, sendOptions = {}) => {
-    const exists = await chatExists(jid);
-    if (exists === false) {
-      lastError = `chat not found for ${jid}`;
-      return false;
+    const maxTries = 3;
+    for (let tryIndex = 0; tryIndex < maxTries; tryIndex += 1) {
+      const exists = await chatExists(jid);
+      if (exists === false) {
+        lastError = `chat not found for ${jid}`;
+        return false;
+      }
+      try {
+        // waitUntilMsgSent improves odds of a Message return; library still often returns undefined
+        // after a real delivery — do not use Boolean(sent).
+        await client.sendMessage(jid, trimmed, {
+          sendSeen: false,
+          waitUntilMsgSent: true,
+          ...sendOptions,
+        });
+        return true;
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e);
+        console.warn("[whatsapp] sendMessage:", jid, lastError);
+        if (!isTransientPuppeteerFrameError(e) || tryIndex >= maxTries - 1) {
+          return false;
+        }
+        // Frame can recover after WhatsApp Web re-attaches; brief backoff then retry same JID.
+        await sleepMs(750 * (tryIndex + 1));
+      }
     }
-    try {
-      // waitUntilMsgSent improves odds of a Message return; library still often returns undefined
-      // after a real delivery — do not use Boolean(sent).
-      await client.sendMessage(jid, trimmed, {
-        sendSeen: false,
-        waitUntilMsgSent: true,
-        ...sendOptions,
-      });
-      return true;
-    } catch (e) {
-      lastError = e instanceof Error ? e.message : String(e);
-      console.warn("[whatsapp] sendMessage:", jid, lastError);
-      return false;
-    }
+    return false;
   };
 
   // Resolve alternate ids before the first send when possible (LID ↔ phone).
@@ -966,6 +993,7 @@ function createWhatsAppBridge(deps) {
     const key = slotKey(safe, safeAccountId);
     waLog(safe, safeAccountId, "destroying client session");
     const entry = slots.get(key);
+    stopPageKeepAlive(entry);
     if (entry?.client) {
       try {
         entry.client.removeAllListeners();
@@ -976,6 +1004,49 @@ function createWhatsAppBridge(deps) {
     }
     slots.delete(key);
     waLog(safe, safeAccountId, "client session removed");
+  }
+
+  function stopPageKeepAlive(entry) {
+    if (!entry?.keepAliveTimer) return;
+    clearInterval(entry.keepAliveTimer);
+    entry.keepAliveTimer = null;
+  }
+
+  /**
+   * Periodically touch the WA Web page so Chrome Memory Saver does not detach the
+   * Puppeteer frame (common cause of "Attempted to use detached Frame").
+   */
+  function startPageKeepAlive(entry, workspaceUserId, accountId) {
+    stopPageKeepAlive(entry);
+    if (!entry?.client) return;
+    const intervalMs = 45000;
+    entry.keepAliveTimer = setInterval(() => {
+      const page = entry.client?.pupPage;
+      if (!page || entry.phase !== "ready") return;
+      void page
+        .evaluate(() => Date.now())
+        .catch((e) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!isTransientPuppeteerFrameError(e)) return;
+          waLog(
+            workspaceUserId,
+            accountId,
+            "page keep-alive detected detached frame; scheduling reconnect",
+            msg
+          );
+          entry.phase = "disconnected";
+          entry.error = msg;
+          stopPageKeepAlive(entry);
+          if (hasPersistedAccountSession(workspaceUserId, accountId)) {
+            setTimeout(() => {
+              void ensureConnected(workspaceUserId, accountId);
+            }, 2000);
+          }
+        });
+    }, intervalMs);
+    if (typeof entry.keepAliveTimer.unref === "function") {
+      entry.keepAliveTimer.unref();
+    }
   }
 
   async function disconnectAndForget(workspaceUserId, accountId = "1") {
@@ -1349,6 +1420,16 @@ function createWhatsAppBridge(deps) {
       if (result && !result.ok) {
         lastFailureMessage = result.message || "";
         waLog(safe, safeAccountId, "live-agent send failed on primary account", lastFailureMessage);
+        if (isTransientPuppeteerFrameError(lastFailureMessage)) {
+          primary.phase = "disconnected";
+          primary.error = lastFailureMessage;
+          stopPageKeepAlive(primary);
+          if (hasPersistedAccountSession(safe, safeAccountId)) {
+            setTimeout(() => {
+              void ensureConnected(safe, safeAccountId);
+            }, 2000);
+          }
+        }
       }
     } else {
       waLog(
@@ -1484,6 +1565,7 @@ function createWhatsAppBridge(deps) {
       entry.pushname = channelLabelFromClient(client);
       failedReconnectCounts.delete(key);
       whatsappAutoStart.addLink(safe, safeAccountId);
+      startPageKeepAlive(entry, safe, safeAccountId);
       if (entry.linkIntent === "user_qr" && typeof onAccountLinkedViaQr === "function") {
         onAccountLinkedViaQr(safe, safeAccountId, {
           pushname: entry.pushname,
@@ -1515,6 +1597,7 @@ function createWhatsAppBridge(deps) {
     client.on("disconnected", (reason) => {
       entry.phase = "disconnected";
       entry.error = String(reason || "disconnected");
+      stopPageKeepAlive(entry);
       waLog(safe, safeAccountId, "disconnected", entry.error);
       const prevFails = failedReconnectCounts.get(key) || 0;
       failedReconnectCounts.set(key, prevFails + 1);
