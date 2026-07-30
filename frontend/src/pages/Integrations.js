@@ -401,7 +401,9 @@ function Integrations() {
     ["qr", "initializing", "authenticated", "error"].includes(activePhase);
   const isRestoringSession =
     !activeConnected &&
-    (activePhase === "reconnecting" || Boolean(activeAccount?.persisted));
+    (activePhase === "reconnecting" ||
+      (Boolean(activeAccount?.persisted) &&
+        !["qr", "initializing", "authenticated"].includes(activePhase)));
 
   return (
     <>
@@ -695,13 +697,14 @@ function Integrations() {
                     <p className="mt-1 text-sm font-semibold text-slate-800">
                       {activeConnected
                         ? activeAccountLabel
-                        : isRestoringSession
-                          ? "Restoring…"
-                          : activePhase === "initializing" ||
-                              activePhase === "authenticated" ||
-                              activePhase === "qr"
-                            ? "Linking…"
-                            : "Not linked"}
+                        : activePhase === "authenticated" ||
+                            activePhase === "initializing"
+                          ? "Connecting…"
+                          : isRestoringSession
+                            ? "Restoring…"
+                            : activePhase === "qr"
+                              ? "Linking…"
+                              : "Not linked"}
                     </p>
                   </div>
                 </div>
@@ -732,7 +735,14 @@ function Integrations() {
                   ) : null}
                   {!activeAccount?.qrDataUrl && !activeConnected && activePhase !== "error" ? (
                     <div className="text-center">
-                      {activePhase === "reconnecting" || activeAccount?.persisted ? (
+                      {activePhase === "authenticated" || activePhase === "initializing" ? (
+                        <>
+                          <RefreshCw size={20} className="mx-auto mb-2 animate-spin text-slate-400" />
+                          <p className="text-sm text-slate-500">
+                            Finishing WhatsApp connection. This usually takes under a minute.
+                          </p>
+                        </>
+                      ) : isRestoringSession ? (
                         <>
                           <RefreshCw size={20} className="mx-auto mb-2 animate-spin text-slate-400" />
                           <p className="text-sm text-slate-500">

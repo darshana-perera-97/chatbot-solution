@@ -2246,6 +2246,8 @@ const whatsappBridge = createWhatsAppBridge({
   },
 });
 
+void whatsappBridge.warmupForRestore();
+
 const enrichWhatsappSessionPeerPhones = async (userIdRaw, sessions) => {
   const safeUserId = sanitizeAgentDetailsUserId(
     typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
@@ -3296,7 +3298,9 @@ server.listen(PORT, () => {
     `[whatsapp] auto-connect: restoring ${restartLinks.length} WhatsApp client(s) (saved sessions + disk)…`
   );
   void (async () => {
-    const results = await whatsappBridge.restorePersistedConnections(restartLinks);
+    const results = await whatsappBridge.restorePersistedConnections(restartLinks, {
+      concurrency: 2,
+    });
     const restored = results.filter((r) => r.ok).length;
     const failed = results.filter((r) => !r.ok);
     console.log(`[whatsapp] auto-connect: ${restored}/${results.length} session(s) ready`);

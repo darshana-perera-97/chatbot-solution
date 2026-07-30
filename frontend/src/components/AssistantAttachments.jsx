@@ -2,8 +2,37 @@
  * Renders chat message materials (images, videos, PDFs, and other files).
  */
 
+function dataUrlToBlobUrl(dataUrl) {
+  if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) return null;
+  const comma = dataUrl.indexOf(",");
+  if (comma === -1) return null;
+  const header = dataUrl.slice(0, comma);
+  const base64 = dataUrl.slice(comma + 1).replace(/\s/g, "");
+  const mimeMatch = /^data:([^;,]+)/i.exec(header);
+  const mime = mimeMatch?.[1]?.trim() || "application/octet-stream";
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mime });
+    return URL.createObjectURL(blob);
+  } catch {
+    return null;
+  }
+}
+
 function openDataUrlInNewTab(dataUrl) {
   if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) return false;
+  const blobUrl = dataUrlToBlobUrl(dataUrl);
+  if (blobUrl) {
+    try {
+      const win = window.open(blobUrl, "_blank", "noopener,noreferrer");
+      setTimeout(() => URL.revokeObjectURL(blobUrl), win ? 120000 : 5000);
+      if (win) return true;
+    } catch {
+      URL.revokeObjectURL(blobUrl);
+    }
+  }
   try {
     const win = window.open(dataUrl, "_blank", "noopener,noreferrer");
     return Boolean(win);
@@ -14,22 +43,8 @@ function openDataUrlInNewTab(dataUrl) {
 
 function openPdfFromDataUrl(dataUrl, filename = "document.pdf") {
   if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) return false;
-  const comma = dataUrl.indexOf(",");
-  if (comma === -1) return false;
-  const header = dataUrl.slice(0, comma);
-  const base64 = dataUrl.slice(comma + 1).replace(/\s/g, "");
-  const mimeMatch = /^data:([^;,]+)/i.exec(header);
-  const mime = mimeMatch?.[1]?.trim() || "application/pdf";
-  let blobUrl = "";
-  try {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const blob = new Blob([bytes], { type: mime });
-    blobUrl = URL.createObjectURL(blob);
-  } catch {
-    return false;
-  }
+  const blobUrl = dataUrlToBlobUrl(dataUrl);
+  if (!blobUrl) return false;
   try {
     const win = window.open(blobUrl, "_blank", "noopener,noreferrer");
     if (!win) {
@@ -67,6 +82,19 @@ function openFileFromDataUrl(dataUrl, filename = "file") {
   } catch {
     return false;
   }
+}
+
+function OpenInNewTabButton({ onClick, className, label = "Open in new tab" }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={className}
+      title={label}
+    >
+      {label}
+    </button>
+  );
 }
 
 const VARIANT_STYLES = {
@@ -116,6 +144,7 @@ export function AssistantAttachments({ attachments, variant = "default" }) {
         {attachments.map((a, i) => {
           const key = `${a.kind}-${i}-${a.imageName || a.pdfName || a.videoName || a.fileName || ""}`;
           if (a.kind === "image" && typeof a.imageData === "string" && a.imageData.startsWith("data:image/")) {
+            const label = a.imageName || "Image";
             return (
               <figure key={key} className={`overflow-hidden rounded-lg border ${styles.figure}`}>
                 {a.productTitle ? (
@@ -129,18 +158,26 @@ export function AssistantAttachments({ attachments, variant = "default" }) {
                   type="button"
                   onClick={() => openDataUrlInNewTab(a.imageData)}
                   className={`block w-full cursor-zoom-in ${styles.imageButton}`}
-                  title={a.imageName ? `Open ${a.imageName}` : "Open image"}
+                  title={`Open ${label} in new tab`}
                 >
                   <img
                     src={a.imageData}
-                    alt={a.imageName || "Attachment"}
+                    alt={label}
                     className="max-h-52 w-full object-contain"
                     loading="lazy"
                   />
                 </button>
-                {a.imageName ? (
-                  <p className={`px-2 py-1 text-[10px] ${styles.fileTitle}`}>{a.imageName}</p>
-                ) : null}
+                <div className="flex items-center justify-between gap-2 px-2 py-1.5">
+                  {a.imageName ? (
+                    <p className={`truncate text-[10px] ${styles.fileTitle}`}>{a.imageName}</p>
+                  ) : (
+                    <span />
+                  )}
+                  <OpenInNewTabButton
+                    onClick={() => openDataUrlInNewTab(a.imageData)}
+                    className={`shrink-0 text-[11px] font-semibold underline underline-offset-2 ${styles.link}`}
+                  />
+                </div>
               </figure>
             );
           }
@@ -161,13 +198,10 @@ export function AssistantAttachments({ attachments, variant = "default" }) {
                 </video>
                 <div className="flex items-center justify-between gap-2 px-2 py-1.5">
                   <p className={`truncate text-[10px] ${styles.fileTitle}`}>{a.videoName || "Video"}</p>
-                  <button
-                    type="button"
+                  <OpenInNewTabButton
                     onClick={() => openDataUrlInNewTab(a.videoData)}
                     className={`shrink-0 text-[11px] font-semibold underline underline-offset-2 ${styles.link}`}
-                  >
-                    Open
-                  </button>
+                  />
                 </div>
               </figure>
             );
@@ -181,13 +215,11 @@ export function AssistantAttachments({ attachments, variant = "default" }) {
                     {a.productTitle}
                   </p>
                 ) : null}
-                <button
-                  type="button"
+                <OpenInNewTabButton
                   onClick={() => openPdfFromDataUrl(a.pdfData, label)}
                   className={`text-left text-sm font-semibold underline underline-offset-2 ${styles.link}`}
-                >
-                  Open {label}
-                </button>
+                  label={`Open ${label} in new tab`}
+                />
               </div>
             );
           }
@@ -195,13 +227,11 @@ export function AssistantAttachments({ attachments, variant = "default" }) {
             const label = a.fileName || "File";
             return (
               <div key={key} className={`rounded-lg border px-2 py-2 ${styles.fileBox}`}>
-                <button
-                  type="button"
+                <OpenInNewTabButton
                   onClick={() => openFileFromDataUrl(a.fileData, label)}
                   className={`text-left text-sm font-semibold underline underline-offset-2 ${styles.link}`}
-                >
-                  Open {label}
-                </button>
+                  label={`Open ${label} in new tab`}
+                />
               </div>
             );
           }

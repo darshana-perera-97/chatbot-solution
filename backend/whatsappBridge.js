@@ -16,6 +16,53 @@ try {
 }
 
 const dataRoot = path.join(__dirname, "data");
+/** Single shared WA Web HTML cache — same pinned version for every account (avoids N downloads on boot). */
+const sharedWebCachePath = path.join(dataRoot, ".wwebjs_cache-shared");
+
+/** Pin WA Web HTML — live web.whatsapp.com builds often hang at authenticated without firing ready. */
+const WHATSAPP_WEB_VERSION =
+  (typeof process.env.WHATSAPP_WEB_VERSION === "string" &&
+    process.env.WHATSAPP_WEB_VERSION.trim()) ||
+  "2.3000.1044135300-alpha";
+const WA_VERSION_REMOTE_TEMPLATE =
+  "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html";
+/** After authenticated, ready should follow within this window or we recycle the browser session. */
+const READY_AFTER_AUTH_TIMEOUT_MS = 75000;
+
+function sanitizeWebCacheDir(webCachePath, pinnedVersion) {
+  if (!webCachePath || !fs.existsSync(webCachePath)) return;
+  const pinnedFile = `${pinnedVersion}.html`;
+  for (const name of fs.readdirSync(webCachePath)) {
+    if (!name.endsWith(".html") || name === pinnedFile) continue;
+    try {
+      fs.rmSync(path.join(webCachePath, name), { force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+async function ensurePinnedWebVersionHtml(webCachePath, version) {
+  if (!webCachePath || !version) return false;
+  fs.mkdirSync(webCachePath, { recursive: true });
+  const filePath = path.join(webCachePath, `${version}.html`);
+  try {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 10000) return true;
+  } catch {
+    /* re-download */
+  }
+  const url = WA_VERSION_REMOTE_TEMPLATE.replace("{version}", encodeURIComponent(version));
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Could not download WhatsApp Web ${version} (HTTP ${res.status})`);
+  }
+  const html = await res.text();
+  if (!html || html.length < 10000) {
+    throw new Error(`Downloaded WhatsApp Web ${version} looks invalid`);
+  }
+  fs.writeFileSync(filePath, html, "utf8");
+  return true;
+}
 
 function resolveUserAuthRoot(workspaceUserId) {
   const safeUserId = String(workspaceUserId || "").trim();
@@ -38,18 +85,15 @@ function slotKey(workspaceUserId, accountId) {
   return `${safeUserId}::${safeAccountId}`;
 }
 
-function resolveUserWebCacheDir(workspaceUserId, accountId = "1") {
-  const safeUserId = String(workspaceUserId || "").trim();
-  const userDir = path.join(dataRoot, safeUserId);
-  const clientId = localAuthClientIdForAccount(accountId);
-  const cacheDir =
-    clientId === "wa"
-      ? path.join(userDir, ".wwebjs_cache")
-      : path.join(userDir, `.wwebjs_cache-${clientId}`);
-  if (!fs.existsSync(cacheDir)) {
-    fs.mkdirSync(cacheDir, { recursive: true });
+function resolveSharedWebCacheDir() {
+  if (!fs.existsSync(sharedWebCachePath)) {
+    fs.mkdirSync(sharedWebCachePath, { recursive: true });
   }
-  return cacheDir;
+  return sharedWebCachePath;
+}
+
+function resolveUserWebCacheDir(workspaceUserId, accountId = "1") {
+  return resolveSharedWebCacheDir();
 }
 
 function resolveAccountSessionDir(workspaceUserId, accountId = "1") {
@@ -176,7 +220,16 @@ function pickChromeExecutable(candidates) {
   return "";
 }
 
+let cachedChromeExecutablePath = undefined;
+
 function resolveChromeExecutablePath() {
+  if (cachedChromeExecutablePath !== undefined) return cachedChromeExecutablePath;
+
+  const assignChromePath = (value) => {
+    cachedChromeExecutablePath = value || "";
+    return cachedChromeExecutablePath;
+  };
+
   const fromEnv =
     (typeof process.env.PUPPETEER_EXECUTABLE_PATH === "string" &&
       process.env.PUPPETEER_EXECUTABLE_PATH.trim()) ||
@@ -188,7 +241,7 @@ function resolveChromeExecutablePath() {
 
   if (fromEnv) {
     const envPath = pickChromeExecutable([fromEnv]);
-    if (envPath) return envPath;
+    if (envPath) return assignChromePath(envPath);
     console.warn(
       `[whatsapp] configured browser path is missing or incompatible: ${fromEnv}`
     );
@@ -218,7 +271,7 @@ function resolveChromeExecutablePath() {
   }
 
   const fromKnownPaths = pickChromeExecutable(candidates);
-  if (fromKnownPaths) return fromKnownPaths;
+  if (fromKnownPaths) return assignChromePath(fromKnownPaths);
 
   // Linux distributions often expose browser binaries only on PATH.
   if (process.platform === "linux") {
@@ -239,7 +292,7 @@ function resolveChromeExecutablePath() {
           .split("\n")
           .pop();
         const fromPath = pickChromeExecutable([resolved]);
-        if (fromPath) return fromPath;
+        if (fromPath) return assignChromePath(fromPath);
       } catch {
         /* command not found */
       }
@@ -253,14 +306,14 @@ function resolveChromeExecutablePath() {
       const p = puppeteer.executablePath();
       if (typeof p === "string" && p.trim()) {
         const fromPuppeteer = pickChromeExecutable([p.trim()]);
-        if (fromPuppeteer) return fromPuppeteer;
+        if (fromPuppeteer) return assignChromePath(fromPuppeteer);
       }
     }
   } catch {
     /* ignore */
   }
 
-  return "";
+  return assignChromePath("");
 }
 
 function formatBrowserLaunchHelp(baseMessage) {
@@ -851,9 +904,50 @@ function mergeSyncedWhatsAppMessages(existingMessages, waMessages) {
 
 const MAX_WA_MEDIA_DATA_CHARS = 2_400_000;
 
-async function attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments) {
+function normalizeWhatsAppMessageId(msg) {
+  if (!msg?.id || msg.id._serialized) return;
+  msg.id._serialized =
+    msg.id.$1 || (typeof msg.id === "string" ? msg.id : null);
+}
+
+/** Resolve message in WhatsApp Web's Store before downloadMedia() (incl. @lid contacts). */
+async function prepareWhatsAppMessageStoreForDownload(client, msg) {
+  normalizeWhatsAppMessageId(msg);
+  const page = client?.pupPage;
+  if (!page || typeof page.evaluate !== "function") return;
+
+  const msgId = msg.id?._serialized;
+  const rawId = msg.id?.$1 || msg.id?._serialized;
+  if (!msgId && !rawId) return;
+
+  try {
+    await page.evaluate(async (serializedId, alternateId) => {
+      try {
+        const MsgStore = window.Store && window.Store.Msg;
+        if (!MsgStore) return;
+
+        let targetMsg = MsgStore.get(serializedId) || MsgStore.get(alternateId);
+        if (!targetMsg && MsgStore.getMessagesById) {
+          const fetched = await MsgStore.getMessagesById([serializedId, alternateId]);
+          if (fetched && fetched.length > 0) targetMsg = fetched[0];
+        }
+
+        if (targetMsg?.id && !targetMsg.id._serialized && targetMsg.id.$1) {
+          targetMsg.id._serialized = targetMsg.id.$1;
+        }
+      } catch {
+        /* browser-side resolution errors are non-fatal */
+      }
+    }, msgId, rawId);
+  } catch {
+    /* page evaluate failures are non-fatal */
+  }
+}
+
+async function attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments, client) {
   if (!msg?.hasMedia || typeof msg.downloadMedia !== "function") return [];
   try {
+    await prepareWhatsAppMessageStoreForDownload(client, msg);
     const media = await msg.downloadMedia();
     const mimetype = typeof media?.mimetype === "string" ? media.mimetype.trim().toLowerCase() : "";
     const rawData = typeof media?.data === "string" ? media.data.replace(/\s/g, "") : "";
@@ -874,17 +968,18 @@ async function attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments) {
       draft = [{ kind: "file", fileName: filename || "File", mimeType: mimetype, fileData: dataUrl }];
     }
     return typeof sanitizeMessageAttachments === "function" ? sanitizeMessageAttachments(draft) : draft;
-  } catch {
+  } catch (e) {
+    console.warn("[whatsapp] downloadMedia failed:", e instanceof Error ? e.message : String(e));
     return [];
   }
 }
 
-async function whatsappMessageToRecord(msg, sanitizeMessageAttachments) {
+async function whatsappMessageToRecord(msg, sanitizeMessageAttachments, client) {
   const body = typeof msg?.body === "string" ? msg.body.trim() : "";
   // Phone/desktop sends from the linked WhatsApp account (not AI / live-agent dashboard).
   const role = msg?.fromMe ? "main_account" : "user";
   const attachments = msg?.hasMedia
-    ? await attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments)
+    ? await attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments, client)
     : [];
   if (!body && !attachments.length) return null;
   const record = { role, content: body };
@@ -962,6 +1057,8 @@ function createWhatsAppBridge(deps) {
   const watchdogLastActionAt = new Map();
   /** @type {Set<string>} slots currently undergoing watchdog recovery */
   const watchdogRecovering = new Set();
+  /** @type {boolean} bulk boot restore in progress — defer per-account conversation sync */
+  let bulkRestoreInProgress = false;
   // Only count failed reconnect *attempts* (not transient disconnect events).
   // Transient WA/Chrome drops are common and must not wipe a healthy LocalAuth folder.
   // Only wipe LocalAuth after repeated QR/auth failures — not transient Chrome drops.
@@ -994,15 +1091,24 @@ function createWhatsAppBridge(deps) {
     if (!safe) return;
     const clientId = localAuthClientIdForAccount(safeAccountId);
     const sessionDir = resolveAccountSessionDir(safe, safeAccountId);
-    const cacheDir = resolveUserWebCacheDir(safe, safeAccountId);
     try {
       if (fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
         waLog(safe, safeAccountId, "removed persisted auth session files");
       }
-      if (fs.existsSync(cacheDir)) {
-        fs.rmSync(cacheDir, { recursive: true, force: true });
-        waLog(safe, safeAccountId, "removed persisted WhatsApp web cache files");
+      // Legacy per-account web caches (shared cache is kept for faster relink).
+      const userDir = path.join(dataRoot, safe);
+      const legacyCaches = [
+        path.join(userDir, ".wwebjs_cache"),
+        path.join(userDir, `.wwebjs_cache-${clientId === "wa" ? "wa" : clientId}`),
+      ];
+      for (const legacyCache of legacyCaches) {
+        if (!fs.existsSync(legacyCache)) continue;
+        try {
+          fs.rmSync(legacyCache, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
       }
     } catch (e) {
       waLog(
@@ -1014,6 +1120,46 @@ function createWhatsAppBridge(deps) {
     }
   }
 
+  function clearReadyWatchdog(entry) {
+    if (!entry?.readyWatchdogTimer) return;
+    clearTimeout(entry.readyWatchdogTimer);
+    entry.readyWatchdogTimer = null;
+  }
+
+  function startReadyWatchdog(entry, workspaceUserId, accountId) {
+    if (!entry) return;
+    clearReadyWatchdog(entry);
+    entry.readyWatchdogTimer = setTimeout(() => {
+      void (async () => {
+        if (!entry || entry.phase === "ready") return;
+        if (!["authenticated", "initializing"].includes(entry.phase)) return;
+        const webCachePath = resolveUserWebCacheDir(workspaceUserId, accountId);
+        waLog(
+          workspaceUserId,
+          accountId,
+          "ready watchdog: stuck after auth — refreshing web cache and retrying"
+        );
+        clearReadyWatchdog(entry);
+        sanitizeWebCacheDir(webCachePath, WHATSAPP_WEB_VERSION);
+        try {
+          await ensurePinnedWebVersionHtml(webCachePath, WHATSAPP_WEB_VERSION);
+        } catch (e) {
+          waLog(
+            workspaceUserId,
+            accountId,
+            "ready watchdog: web cache refresh failed",
+            e instanceof Error ? e.message : String(e)
+          );
+        }
+        await destroyClient(workspaceUserId, accountId);
+        void ensureConnected(workspaceUserId, accountId, { force: true });
+      })();
+    }, READY_AFTER_AUTH_TIMEOUT_MS);
+    if (typeof entry.readyWatchdogTimer.unref === "function") {
+      entry.readyWatchdogTimer.unref();
+    }
+  }
+
   async function destroyClient(workspaceUserId, accountId = "1") {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
@@ -1021,6 +1167,7 @@ function createWhatsAppBridge(deps) {
     const key = slotKey(safe, safeAccountId);
     waLog(safe, safeAccountId, "destroying client session");
     const entry = slots.get(key);
+    clearReadyWatchdog(entry);
     stopPageKeepAlive(entry);
     if (entry?.client) {
       try {
@@ -1379,7 +1526,7 @@ function createWhatsAppBridge(deps) {
         (a, b) => (Number(a?.timestamp) || 0) - (Number(b?.timestamp) || 0)
       );
       const records = await Promise.all(
-        sorted.map((msg) => whatsappMessageToRecord(msg, sanitizeMessageAttachments))
+        sorted.map((msg) => whatsappMessageToRecord(msg, sanitizeMessageAttachments, client))
       );
       waMessages = records.filter(Boolean);
     } catch (e) {
@@ -1647,6 +1794,19 @@ function createWhatsAppBridge(deps) {
     const localAuthProfileDir = path.join(authRoot, `session-${localAuthClientId}`);
     releaseLinuxProfileDir(localAuthProfileDir);
 
+    sanitizeWebCacheDir(webCachePath, WHATSAPP_WEB_VERSION);
+    try {
+      await ensurePinnedWebVersionHtml(webCachePath, WHATSAPP_WEB_VERSION);
+      waLog(safe, safeAccountId, `using pinned WhatsApp Web version ${WHATSAPP_WEB_VERSION}`);
+    } catch (e) {
+      waLog(
+        safe,
+        safeAccountId,
+        "could not prefetch pinned WhatsApp Web HTML",
+        e instanceof Error ? e.message : String(e)
+      );
+    }
+
     const client = new Client({
       authStrategy: new LocalAuth({
         clientId: localAuthClientId,
@@ -1657,9 +1817,11 @@ function createWhatsAppBridge(deps) {
       takeoverOnConflict: true,
       takeoverTimeoutMs: 10000,
       restartOnAuthFail: true,
+      webVersion: WHATSAPP_WEB_VERSION,
       webVersionCache: {
         type: "local",
         path: webCachePath,
+        strict: true,
       },
       puppeteer: buildPuppeteerOptions(executablePath),
     });
@@ -1682,7 +1844,15 @@ function createWhatsAppBridge(deps) {
       setEntryPhase(entry, "authenticated");
       entry.qrDataUrl = "";
       whatsappAutoStart.addLink(safe, safeAccountId);
+      startReadyWatchdog(entry, safe, safeAccountId);
       waLog(safe, safeAccountId, "account login authenticated");
+    });
+
+    client.on("loading_screen", (percent) => {
+      const pct = Number(percent);
+      if (Number.isFinite(pct) && pct >= 99 && ["authenticated", "initializing"].includes(entry.phase)) {
+        startReadyWatchdog(entry, safe, safeAccountId);
+      }
     });
 
     client.on("auth_failure", (m) => {
@@ -1692,6 +1862,7 @@ function createWhatsAppBridge(deps) {
     });
 
     client.on("ready", () => {
+      clearReadyWatchdog(entry);
       setEntryPhase(entry, "ready");
       entry.qrDataUrl = "";
       const wid = client.info?.wid;
@@ -1723,16 +1894,18 @@ function createWhatsAppBridge(deps) {
         safeAccountId,
         `linked and ready (account=${entry.pushname || "unknown"}${entry.phone ? ` · ${entry.phone}` : ""})`
       );
-      setTimeout(() => {
-        void syncConversationsForAccount(safe, safeAccountId).catch((e) => {
-          waLog(
-            safe,
-            safeAccountId,
-            "auto conversation sync failed",
-            e instanceof Error ? e.message : String(e)
-          );
-        });
-      }, 3000);
+      if (!bulkRestoreInProgress && !options.deferConversationSync) {
+        setTimeout(() => {
+          void syncConversationsForAccount(safe, safeAccountId).catch((e) => {
+            waLog(
+              safe,
+              safeAccountId,
+              "auto conversation sync failed",
+              e instanceof Error ? e.message : String(e)
+            );
+          });
+        }, 3000);
+      }
     });
 
     client.on("change_state", (state) => {
@@ -1789,7 +1962,7 @@ function createWhatsAppBridge(deps) {
       }
 
       try {
-        const outboundRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments);
+        const outboundRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, client);
         if (!outboundRecord) return;
 
         const conversationId = jidToConversationId(jid);
@@ -1863,7 +2036,7 @@ function createWhatsAppBridge(deps) {
         `WhatsApp ${safeAccountId}`;
 
       if (isStaleWhatsAppMessage(msg)) {
-        const incomingStale = await whatsappMessageToRecord(msg, sanitizeMessageAttachments);
+        const incomingStale = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, client);
         if (incomingStale) {
           const existingStale = getTestChatSessionByConversation(safe, conversationId);
           const priorStale = priorMessagesFromSession(existingStale).filter(
@@ -1889,7 +2062,7 @@ function createWhatsAppBridge(deps) {
         return;
       }
 
-      const incomingRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments);
+      const incomingRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, client);
       if (!incomingRecord) return;
 
       const existing = getTestChatSessionByConversation(safe, conversationId);
@@ -2072,7 +2245,7 @@ function createWhatsAppBridge(deps) {
       if (entry.phase === "error") {
         return { ok: false, phase: "error", error: entry.error || "error" };
       }
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 200));
     }
     const entry = slots.get(key);
     return {
@@ -2083,26 +2256,40 @@ function createWhatsAppBridge(deps) {
   }
 
   /**
-   * Reconnect persisted LocalAuth sessions after server boot (sequential to avoid Chrome overload).
+   * Reconnect persisted LocalAuth sessions after server boot.
+   * Restores accounts in parallel (bounded concurrency) instead of one-by-one.
    */
   async function restorePersistedConnections(links = null, options = {}) {
     const toRestore = Array.isArray(links) ? links : whatsappAutoStart.readRestoreLinks();
-    const staggerMs = Number(options.staggerMs) >= 0 ? Number(options.staggerMs) : 3000;
-    const readyTimeoutMs = Number(options.readyTimeoutMs) > 0 ? Number(options.readyTimeoutMs) : 180000;
+    const envConcurrency = Number(process.env.WHATSAPP_RESTORE_CONCURRENCY);
+    const concurrency =
+      Number(options.concurrency) > 0
+        ? Number(options.concurrency)
+        : Number.isFinite(envConcurrency) && envConcurrency > 0
+          ? envConcurrency
+          : 2;
+    const readyTimeoutMs =
+      Number(options.readyTimeoutMs) > 0 ? Number(options.readyTimeoutMs) : 180000;
     const maxAttempts = Number(options.maxAttempts) > 0 ? Number(options.maxAttempts) : 3;
+    const retryDelayMs = Number(options.retryDelayMs) > 0 ? Number(options.retryDelayMs) : 2000;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const results = [];
 
-    for (let i = 0; i < toRestore.length; i += 1) {
-      const link = toRestore[i];
+    await warmupForRestore();
+
+    if (!toRestore.length) return [];
+
+    bulkRestoreInProgress = true;
+    const results = new Array(toRestore.length);
+    let nextIndex = 0;
+
+    async function restoreOneLink(link) {
       const uid = sanitizeAgentDetailsUserId(String(link.userId || "").trim());
       const accountId = sanitizeWhatsAppAccountId(link.accountId) || "1";
-      if (!uid) continue;
+      if (!uid) return { userId: "", accountId, ok: false, reason: "invalid_user" };
 
       if (!hasPersistedAccountSession(uid, accountId)) {
         waLog(uid, accountId, "skip restore: no persisted session on disk");
-        results.push({ userId: uid, accountId, ok: false, reason: "no_session" });
-        continue;
+        return { userId: uid, accountId, ok: false, reason: "no_session" };
       }
 
       let restored = false;
@@ -2111,11 +2298,13 @@ function createWhatsAppBridge(deps) {
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
           waLog(uid, accountId, `restore attempt ${attempt}/${maxAttempts}`);
-          const startResult = await startLinking(uid, accountId);
+          const startResult = await startLinking(uid, accountId, {
+            deferConversationSync: true,
+          });
           if (!startResult?.ok) {
             lastReason = startResult?.error || "initialize_failed";
             if (attempt < maxAttempts) {
-              await sleep(4000 * attempt);
+              await sleep(retryDelayMs * attempt);
               continue;
             }
             break;
@@ -2143,7 +2332,7 @@ function createWhatsAppBridge(deps) {
         }
 
         if (attempt < maxAttempts) {
-          const delayMs = 4000 * attempt;
+          const delayMs = retryDelayMs * attempt;
           waLog(uid, accountId, `restore retry in ${delayMs}ms`, lastReason);
           await sleep(delayMs);
         }
@@ -2152,32 +2341,86 @@ function createWhatsAppBridge(deps) {
       if (restored) {
         failedReconnectCounts.delete(slotKey(uid, accountId));
         waLog(uid, accountId, "persisted session restored");
-        results.push({ userId: uid, accountId, ok: true });
-      } else {
-        waLog(uid, accountId, "restore failed", lastReason || "unknown");
-        const isSessionInvalid =
-          lastReason === "session_expired_needs_qr" ||
-          /auth.?fail/i.test(lastReason);
-        if (isSessionInvalid) {
-          removeAuthSession(uid, accountId);
-          whatsappAutoStart.removeLink(uid, accountId);
-          failedReconnectCounts.delete(slotKey(uid, accountId));
-          const staleKey = slotKey(uid, accountId);
-          const staleEntry = slots.get(staleKey);
-          if (staleEntry && staleEntry.phase !== "ready") {
-            slots.delete(staleKey);
-          }
-          waLog(uid, accountId, "cleared invalid session (reason: " + lastReason + ")");
-        }
-        results.push({ userId: uid, accountId, ok: false, reason: lastReason || "unknown" });
+        return { userId: uid, accountId, ok: true };
       }
 
-      if (staggerMs > 0 && i < toRestore.length - 1) {
-        await sleep(staggerMs);
+      waLog(uid, accountId, "restore failed", lastReason || "unknown");
+      const isSessionInvalid =
+        lastReason === "session_expired_needs_qr" || /auth.?fail/i.test(lastReason);
+      if (isSessionInvalid) {
+        removeAuthSession(uid, accountId);
+        whatsappAutoStart.removeLink(uid, accountId);
+        failedReconnectCounts.delete(slotKey(uid, accountId));
+        const staleKey = slotKey(uid, accountId);
+        const staleEntry = slots.get(staleKey);
+        if (staleEntry && staleEntry.phase !== "ready") {
+          slots.delete(staleKey);
+        }
+        waLog(uid, accountId, "cleared invalid session (reason: " + lastReason + ")");
+      }
+      return { userId: uid, accountId, ok: false, reason: lastReason || "unknown" };
+    }
+
+    async function restoreWorker() {
+      while (nextIndex < toRestore.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await restoreOneLink(toRestore[index]);
       }
     }
 
-    return results;
+    const workerCount = Math.min(Math.max(1, concurrency), toRestore.length);
+    waLog(
+      "system",
+      "restore",
+      `restoring ${toRestore.length} session(s) with concurrency=${workerCount}`
+    );
+
+    try {
+      await Promise.all(Array.from({ length: workerCount }, () => restoreWorker()));
+    } finally {
+      bulkRestoreInProgress = false;
+    }
+
+    const restoredAccounts = results.filter((r) => r?.ok);
+    restoredAccounts.forEach((r, index) => {
+      setTimeout(() => {
+        void syncConversationsForAccount(r.userId, r.accountId).catch((e) => {
+          waLog(
+            r.userId,
+            r.accountId,
+            "post-restore conversation sync failed",
+            e instanceof Error ? e.message : String(e)
+          );
+        });
+      }, 4000 + index * 2000);
+    });
+
+    return results.filter(Boolean);
+  }
+
+  let warmupPromise = null;
+
+  async function warmupForRestore() {
+    if (!warmupPromise) {
+      warmupPromise = (async () => {
+        const webCachePath = resolveSharedWebCacheDir();
+        resolveChromeExecutablePath();
+        sanitizeWebCacheDir(webCachePath, WHATSAPP_WEB_VERSION);
+        try {
+          await ensurePinnedWebVersionHtml(webCachePath, WHATSAPP_WEB_VERSION);
+          waLog("system", "warmup", `pinned WhatsApp Web ${WHATSAPP_WEB_VERSION} ready`);
+        } catch (e) {
+          waLog(
+            "system",
+            "warmup",
+            "could not prefetch pinned WhatsApp Web HTML",
+            e instanceof Error ? e.message : String(e)
+          );
+        }
+      })();
+    }
+    return warmupPromise;
   }
 
   function watchdogCanAct(key, now) {
@@ -2383,6 +2626,7 @@ function createWhatsAppBridge(deps) {
     regenerateQr,
     ensureConnected,
     restorePersistedConnections,
+    warmupForRestore,
     hasPersistedSession: hasPersistedAccountSession,
     destroyClient,
     disconnectAndForget,
