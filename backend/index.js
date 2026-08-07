@@ -3,7 +3,7 @@ const http = require("http");
 const path = require("path");
 const { randomUUID } = require("crypto");
 const dotenv = require("dotenv");
-const { createWhatsAppBridge, isWhatsAppGroupJid } = require("./whatsappBridge");
+const { createWhatsAppBridge, isNonPersonalWhatsAppJid } = require("./whatsappBridge");
 const whatsappAutoStart = require("./whatsappAutoStart");
 const {
   ALLOWED_PLANS,
@@ -12,6 +12,11 @@ const {
   getWhatsAppAccountLimit,
   sanitizeWhatsAppAccountId,
 } = require("./planConfig");
+const {
+  applyMediaRetentionToMessages,
+  scheduleChatMediaPurge,
+  trimChatSessions,
+} = require("./chatMediaRetention");
 
 // Load `backend/.env` even when Node is started from the repo root (dotenv default is cwd-only).
 dotenv.config({ path: path.join(__dirname, ".env") });
@@ -406,6 +411,8 @@ const getDefaultWidgetSettings = () => ({
   launcherImage: "",
   /** When false, POST /chat/test does not generate assistant replies (all channels). */
   aiRepliesEnabled: true,
+  /** User-defined labels assignable to conversations on the Chats page. */
+  conversationBadges: [],
   updatedAt: null,
 });
 
@@ -527,6 +534,29 @@ const sanitizeHexColor = (value, fallback) => {
   return fallback;
 };
 
+const MAX_CONVERSATION_BADGES = 30;
+
+const sanitizeConversationBadges = (raw) => {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const id = typeof entry.id === "string" ? entry.id.trim().slice(0, 40) : "";
+    if (!id || !/^[a-zA-Z0-9_-]+$/.test(id) || seen.has(id)) continue;
+    const label = typeof entry.label === "string" ? entry.label.trim().slice(0, 40) : "";
+    if (!label) continue;
+    seen.add(id);
+    out.push({
+      id,
+      label,
+      color: sanitizeHexColor(entry.color, "#7C3AED"),
+    });
+    if (out.length >= MAX_CONVERSATION_BADGES) break;
+  }
+  return out;
+};
+
 const sanitizeWidgetSettings = (input) => {
   const defaults = getDefaultWidgetSettings();
   const source = input && typeof input === "object" ? input : {};
@@ -554,6 +584,7 @@ const sanitizeWidgetSettings = (input) => {
     sendButtonColor: sanitizeHexColor(source.sendButtonColor, defaults.sendButtonColor),
     launcherImage,
     aiRepliesEnabled,
+    conversationBadges: sanitizeConversationBadges(source.conversationBadges),
     updatedAt: typeof source.updatedAt === "string" ? source.updatedAt : null,
   };
 };
@@ -786,10 +817,24 @@ const stampMessageCreatedAt = (msg, fallbackIso = "") => {
 
 const isPreservedChatRole = (role) => role === "agent" || role === "main_account";
 
+const OUTBOUND_EDITABLE_ROLES = new Set(["agent", "assistant", "main_account"]);
+
+const sanitizeSessionMessageMeta = (entry, msg) => {
+  const waId =
+    typeof entry?.whatsappMessageId === "string" ? entry.whatsappMessageId.trim().slice(0, 200) : "";
+  if (waId) msg.whatsappMessageId = waId;
+  const localId =
+    typeof entry?.localId === "string" ? entry.localId.trim().slice(0, 80) : "";
+  if (localId) msg.localId = localId;
+  const editedAt = sanitizeMessageCreatedAt(entry?.editedAt);
+  if (editedAt) msg.editedAt = editedAt;
+};
+
 const sanitizeSessionChatMessages = (raw) => {
   if (!Array.isArray(raw)) return [];
   const out = [];
   for (const entry of raw) {
+    if (entry?.deleted) continue;
     const role =
       entry?.role === "assistant"
         ? "assistant"
@@ -801,16 +846,52 @@ const sanitizeSessionChatMessages = (raw) => {
         ? "main_account"
         : null;
     const content = typeof entry?.content === "string" ? entry.content.trim() : "";
-    const att = sanitizeMessageAttachments(entry.attachments);
+    let att = sanitizeMessageAttachments(entry.attachments);
     if (!role || (!content && !att.length)) continue;
+    let createdAt = sanitizeMessageCreatedAt(entry?.createdAt);
+    if (!createdAt && att.length) createdAt = new Date().toISOString();
+    if (att.length) {
+      const retained = applyMediaRetentionToMessages(
+        [{ attachments: att, createdAt }],
+        Date.now(),
+        Date.parse(createdAt) || Date.now()
+      );
+      att = sanitizeMessageAttachments(retained[0]?.attachments);
+    }
+    if (!content && !att.length) continue;
     const msg = { role, content: content.slice(0, 16000) };
     if (att.length) msg.attachments = att;
-    const createdAt = sanitizeMessageCreatedAt(entry?.createdAt);
     if (createdAt) msg.createdAt = createdAt;
+    sanitizeSessionMessageMeta(entry, msg);
     out.push(msg);
   }
-  // Keep a long personal-chat history (WhatsApp sync can import hundreds of messages).
-  return out.slice(-500);
+  return out;
+};
+
+const messageStorageFingerprint = (msg) => {
+  const waId = typeof msg?.whatsappMessageId === "string" ? msg.whatsappMessageId.trim() : "";
+  if (waId) return `wa:${waId}`;
+  const role = typeof msg?.role === "string" ? msg.role : "";
+  const content = typeof msg?.content === "string" ? msg.content.trim() : "";
+  const createdAt = typeof msg?.createdAt === "string" ? msg.createdAt : "";
+  const attCount = Array.isArray(msg?.attachments) ? msg.attachments.length : 0;
+  return `${role}|${createdAt}|${content}|${attCount}`;
+};
+
+/** Append incoming rows without duplicating messages already stored in the session. */
+const appendUniqueSessionMessages = (existingMessages, toAppend) => {
+  const existing = sanitizeSessionChatMessages(existingMessages);
+  const incoming = sanitizeSessionChatMessages(toAppend);
+  if (!incoming.length) return existing;
+  const seen = new Set(existing.map(messageStorageFingerprint));
+  const merged = [...existing];
+  for (const msg of incoming) {
+    const key = messageStorageFingerprint(msg);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(msg.createdAt ? msg : stampMessageCreatedAt(msg));
+  }
+  return merged;
 };
 
 /** Keep live-agent / main-account messages in timeline order when persisting user/assistant payloads. */
@@ -819,22 +900,33 @@ const mergeAgentMessagesPreservingOrder = (existingMessages, incomingUserAssista
   const incoming = sanitizeSessionChatMessages(
     (incomingUserAssistant || []).filter((entry) => !isPreservedChatRole(entry?.role))
   );
-  if (!existing.some((entry) => isPreservedChatRole(entry.role))) {
-    const stampedIncoming = [];
-    for (let i = 0; i < incoming.length; i += 1) {
-      const next = incoming[i];
-      const prev = existing[i];
-      if (next.createdAt) {
-        stampedIncoming.push(next);
-      } else if (prev?.role === next.role && prev.createdAt) {
-        stampedIncoming.push({ ...next, createdAt: prev.createdAt });
-      } else if (i >= existing.length) {
-        stampedIncoming.push(stampMessageCreatedAt(next));
-      } else {
-        stampedIncoming.push(next);
+  if (!incoming.length) return existing;
+
+  const hasPreserved = existing.some((entry) => isPreservedChatRole(entry.role));
+  if (!hasPreserved) {
+    if (incoming.length >= existing.length) {
+      const stampedIncoming = [];
+      for (let i = 0; i < incoming.length; i += 1) {
+        const next = incoming[i];
+        const prev = existing[i];
+        if (next.createdAt) {
+          stampedIncoming.push(next);
+        } else if (prev?.role === next.role && prev.createdAt) {
+          stampedIncoming.push({ ...next, createdAt: prev.createdAt });
+        } else if (i >= existing.length) {
+          stampedIncoming.push(stampMessageCreatedAt(next));
+        } else {
+          stampedIncoming.push(stampMessageCreatedAt(next));
+        }
       }
+      return sanitizeSessionChatMessages(stampedIncoming);
     }
-    return sanitizeSessionChatMessages(stampedIncoming);
+    return appendUniqueSessionMessages(existing, incoming);
+  }
+
+  const existingNonPreserved = existing.filter((entry) => !isPreservedChatRole(entry.role)).length;
+  if (incoming.length > existingNonPreserved) {
+    return appendUniqueSessionMessages(existing, incoming.slice(existingNonPreserved));
   }
 
   const merged = [];
@@ -851,6 +943,8 @@ const mergeAgentMessagesPreservingOrder = (existingMessages, incomingUserAssista
       } else {
         merged.push(next.createdAt ? next : stampMessageCreatedAt(next));
       }
+    } else {
+      merged.push(entry);
     }
   }
   while (incomingIdx < incoming.length) {
@@ -1146,15 +1240,15 @@ const sanitizeWhatsappChatId = (raw) => {
   return raw.trim().slice(0, 120);
 };
 
-/** WhatsApp group sessions are excluded — personal chats only. */
+/** WhatsApp group / channel / status sessions are excluded — personal chats only. */
 const isWhatsAppGroupSession = (session) => {
   if (!session || typeof session !== "object") return false;
   const chatId =
     typeof session.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
-  if (chatId && isWhatsAppGroupJid(chatId)) return true;
+  if (chatId && isNonPersonalWhatsAppJid(chatId)) return true;
   const conversationId =
     typeof session.conversationId === "string" ? session.conversationId.trim() : "";
-  return Boolean(conversationId && isWhatsAppGroupJid(conversationId));
+  return Boolean(conversationId && isNonPersonalWhatsAppJid(conversationId));
 };
 
 const sanitizeWhatsappPeerPhone = (raw) => {
@@ -1211,10 +1305,10 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
     typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
   );
   if (!safeConversationId) return;
-  // Never persist WhatsApp group chats — personal conversations only.
+  // Never persist WhatsApp group / channel / status chats — personal conversations only.
   const incomingChatId =
     options && typeof options.whatsappChatId === "string" ? options.whatsappChatId.trim() : "";
-  if (isWhatsAppGroupJid(safeConversationId) || isWhatsAppGroupJid(incomingChatId)) return;
+  if (isNonPersonalWhatsAppJid(safeConversationId) || isNonPersonalWhatsAppJid(incomingChatId)) return;
   const sessionUserId = safeUserId || "__anonymous__";
   const accounts = readAccounts();
   const matchedAccount = safeUserId
@@ -1288,7 +1382,7 @@ const saveTestChatSession = (userIdRaw, conversationIdRaw, messages, options = {
     });
   }
 
-  writeChatsStore({ sessions: sessions.slice(0, 200) }, safeUserId);
+  writeChatsStore({ sessions: trimChatSessions(sessions) }, safeUserId);
 };
 
 const patchTestChatSessionPeerPhone = (userIdRaw, conversationIdRaw, phoneRaw) => {
@@ -1315,7 +1409,7 @@ const patchTestChatSessionPeerPhone = (userIdRaw, conversationIdRaw, phoneRaw) =
     whatsappPeerPhone: phone,
     updatedAt: new Date().toISOString(),
   };
-  writeChatsStore({ sessions: sessions.slice(0, 200) }, safeUserId);
+  writeChatsStore({ sessions: trimChatSessions(sessions) }, safeUserId);
   return getTestChatSessionByConversation(safeUserId, safeConversationId);
 };
 
@@ -1375,6 +1469,35 @@ const peekLastReplyMeta = (session) => {
   return { lastReplyRole: "", lastReplyPreview: storedPreview };
 };
 
+const peekSessionDocumentMeta = (session) => {
+  const raw = Array.isArray(session?.messages) ? session.messages : [];
+  let documentCount = 0;
+  let documentLabel = "";
+  for (const entry of raw) {
+    const attachments = Array.isArray(entry?.attachments) ? entry.attachments : [];
+    for (const att of attachments) {
+      if (!att || typeof att !== "object") continue;
+      if (att.kind !== "pdf" && att.kind !== "file") continue;
+      documentCount += 1;
+      const name =
+        att.kind === "pdf"
+          ? typeof att.pdfName === "string"
+            ? att.pdfName.trim()
+            : ""
+          : typeof att.fileName === "string"
+          ? att.fileName.trim()
+          : "";
+      if (name) documentLabel = name.slice(0, 120);
+      else if (!documentLabel) documentLabel = att.kind === "pdf" ? "PDF document" : "Document";
+    }
+  }
+  return {
+    hasDocument: documentCount > 0,
+    documentCount,
+    documentLabel,
+  };
+};
+
 const mapStoredChatSession = (
   safeUserId,
   session,
@@ -1387,6 +1510,7 @@ const mapStoredChatSession = (
     ? leadLookup.get(conversationId) || null
     : getLeadByConversation(safeUserId, conversationId);
   const lastReply = peekLastReplyMeta(session);
+  const documentMeta = peekSessionDocumentMeta(session);
   return {
     id: typeof session.id === "string" ? session.id : `${Date.now()}`,
     userId: safeUserId,
@@ -1411,6 +1535,9 @@ const mapStoredChatSession = (
     liveAgentEnabled: Boolean(session.liveAgentEnabled),
     lastReplyPreview: lastReply.lastReplyPreview,
     lastReplyRole: lastReply.lastReplyRole,
+    hasDocument: documentMeta.hasDocument,
+    documentCount: documentMeta.documentCount,
+    documentLabel: documentMeta.documentLabel,
     lead: lead
       ? {
           fieldLabels: Array.isArray(lead.fieldLabels) ? lead.fieldLabels : [],
@@ -1420,6 +1547,7 @@ const mapStoredChatSession = (
           updatedAt: typeof lead.updatedAt === "string" ? lead.updatedAt : null,
         }
       : null,
+    badgeId: typeof session.badgeId === "string" ? session.badgeId.trim().slice(0, 40) : "",
     createdAt: typeof session.createdAt === "string" ? session.createdAt : null,
     updatedAt: typeof session.updatedAt === "string" ? session.updatedAt : null,
   };
@@ -1489,7 +1617,46 @@ const updateLiveAgentMode = (userIdRaw, conversationIdRaw, enabled) => {
   return getTestChatSessionByConversation(safeUserId, safeConversationId);
 };
 
-const appendLiveAgentMessage = (userIdRaw, conversationIdRaw, messageTextRaw) => {
+const updateSessionBadge = (userIdRaw, conversationIdRaw, badgeIdRaw) => {
+  const safeUserId = sanitizeAgentDetailsUserId(
+    typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
+  );
+  const safeConversationId = sanitizeConversationId(
+    typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
+  );
+  if (!safeUserId || !safeConversationId) return null;
+
+  const settings = readWidgetSettings(safeUserId);
+  const allowedIds = new Set(
+    (Array.isArray(settings.conversationBadges) ? settings.conversationBadges : []).map(
+      (badge) => String(badge?.id || "").trim()
+    )
+  );
+  const requested =
+    typeof badgeIdRaw === "string" || typeof badgeIdRaw === "number"
+      ? String(badgeIdRaw).trim().slice(0, 40)
+      : "";
+  if (requested && !allowedIds.has(requested)) return null;
+
+  const store = readChatsStore(safeUserId);
+  const sessions = Array.isArray(store.sessions) ? store.sessions : [];
+  const index = sessions.findIndex(
+    (session) =>
+      String(session.userId || "") === safeUserId &&
+      String(session.conversationId || "") === safeConversationId
+  );
+  if (index < 0) return null;
+
+  sessions[index] = {
+    ...sessions[index],
+    badgeId: requested,
+    updatedAt: new Date().toISOString(),
+  };
+  writeChatsStore({ sessions: trimChatSessions(sessions) }, safeUserId);
+  return getTestChatSessionByConversation(safeUserId, safeConversationId);
+};
+
+const appendLiveAgentMessage = (userIdRaw, conversationIdRaw, messageTextRaw, options = {}) => {
   const safeUserId = sanitizeAgentDetailsUserId(
     typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
   );
@@ -1501,14 +1668,172 @@ const appendLiveAgentMessage = (userIdRaw, conversationIdRaw, messageTextRaw) =>
   const existing = getTestChatSessionByConversation(safeUserId, safeConversationId);
   if (!existing || !existing.liveAgentEnabled) return null;
 
-  const nextMessages = [
-    ...existing.messages,
-    { role: "agent", content: messageText, createdAt: new Date().toISOString() },
-  ];
+  const localId =
+    typeof options.localId === "string" && options.localId.trim()
+      ? options.localId.trim().slice(0, 80)
+      : `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  const record = {
+    role: "agent",
+    content: messageText,
+    createdAt: new Date().toISOString(),
+    localId,
+  };
+  const waId =
+    typeof options.whatsappMessageId === "string" ? options.whatsappMessageId.trim().slice(0, 200) : "";
+  if (waId) record.whatsappMessageId = waId;
+
+  const nextMessages = [...existing.messages, record];
   saveTestChatSession(safeUserId, safeConversationId, nextMessages, {
     liveAgentEnabled: true,
   });
+  return {
+    session: getTestChatSessionByConversation(safeUserId, safeConversationId),
+    localId,
+  };
+};
+
+const patchLiveAgentMessageWhatsappId = (
+  userIdRaw,
+  conversationIdRaw,
+  localIdRaw,
+  whatsappMessageIdRaw
+) => {
+  const safeUserId = sanitizeAgentDetailsUserId(
+    typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
+  );
+  const safeConversationId = sanitizeConversationId(
+    typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
+  );
+  const localId = typeof localIdRaw === "string" ? localIdRaw.trim() : "";
+  const whatsappMessageId =
+    typeof whatsappMessageIdRaw === "string" ? whatsappMessageIdRaw.trim().slice(0, 200) : "";
+  if (!safeUserId || !safeConversationId || !localId || !whatsappMessageId) return null;
+
+  const store = readChatsStore(safeUserId);
+  const sessions = Array.isArray(store.sessions) ? store.sessions : [];
+  const index = sessions.findIndex(
+    (session) =>
+      String(session.userId || "") === safeUserId &&
+      String(session.conversationId || "") === safeConversationId
+  );
+  if (index < 0) return null;
+
+  const messages = Array.isArray(sessions[index].messages) ? [...sessions[index].messages] : [];
+  const msgIndex = messages.findIndex((entry) => String(entry?.localId || "") === localId);
+  if (msgIndex < 0) return null;
+
+  messages[msgIndex] = { ...messages[msgIndex], whatsappMessageId };
+  sessions[index] = {
+    ...sessions[index],
+    messages,
+    messageCount: messages.length,
+    updatedAt: new Date().toISOString(),
+  };
+  writeChatsStore({ sessions: trimChatSessions(sessions) }, safeUserId);
   return getTestChatSessionByConversation(safeUserId, safeConversationId);
+};
+
+const findSessionMessageIndex = (messages, { messageIndex, localId }) => {
+  const list = Array.isArray(messages) ? messages : [];
+  const id = typeof localId === "string" ? localId.trim() : "";
+  if (id) {
+    const byLocal = list.findIndex((entry) => String(entry?.localId || "") === id);
+    if (byLocal >= 0) return byLocal;
+  }
+  const idx = Number(messageIndex);
+  if (Number.isInteger(idx) && idx >= 0 && idx < list.length) return idx;
+  return -1;
+};
+
+const editSessionOutboundMessage = (userIdRaw, conversationIdRaw, target, contentRaw) => {
+  const safeUserId = sanitizeAgentDetailsUserId(
+    typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
+  );
+  const safeConversationId = sanitizeConversationId(
+    typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
+  );
+  const content = typeof contentRaw === "string" ? contentRaw.trim() : "";
+  if (!safeUserId || !safeConversationId || !content) return null;
+
+  const store = readChatsStore(safeUserId);
+  const sessions = Array.isArray(store.sessions) ? store.sessions : [];
+  const sessionIndex = sessions.findIndex(
+    (session) =>
+      String(session.userId || "") === safeUserId &&
+      String(session.conversationId || "") === safeConversationId
+  );
+  if (sessionIndex < 0) return null;
+
+  const messages = Array.isArray(sessions[sessionIndex].messages)
+    ? [...sessions[sessionIndex].messages]
+    : [];
+  const msgIndex = findSessionMessageIndex(messages, target);
+  if (msgIndex < 0) return null;
+
+  const entry = messages[msgIndex];
+  if (!OUTBOUND_EDITABLE_ROLES.has(entry?.role)) return null;
+
+  messages[msgIndex] = {
+    ...entry,
+    content: content.slice(0, 16000),
+    editedAt: new Date().toISOString(),
+  };
+  sessions[sessionIndex] = {
+    ...sessions[sessionIndex],
+    messages,
+    messageCount: messages.length,
+    lastReplyPreview: messagePreviewFromRecord(messages[messages.length - 1] || {}),
+    updatedAt: new Date().toISOString(),
+  };
+  writeChatsStore({ sessions: trimChatSessions(sessions) }, safeUserId);
+  return {
+    session: getTestChatSessionByConversation(safeUserId, safeConversationId),
+    message: messages[msgIndex],
+    messageIndex: msgIndex,
+  };
+};
+
+const deleteSessionOutboundMessage = (userIdRaw, conversationIdRaw, target) => {
+  const safeUserId = sanitizeAgentDetailsUserId(
+    typeof userIdRaw === "string" ? userIdRaw : String(userIdRaw || "")
+  );
+  const safeConversationId = sanitizeConversationId(
+    typeof conversationIdRaw === "string" ? conversationIdRaw : String(conversationIdRaw || "")
+  );
+  if (!safeUserId || !safeConversationId) return null;
+
+  const store = readChatsStore(safeUserId);
+  const sessions = Array.isArray(store.sessions) ? store.sessions : [];
+  const sessionIndex = sessions.findIndex(
+    (session) =>
+      String(session.userId || "") === safeUserId &&
+      String(session.conversationId || "") === safeConversationId
+  );
+  if (sessionIndex < 0) return null;
+
+  const messages = Array.isArray(sessions[sessionIndex].messages)
+    ? [...sessions[sessionIndex].messages]
+    : [];
+  const msgIndex = findSessionMessageIndex(messages, target);
+  if (msgIndex < 0) return null;
+
+  const entry = messages[msgIndex];
+  if (!OUTBOUND_EDITABLE_ROLES.has(entry?.role)) return null;
+
+  const removed = messages.splice(msgIndex, 1)[0];
+  sessions[sessionIndex] = {
+    ...sessions[sessionIndex],
+    messages,
+    messageCount: messages.length,
+    lastReplyPreview: messagePreviewFromRecord(messages[messages.length - 1] || {}),
+    updatedAt: new Date().toISOString(),
+  };
+  writeChatsStore({ sessions: trimChatSessions(sessions) }, safeUserId);
+  return {
+    session: getTestChatSessionByConversation(safeUserId, safeConversationId),
+    removedMessage: removed,
+    messageIndex: msgIndex,
+  };
 };
 
 const resolveAgentDetailsPath = (userIdRaw) => {
@@ -1589,6 +1914,21 @@ const messagePreviewFromRecord = (record) => {
   const attachments = sanitizeMessageAttachments(record?.attachments);
   if (!attachments.length) return "";
   const first = attachments[0];
+  if (first.expired) {
+    if (first.kind === "image") {
+      return first.imageName ? `[Image expired: ${first.imageName}]` : "[Image expired]";
+    }
+    if (first.kind === "pdf") {
+      return first.pdfName ? `[PDF expired: ${first.pdfName}]` : "[PDF expired]";
+    }
+    if (first.kind === "video") {
+      return first.videoName ? `[Video expired: ${first.videoName}]` : "[Video expired]";
+    }
+    if (first.kind === "file") {
+      return first.fileName ? `[File expired: ${first.fileName}]` : "[File expired]";
+    }
+    return "[Media expired]";
+  }
   if (first.kind === "image") return first.imageName ? `[Image: ${first.imageName}]` : "[Image]";
   if (first.kind === "pdf") return first.pdfName ? `[PDF: ${first.pdfName}]` : "[PDF]";
   if (first.kind === "video") return first.videoName ? `[Video: ${first.videoName}]` : "[Video]";
@@ -1601,6 +1941,58 @@ const sanitizeMessageAttachments = (raw) => {
   const out = [];
   for (const item of raw) {
     if (out.length >= MAX_MESSAGE_ATTACHMENTS) break;
+    if (item?.expired === true) {
+      const productTitle =
+        typeof item.productTitle === "string" && item.productTitle.trim()
+          ? item.productTitle.trim().slice(0, 200)
+          : "";
+      if (item.kind === "image") {
+        const row = {
+          kind: "image",
+          imageName:
+            typeof item.imageName === "string" && item.imageName.trim()
+              ? item.imageName.trim().slice(0, 180)
+              : "Image",
+          expired: true,
+        };
+        if (productTitle) row.productTitle = productTitle;
+        out.push(row);
+      } else if (item.kind === "video") {
+        out.push({
+          kind: "video",
+          videoName:
+            typeof item.videoName === "string" && item.videoName.trim()
+              ? item.videoName.trim().slice(0, 180)
+              : "Video",
+          expired: true,
+        });
+      } else if (item.kind === "pdf") {
+        const row = {
+          kind: "pdf",
+          pdfName:
+            typeof item.pdfName === "string" && item.pdfName.trim()
+              ? item.pdfName.trim().slice(0, 180)
+              : "document.pdf",
+          expired: true,
+        };
+        if (productTitle) row.productTitle = productTitle;
+        out.push(row);
+      } else if (item.kind === "file") {
+        out.push({
+          kind: "file",
+          fileName:
+            typeof item.fileName === "string" && item.fileName.trim()
+              ? item.fileName.trim().slice(0, 180)
+              : "File",
+          mimeType:
+            typeof item.mimeType === "string" && item.mimeType.trim()
+              ? item.mimeType.trim().slice(0, 120)
+              : "application/octet-stream",
+          expired: true,
+        });
+      }
+      continue;
+    }
     if (item?.kind === "pdf") {
       const pdfName =
         typeof item.pdfName === "string" && item.pdfName.trim()
@@ -2095,6 +2487,8 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
     const aiRepliesEnabled = widgetSettings.aiRepliesEnabled !== false;
 
     cleaned = sanitizeChatMessages(parsedBody.messages);
+    const storageMessages = sanitizeSessionChatMessages(parsedBody.messages);
+    const skipUserPersist = Boolean(parsedBody.skipUserPersist);
     if (!cleaned.length) {
       return { kind: "validation_error", status: 400, message: "messages must be a non-empty array of { role: user|assistant, content }" };
     }
@@ -2134,11 +2528,16 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
     const existingSession = getTestChatSessionByConversation(userId, conversationId);
     const liveAgentEnabled = Boolean(existingSession?.liveAgentEnabled);
     if (liveAgentEnabled) {
-      const mergedMessages = mergeAgentMessagesPreservingOrder(existingSession?.messages, cleaned);
-      saveTestChatSession(userId, conversationId, mergedMessages, {
-        liveAgentEnabled: true,
-        ...sessionChannelOpts,
-      });
+      if (!skipUserPersist) {
+        const mergedMessages = mergeAgentMessagesPreservingOrder(
+          existingSession?.messages,
+          storageMessages
+        );
+        saveTestChatSession(userId, conversationId, mergedMessages, {
+          liveAgentEnabled: true,
+          ...sessionChannelOpts,
+        });
+      }
       return {
         kind: "live_agent",
         collectedData: lead?.collectedData || {},
@@ -2146,11 +2545,16 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
     }
 
     if (!aiRepliesEnabled) {
-      const mergedMessages = mergeAgentMessagesPreservingOrder(existingSession?.messages, cleaned);
-      saveTestChatSession(userId, conversationId, mergedMessages, {
-        liveAgentEnabled: false,
-        ...sessionChannelOpts,
-      });
+      if (!skipUserPersist) {
+        const mergedMessages = mergeAgentMessagesPreservingOrder(
+          existingSession?.messages,
+          storageMessages
+        );
+        saveTestChatSession(userId, conversationId, mergedMessages, {
+          liveAgentEnabled: false,
+          ...sessionChannelOpts,
+        });
+      }
       return {
         kind: "ai_disabled",
         collectedData: lead?.collectedData || {},
@@ -2159,10 +2563,12 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
 
     const apiKey = readEnvCredential("OPENAI_API_KEY");
     if (!apiKey) {
-      saveTestChatSession(userId, conversationId, cleaned, {
-        liveAgentEnabled: false,
-        ...sessionChannelOpts,
-      });
+      if (!skipUserPersist) {
+        saveTestChatSession(userId, conversationId, storageMessages, {
+          liveAgentEnabled: false,
+          ...sessionChannelOpts,
+        });
+      }
       return { kind: "openai_missing", message: "OpenAI is not configured on this server." };
     }
 
@@ -2190,10 +2596,13 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
       createdAt: new Date().toISOString(),
     };
     if (attachments.length) assistantRecord.attachments = attachments;
-    const mergedMessages = mergeAgentMessagesPreservingOrder(existingSession?.messages, [
-      ...cleaned,
-      assistantRecord,
-    ]);
+    const refreshedSession = getTestChatSessionByConversation(userId, conversationId);
+    const mergedMessages = skipUserPersist
+      ? appendUniqueSessionMessages(refreshedSession?.messages, [assistantRecord])
+      : mergeAgentMessagesPreservingOrder(refreshedSession?.messages, [
+          ...storageMessages,
+          assistantRecord,
+        ]);
     saveTestChatSession(userId, conversationId, mergedMessages, {
       liveAgentEnabled: false,
       ...sessionChannelOpts,
@@ -2205,9 +2614,14 @@ const completeWorkspaceChatTurn = async (parsedBody) => {
       collectedData: lead?.collectedData || {},
     };
   } catch (err) {
-    if (cleaned.length) {
+    if (cleaned.length && !parsedBody.skipUserPersist) {
       try {
-        saveTestChatSession(userId, conversationId, cleaned, {
+        const existingSession = getTestChatSessionByConversation(userId, conversationId);
+        const mergedMessages = mergeAgentMessagesPreservingOrder(
+          existingSession?.messages,
+          sanitizeSessionChatMessages(parsedBody.messages)
+        );
+        saveTestChatSession(userId, conversationId, mergedMessages, {
           liveAgentEnabled: false,
           ...sessionChannelOpts,
         });
@@ -2235,7 +2649,7 @@ const whatsappBridge = createWhatsAppBridge({
   sanitizeChatMessages,
   sanitizeMessageAttachments,
   saveTestChatSession,
-  mergeAgentMessagesPreservingOrder,
+  appendUniqueSessionMessages,
   onAccountLinkedViaQr: (workspaceUserId, accountId, accountDetails = {}) => {
     appendWhatsAppLinkLog(workspaceUserId, {
       accountId,
@@ -2247,6 +2661,42 @@ const whatsappBridge = createWhatsAppBridge({
 });
 
 void whatsappBridge.warmupForRestore();
+
+let whatsappAutoRestoreStarted = false;
+
+function kickOffWhatsAppAutoRestore() {
+  if (whatsappAutoRestoreStarted) return;
+  whatsappAutoRestoreStarted = true;
+  whatsappAutoStart.syncFromSessionFolders();
+  const restartLinks = whatsappAutoStart.readRestoreLinks();
+  if (restartLinks.length === 0) return;
+  const envConcurrency = Number(process.env.WHATSAPP_RESTORE_CONCURRENCY);
+  const concurrency =
+    Number.isFinite(envConcurrency) && envConcurrency > 0
+      ? envConcurrency
+      : Math.min(restartLinks.length, 1);
+  console.log(
+    `[whatsapp] auto-connect: restoring ${restartLinks.length} WhatsApp client(s) immediately (concurrency=${concurrency})…`
+  );
+  void (async () => {
+    const results = await whatsappBridge.restorePersistedConnections(restartLinks, {
+      concurrency,
+      retryDelayMs: 500,
+      boot: true,
+    });
+    const restored = results.filter((r) => r.ok).length;
+    const failed = results.filter((r) => !r.ok);
+    console.log(`[whatsapp] auto-connect: ${restored}/${results.length} session(s) ready`);
+    failed.forEach((r) => {
+      console.warn(
+        `[whatsapp] auto-connect failed: ${r.userId}::${r.accountId}`,
+        r.reason || "unknown"
+      );
+    });
+  })();
+}
+
+kickOffWhatsAppAutoRestore();
 
 const enrichWhatsappSessionPeerPhones = async (userIdRaw, sessions) => {
   const safeUserId = sanitizeAgentDetailsUserId(
@@ -2403,7 +2853,10 @@ const server = http.createServer((req, res) => {
       reqPath === "/logs/whatsapp-disconnects" ||
       reqPath === "/chat/test" ||
       reqPath === "/chat/test/live-agent" ||
+      reqPath === "/chat/test/session-badge" ||
       reqPath === "/chat/test/live-message" ||
+      reqPath === "/chat/test/message-edit" ||
+      reqPath === "/chat/test/message-delete" ||
       reqPath === "/chat/test/session" ||
       reqPath === "/chat/test/sessions" ||
       reqPath.startsWith("/admin/accounts/") ||
@@ -2899,6 +3352,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "POST" && reqPath === "/chat/test/session-badge") {
+    parseJsonBody(
+      req,
+      (parsedBody) => {
+        const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
+        const conversationId =
+          typeof parsedBody.conversationId === "string" ? parsedBody.conversationId : "";
+        const badgeId =
+          typeof parsedBody.badgeId === "string" || typeof parsedBody.badgeId === "number"
+            ? String(parsedBody.badgeId)
+            : "";
+        const session = updateSessionBadge(userId, conversationId, badgeId);
+        if (!session) {
+          return sendJson(
+            res,
+            404,
+            { message: "Conversation or badge not found" },
+            adminCorsHeaders
+          );
+        }
+        return sendJson(res, 200, { session }, adminCorsHeaders);
+      },
+      () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
+    );
+    return;
+  }
+
   if (req.method === "POST" && reqPath === "/chat/test/live-message") {
     parseJsonBody(
       req,
@@ -2909,8 +3389,8 @@ const server = http.createServer((req, res) => {
             const conversationId =
               typeof parsedBody.conversationId === "string" ? parsedBody.conversationId : "";
             const message = typeof parsedBody.message === "string" ? parsedBody.message : "";
-            let session = appendLiveAgentMessage(userId, conversationId, message);
-            if (!session) {
+            const appendResult = appendLiveAgentMessage(userId, conversationId, message);
+            if (!appendResult?.session) {
               return sendJson(
                 res,
                 404,
@@ -2918,6 +3398,8 @@ const server = http.createServer((req, res) => {
                 adminCorsHeaders
               );
             }
+            let session = appendResult.session;
+            const localId = appendResult.localId;
 
             let whatsappDelivery = null;
             if (sanitizeChatSource(session.chatSource) === "whatsapp") {
@@ -2952,6 +3434,15 @@ const server = http.createServer((req, res) => {
                   message,
                   { peerPhone: waPeerPhone }
                 );
+                if (whatsappDelivery?.ok && whatsappDelivery.messageId && localId) {
+                  session =
+                    patchLiveAgentMessageWhatsappId(
+                      userId,
+                      conversationId,
+                      localId,
+                      whatsappDelivery.messageId
+                    ) || session;
+                }
               } else {
                 whatsappDelivery = {
                   ok: false,
@@ -2978,6 +3469,192 @@ const server = http.createServer((req, res) => {
             return sendJson(res, 200, payload, adminCorsHeaders);
           } catch (err) {
             const message = err instanceof Error ? err.message : "Could not send live agent reply";
+            return sendJson(res, 500, { message }, adminCorsHeaders);
+          }
+        })();
+      },
+      () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
+    );
+    return;
+  }
+
+  if (req.method === "POST" && reqPath === "/chat/test/message-edit") {
+    parseJsonBody(
+      req,
+      (parsedBody) => {
+        void (async () => {
+          try {
+            const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
+            const conversationId =
+              typeof parsedBody.conversationId === "string" ? parsedBody.conversationId : "";
+            const content = typeof parsedBody.content === "string" ? parsedBody.content : "";
+            const localId = typeof parsedBody.localId === "string" ? parsedBody.localId : "";
+            const messageIndex =
+              parsedBody.messageIndex != null ? Number(parsedBody.messageIndex) : NaN;
+
+            const existing = getTestChatSessionByConversation(userId, conversationId);
+            if (!existing) {
+              return sendJson(res, 404, { message: "Conversation not found" }, adminCorsHeaders);
+            }
+
+            const msgIndex = findSessionMessageIndex(existing.messages, { localId, messageIndex });
+            if (msgIndex < 0) {
+              return sendJson(res, 404, { message: "Message not found" }, adminCorsHeaders);
+            }
+            const targetMessage = existing.messages[msgIndex];
+            if (!OUTBOUND_EDITABLE_ROLES.has(targetMessage?.role)) {
+              return sendJson(
+                res,
+                403,
+                { message: "Only sent outbound messages can be edited" },
+                adminCorsHeaders
+              );
+            }
+
+            let whatsappSync = null;
+            const waMessageId =
+              typeof targetMessage?.whatsappMessageId === "string"
+                ? targetMessage.whatsappMessageId.trim()
+                : "";
+            if (sanitizeChatSource(existing.chatSource) === "whatsapp" && waMessageId) {
+              const waAccountId =
+                typeof existing.whatsappAccountId === "string"
+                  ? sanitizeWhatsAppAccountId(existing.whatsappAccountId) || "1"
+                  : "1";
+              whatsappSync = await whatsappBridge.editWhatsAppMessage(
+                userId,
+                waAccountId,
+                waMessageId,
+                content
+              );
+              if (!whatsappSync?.ok) {
+                return sendJson(
+                  res,
+                  502,
+                  {
+                    message:
+                      whatsappSync?.message ||
+                      "Could not edit the message on WhatsApp for the customer.",
+                    whatsappSync,
+                  },
+                  adminCorsHeaders
+                );
+              }
+            }
+
+            const result = editSessionOutboundMessage(
+              userId,
+              conversationId,
+              { localId, messageIndex: msgIndex },
+              content
+            );
+            if (!result?.session) {
+              return sendJson(res, 400, { message: "Could not update message" }, adminCorsHeaders);
+            }
+            return sendJson(
+              res,
+              200,
+              {
+                session: result.session,
+                message: result.message,
+                whatsappSynced: Boolean(whatsappSync?.ok),
+                whatsappSync,
+              },
+              adminCorsHeaders
+            );
+          } catch (err) {
+            const message = err instanceof Error ? err.message : "Could not edit message";
+            return sendJson(res, 500, { message }, adminCorsHeaders);
+          }
+        })();
+      },
+      () => sendJson(res, 400, { message: "Invalid JSON body" }, adminCorsHeaders)
+    );
+    return;
+  }
+
+  if (req.method === "POST" && reqPath === "/chat/test/message-delete") {
+    parseJsonBody(
+      req,
+      (parsedBody) => {
+        void (async () => {
+          try {
+            const userId = typeof parsedBody.userId === "string" ? parsedBody.userId : "";
+            const conversationId =
+              typeof parsedBody.conversationId === "string" ? parsedBody.conversationId : "";
+            const localId = typeof parsedBody.localId === "string" ? parsedBody.localId : "";
+            const messageIndex =
+              parsedBody.messageIndex != null ? Number(parsedBody.messageIndex) : NaN;
+
+            const existing = getTestChatSessionByConversation(userId, conversationId);
+            if (!existing) {
+              return sendJson(res, 404, { message: "Conversation not found" }, adminCorsHeaders);
+            }
+
+            const msgIndex = findSessionMessageIndex(existing.messages, { localId, messageIndex });
+            if (msgIndex < 0) {
+              return sendJson(res, 404, { message: "Message not found" }, adminCorsHeaders);
+            }
+            const targetMessage = existing.messages[msgIndex];
+            if (!OUTBOUND_EDITABLE_ROLES.has(targetMessage?.role)) {
+              return sendJson(
+                res,
+                403,
+                { message: "Only sent outbound messages can be deleted" },
+                adminCorsHeaders
+              );
+            }
+
+            let whatsappSync = null;
+            const waMessageId =
+              typeof targetMessage?.whatsappMessageId === "string"
+                ? targetMessage.whatsappMessageId.trim()
+                : "";
+            if (sanitizeChatSource(existing.chatSource) === "whatsapp" && waMessageId) {
+              const waAccountId =
+                typeof existing.whatsappAccountId === "string"
+                  ? sanitizeWhatsAppAccountId(existing.whatsappAccountId) || "1"
+                  : "1";
+              whatsappSync = await whatsappBridge.deleteWhatsAppMessage(
+                userId,
+                waAccountId,
+                waMessageId,
+                { everyone: true }
+              );
+              if (!whatsappSync?.ok) {
+                return sendJson(
+                  res,
+                  502,
+                  {
+                    message:
+                      whatsappSync?.message ||
+                      "Could not delete the message on WhatsApp for the customer.",
+                    whatsappSync,
+                  },
+                  adminCorsHeaders
+                );
+              }
+            }
+
+            const result = deleteSessionOutboundMessage(userId, conversationId, {
+              localId,
+              messageIndex: msgIndex,
+            });
+            if (!result?.session) {
+              return sendJson(res, 400, { message: "Could not delete message" }, adminCorsHeaders);
+            }
+            return sendJson(
+              res,
+              200,
+              {
+                session: result.session,
+                whatsappSynced: Boolean(whatsappSync?.ok),
+                whatsappSync,
+              },
+              adminCorsHeaders
+            );
+          } catch (err) {
+            const message = err instanceof Error ? err.message : "Could not delete message";
             return sendJson(res, 500, { message }, adminCorsHeaders);
           }
         })();
@@ -3291,32 +3968,24 @@ server.listen(PORT, () => {
   ensureAccountsFile();
   ensureLoginHistoryFile();
   console.log(`Server listening on http://localhost:${PORT}`);
-  whatsappAutoStart.syncFromSessionFolders();
-  const restartLinks = whatsappAutoStart.readRestoreLinks();
-  if (restartLinks.length === 0) return;
-  console.log(
-    `[whatsapp] auto-connect: restoring ${restartLinks.length} WhatsApp client(s) (saved sessions + disk)…`
-  );
-  void (async () => {
-    const results = await whatsappBridge.restorePersistedConnections(restartLinks, {
-      concurrency: 2,
-    });
-    const restored = results.filter((r) => r.ok).length;
-    const failed = results.filter((r) => !r.ok);
-    console.log(`[whatsapp] auto-connect: ${restored}/${results.length} session(s) ready`);
-    failed.forEach((r) => {
-      console.warn(
-        `[whatsapp] auto-connect failed: ${r.userId}::${r.accountId}`,
-        r.reason || "unknown"
-      );
-    });
-  })();
+  scheduleChatMediaPurge({
+    dataDir: DATA_DIR,
+    readAccounts,
+    readChatsStore,
+    writeChatsStore,
+    legacyChatsPath: CHATS_PATH,
+  });
 });
 
 async function gracefulShutdown(signal) {
   console.log(`[server] ${signal} received, shutting down WhatsApp clients…`);
   try {
-    await whatsappBridge.shutdownAll();
+    await Promise.race([
+      whatsappBridge.shutdownAll(),
+      new Promise((resolve) => setTimeout(resolve, 15000)),
+    ]);
+    // Extra beat so Chrome can flush LocalAuth profile data to disk.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
   } catch {
     /* ignore */
   }

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, MessageSquareDot, MoreVertical, Search, Send } from "lucide-react";
+import { ChevronLeft, FileText, MessageSquareDot, MoreVertical, Pencil, Search, Send, Trash2 } from "lucide-react";
 import { useLocation } from "react-router-dom";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
@@ -7,11 +7,17 @@ import { AssistantAttachments } from "../components/AssistantAttachments";
 import { MessageText } from "../components/MessageText";
 import {
   CHATS_ACTIVE_THREAD_POLL_MS,
-  CHATS_OPERATOR_POLL_FAST_MS,
   CHATS_OPERATOR_POLL_MS,
+  CHATS_WA_CONNECTED_POLL_MS,
   CHATS_WA_STATUS_POLL_MS,
   formatMessageTimestamp,
 } from "../chatSessionMessages";
+import {
+  NOT_ALLOCATED_BADGE_LABEL,
+  badgePillStyle,
+  findConversationBadge,
+  normalizeConversationBadges,
+} from "../conversationBadges";
 
 function formatConversationTime(iso) {
   const date = Date.parse(String(iso || ""));
@@ -55,14 +61,28 @@ function getAccountFilterKey(session) {
   return `whatsapp:${accountId || "1"}`;
 }
 
-/** Hide WhatsApp group threads — inbox is personal chats only. */
+/** Hide WhatsApp group / channel / status threads — inbox is personal chats only. */
 function isWhatsAppGroupSession(session) {
   if (normalizeChatSource(session) !== "whatsapp") return false;
   const chatId = typeof session?.whatsappChatId === "string" ? session.whatsappChatId.trim() : "";
-  if (chatId.toLowerCase().endsWith("@g.us")) return true;
+  const chatLower = chatId.toLowerCase();
+  if (
+    chatLower.endsWith("@g.us") ||
+    chatLower.endsWith("@broadcast") ||
+    chatLower.endsWith("@newsletter") ||
+    chatLower === "status@broadcast"
+  ) {
+    return true;
+  }
   const conversationId =
     typeof session?.conversationId === "string" ? session.conversationId.trim() : "";
-  return conversationId.toLowerCase().endsWith("_g_us");
+  const convLower = conversationId.toLowerCase();
+  return (
+    convLower.endsWith("_g_us") ||
+    convLower.endsWith("_broadcast") ||
+    convLower.endsWith("_newsletter") ||
+    convLower.includes("status_broadcast")
+  );
 }
 
 function whatsAppAccountLabel(account) {
@@ -86,6 +106,124 @@ const SOURCE_BADGE_CLASS = {
   web: "bg-sky-100 text-sky-800 ring-1 ring-sky-200/80",
   whatsapp: "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-200/80",
 };
+
+function ConversationBadgeButton({ badge, onClick, className = "" }) {
+  const allocated = Boolean(badge?.id);
+  const label = allocated ? badge.label : NOT_ALLOCATED_BADGE_LABEL;
+  const style = badgePillStyle(badge?.color, { allocated });
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex max-w-full items-center rounded-md border px-1.5 py-0.5 text-[10px] font-semibold transition hover:opacity-90 ${className}`}
+      style={style}
+      title="Assign badge"
+    >
+      <span className="truncate">{label}</span>
+    </button>
+  );
+}
+
+function ConversationDocumentIndicator({ documentCount, documentLabel, className = "" }) {
+  if (!documentCount) return null;
+  const countLabel =
+    documentCount > 1 ? `${documentCount} documents` : documentLabel || "Document";
+  return (
+    <span
+      className={`inline-flex max-w-full items-center gap-1 rounded-md border border-amber-200/90 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 ${className}`}
+      title={documentLabel || countLabel}
+    >
+      <FileText size={11} strokeWidth={2.25} className="shrink-0" aria-hidden />
+      <span className="truncate">{countLabel}</span>
+    </span>
+  );
+}
+
+function BadgePickerModal({ open, badges, currentBadgeId, saving, onClose, onSelect }) {
+  if (!open) return null;
+  const selectedId = String(currentBadgeId || "").trim();
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="badge-picker-title"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm rounded-2xl border border-[#E9D5FF] bg-white p-5 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 id="badge-picker-title" className="text-lg font-bold text-slate-900">
+          Assign badge
+        </h2>
+        <p className="mt-1 text-sm text-slate-500">Choose one badge for this conversation.</p>
+        <ul className="mt-4 max-h-72 space-y-2 overflow-y-auto">
+          <li>
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => onSelect("")}
+              className={`flex w-full items-center justify-between rounded-xl border px-3 py-2.5 text-left text-sm transition ${
+                !selectedId
+                  ? "border-[#8B5CF6] bg-[#F6F1FF] font-semibold text-slate-900"
+                  : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+              }`}
+            >
+              <span
+                className="inline-flex rounded-md border px-2 py-0.5 text-[11px] font-semibold"
+                style={badgePillStyle(null, { allocated: false })}
+              >
+                {NOT_ALLOCATED_BADGE_LABEL}
+              </span>
+              {!selectedId ? <span className="text-xs text-[#7C3AED]">Selected</span> : null}
+            </button>
+          </li>
+          {badges.map((badge) => {
+            const isSelected = selectedId === badge.id;
+            return (
+              <li key={badge.id}>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => onSelect(badge.id)}
+                  className={`flex w-full items-center justify-between rounded-xl border px-3 py-2.5 text-left text-sm transition ${
+                    isSelected
+                      ? "border-[#8B5CF6] bg-[#F6F1FF] font-semibold text-slate-900"
+                      : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+                  }`}
+                >
+                  <span
+                    className="inline-flex rounded-md border px-2 py-0.5 text-[11px] font-semibold"
+                    style={badgePillStyle(badge.color, { allocated: true })}
+                  >
+                    {badge.label}
+                  </span>
+                  {isSelected ? <span className="text-xs text-[#7C3AED]">Selected</span> : null}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+        {!badges.length ? (
+          <p className="mt-3 text-xs text-slate-500">
+            No custom badges yet. Add badges in Settings first.
+          </p>
+        ) : null}
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={saving}
+            className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function pickVisitorNameFromCollected(collected) {
   if (!collected || typeof collected !== "object") return "";
@@ -238,13 +376,20 @@ function toThreadMessages(rawMessages) {
       const createdAtMs = Date.parse(String(item.createdAt || ""));
       const text = typeof item.content === "string" ? item.content : "";
       const createdAt = Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : "";
+      const localId = typeof item.localId === "string" ? item.localId.trim() : "";
       return {
-        id: `${idx}-${item.role}-${createdAt || "t"}-${text.slice(0, 24)}`,
+        id: localId || `${idx}-${item.role}-${createdAt || "t"}-${text.slice(0, 24)}`,
+        messageIndex: idx,
+        localId,
+        whatsappMessageId:
+          typeof item.whatsappMessageId === "string" ? item.whatsappMessageId.trim() : "",
         role: item.role,
         text,
         attachments: Array.isArray(item.attachments) ? item.attachments : [],
         createdAt,
+        editedAt: typeof item.editedAt === "string" ? item.editedAt : "",
         deliveryStatus: item.role === "agent" ? "sent" : undefined,
+        canModify: item.role === "agent" || item.role === "assistant" || item.role === "main_account",
       };
     })
     .filter((item) => item.text.trim().length > 0 || item.attachments.length > 0);
@@ -265,9 +410,15 @@ function Chats() {
   const [error, setError] = useState("");
   const [liveDraft, setLiveDraft] = useState("");
   const [liveSaving, setLiveSaving] = useState(false);
+  const [messageActionSaving, setMessageActionSaving] = useState(false);
+  const [editingMessage, setEditingMessage] = useState(null);
+  const [editDraft, setEditDraft] = useState("");
   /** Optimistic live-agent bubbles shown while WhatsApp/API delivery is in flight. */
   const [pendingLiveMessages, setPendingLiveMessages] = useState([]);
   const [listHoverPreview, setListHoverPreview] = useState(null);
+  const [conversationBadges, setConversationBadges] = useState([]);
+  const [badgePicker, setBadgePicker] = useState(null);
+  const [badgeSaving, setBadgeSaving] = useState(false);
   /** conversationId → fingerprint of the last live-agent customer message the operator has opened. */
   const [seenLiveFingerprints, setSeenLiveFingerprints] = useState({});
   const syncedOnLoadRef = useRef(false);
@@ -279,22 +430,33 @@ function Chats() {
   const liveInputRef = useRef(null);
   const pendingLiveDraftCursorRef = useRef(null);
 
-  const needsFastRefresh = useMemo(
-    () =>
+  const needsFastRefresh = useMemo(() => {
+    const waConnected =
+      (Number(waStatus?.connectedCount) || 0) > 0 ||
+      (Array.isArray(waStatus?.accounts) &&
+        waStatus.accounts.some((account) => account.connected || account.phase === "ready"));
+    return (
+      waConnected ||
       sessions.some(
         (session) =>
           Boolean(session?.liveAgentEnabled) ||
           String(session?.chatSource || "").toLowerCase() === "whatsapp"
-      ),
-    [sessions]
-  );
+      )
+    );
+  }, [sessions, waStatus]);
 
   const mergeSessionSummary = (prev, list) => {
     const prevById = new Map(prev.map((session) => [session.id, session]));
+    const prevByConversationId = new Map(
+      prev.map((session) => [String(session.conversationId || ""), session])
+    );
     return list.map((session) => {
-      const existing = prevById.get(session.id);
+      const existing =
+        prevById.get(session.id) ||
+        prevByConversationId.get(String(session.conversationId || "")) ||
+        null;
       if (!existing) return session;
-      // Keep already-hydrated thread messages when the list poll is summary-only.
+      // Keep hydrated thread bodies when the list poll is summary-only.
       if (!Array.isArray(session.messages) && Array.isArray(existing.messages)) {
         return {
           ...existing,
@@ -371,11 +533,33 @@ function Chats() {
     };
   }, [userId, conversationIdFromNav]);
 
+  useEffect(() => {
+    let active = true;
+    async function loadBadges() {
+      if (!userId) {
+        if (active) setConversationBadges([]);
+        return;
+      }
+      try {
+        const res = await fetch(apiUrl(`/widget-settings?userId=${encodeURIComponent(userId)}`));
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !active) return;
+        setConversationBadges(normalizeConversationBadges(data?.settings?.conversationBadges));
+      } catch {
+        if (active) setConversationBadges([]);
+      }
+    }
+    void loadBadges();
+    return () => {
+      active = false;
+    };
+  }, [userId]);
+
   // Poll session list separately so changing poll speed never re-triggers the loading spinner.
   useEffect(() => {
     if (!userId) return undefined;
     let active = true;
-    const pollMs = needsFastRefresh ? CHATS_OPERATOR_POLL_FAST_MS : CHATS_OPERATOR_POLL_MS;
+    const pollMs = needsFastRefresh ? CHATS_WA_CONNECTED_POLL_MS : CHATS_OPERATOR_POLL_MS;
 
     async function refreshList() {
       try {
@@ -511,18 +695,16 @@ function Chats() {
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) return;
-        if (Number(data?.created) > 0) {
-          const sessionsRes = await fetch(
-            apiUrl(
-              `/chat/test/sessions?userId=${encodeURIComponent(userId)}&summary=1`
-            )
-          );
-          const payload = await sessionsRes.json().catch(() => ({}));
-          const list = (Array.isArray(payload.sessions) ? payload.sessions : []).filter(
-            (session) => !isWhatsAppGroupSession(session)
-          );
-          if (list.length) setSessions((prev) => mergeSessionSummary(prev, list));
-        }
+        const sessionsRes = await fetch(
+          apiUrl(
+            `/chat/test/sessions?userId=${encodeURIComponent(userId)}&summary=1`
+          )
+        );
+        const payload = await sessionsRes.json().catch(() => ({}));
+        const list = (Array.isArray(payload.sessions) ? payload.sessions : []).filter(
+          (session) => !isWhatsAppGroupSession(session)
+        );
+        if (list.length) setSessions((prev) => mergeSessionSummary(prev, list));
       } catch {
         /* ignore background sync errors */
       }
@@ -572,6 +754,12 @@ function Chats() {
       const lastSender = lastMessageSenderLabel(lastRole, displayName);
       const conversationId =
         typeof session.conversationId === "string" ? session.conversationId.trim() : "";
+      const badgeId = typeof session.badgeId === "string" ? session.badgeId.trim() : "";
+      const assignedBadge = findConversationBadge(badgeId, conversationBadges);
+      const documentCount = Number(session.documentCount) || 0;
+      const documentLabel =
+        typeof session.documentLabel === "string" ? session.documentLabel.trim() : "";
+      const hasDocument = Boolean(session.hasDocument) || documentCount > 0;
       const sessionId = session.id || `session-${idx}`;
       const fingerprint = liveAgentMessageFingerprint(session, lastRole);
       const isSelected = sessionId === selectedId;
@@ -592,6 +780,12 @@ function Chats() {
         time: formatConversationTime(session.updatedAt || session.createdAt),
         sourceLabel,
         sourceKey: sessionSourceStyleKey(session),
+        conversationId,
+        badgeId,
+        assignedBadge,
+        hasDocument,
+        documentCount,
+        documentLabel,
         hasNewMessage,
       };
     });
@@ -603,9 +797,11 @@ function Chats() {
         c.whatsappNumber.toLowerCase().includes(q) ||
         c.preview.toLowerCase().includes(q) ||
         c.lastSender.toLowerCase().includes(q) ||
-        c.sourceLabel.toLowerCase().includes(q)
+        c.sourceLabel.toLowerCase().includes(q) ||
+        (c.assignedBadge?.label || NOT_ALLOCATED_BADGE_LABEL).toLowerCase().includes(q) ||
+        (c.hasDocument && (c.documentLabel || "document").toLowerCase().includes(q))
     );
-  }, [query, accountFilteredSessions, seenLiveFingerprints, selectedId]);
+  }, [query, accountFilteredSessions, seenLiveFingerprints, selectedId, conversationBadges]);
 
   const active = selectedId ? filtered.find((c) => c.id === selectedId) ?? null : null;
   const activeSession = sessions.find((session) => session.id === active?.id) ?? null;
@@ -665,6 +861,41 @@ function Chats() {
   };
 
   const backToList = () => setMobileShowThread(false);
+
+  const openBadgePicker = (conversationId, badgeId) => {
+    if (!conversationId) return;
+    setBadgePicker({ conversationId, badgeId: String(badgeId || "").trim() });
+  };
+
+  const assignConversationBadge = async (badgeId) => {
+    if (!badgePicker?.conversationId || !userId || badgeSaving) return;
+    setBadgeSaving(true);
+    setError("");
+    try {
+      const res = await fetch(apiUrl("/chat/test/session-badge"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          conversationId: badgePicker.conversationId,
+          badgeId: badgeId || "",
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || "Could not update badge");
+      const updated = data?.session;
+      if (updated?.id) {
+        setSessions((prev) =>
+          prev.map((session) => (session.id === updated.id ? { ...session, ...updated } : session))
+        );
+      }
+      setBadgePicker(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update badge");
+    } finally {
+      setBadgeSaving(false);
+    }
+  };
 
   const toggleLiveAgent = async (enabled) => {
     if (!activeSession || !userId) return;
@@ -769,12 +1000,117 @@ function Chats() {
     void sendLiveMessage();
   };
 
+  const startEditMessage = (message) => {
+    if (!message?.canModify || messageActionSaving) return;
+    setEditingMessage({
+      localId: message.localId,
+      messageIndex: message.messageIndex,
+    });
+    setEditDraft(message.text);
+  };
+
+  const cancelEditMessage = () => {
+    setEditingMessage(null);
+    setEditDraft("");
+  };
+
+  const saveEditMessage = async () => {
+    if (!activeSession || !userId || !editingMessage || messageActionSaving) return;
+    const content = editDraft.trim();
+    if (!content) return;
+    setMessageActionSaving(true);
+    setError("");
+    try {
+      const res = await fetch(apiUrl("/chat/test/message-edit"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          conversationId: activeSession.conversationId,
+          localId: editingMessage.localId || undefined,
+          messageIndex: editingMessage.messageIndex,
+          content,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.message || "Could not edit message");
+      }
+      const updated = data?.session;
+      if (updated?.id) {
+        setSessions((prev) =>
+          prev.map((session) => (session.id === updated.id ? updated : session))
+        );
+      }
+      cancelEditMessage();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not edit message");
+    } finally {
+      setMessageActionSaving(false);
+    }
+  };
+
+  const deleteMessage = async (message) => {
+    if (!activeSession || !userId || !message?.canModify || messageActionSaving) return;
+    const label = message.role === "agent" ? "live agent message" : "message";
+    if (!window.confirm(`Delete this ${label}? This will also remove it on the customer's WhatsApp when possible.`)) {
+      return;
+    }
+    setMessageActionSaving(true);
+    setError("");
+    try {
+      const res = await fetch(apiUrl("/chat/test/message-delete"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          conversationId: activeSession.conversationId,
+          localId: message.localId || undefined,
+          messageIndex: message.messageIndex,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.message || "Could not delete message");
+      }
+      const updated = data?.session;
+      if (updated?.id) {
+        setSessions((prev) =>
+          prev.map((session) => (session.id === updated.id ? updated : session))
+        );
+      }
+      if (
+        editingMessage &&
+        editingMessage.messageIndex === message.messageIndex &&
+        (editingMessage.localId ? editingMessage.localId === message.localId : true)
+      ) {
+        cancelEditMessage();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete message");
+    } finally {
+      setMessageActionSaving(false);
+    }
+  };
+
+  const handleEditDraftKeyDown = (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEditMessage();
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void saveEditMessage();
+    }
+  };
+
   return (
     <div className="flex min-h-[420px] w-full flex-1 flex-col xl:h-full xl:min-h-0">
-      <div className="grid min-h-[360px] flex-1 grid-cols-1 overflow-hidden rounded-3xl border border-[#F0E9FF] bg-white shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0 lg:grid-cols-[minmax(260px,34%)_1fr]">
-        {/* Conversation list */}
+      <div className="grid min-h-[360px] flex-1 grid-cols-1 overflow-hidden rounded-3xl border border-[#F0E9FF] bg-white shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0 lg:grid-cols-[380px_minmax(0,1fr)]">
+        {/* Conversation list — fixed 380px on desktop so width never shifts */}
         <section
-          className={`flex min-h-0 flex-1 flex-col border-[#EEE8FF] lg:border-r ${
+          className={`flex min-h-0 w-full flex-col overflow-hidden border-[#EEE8FF] lg:w-[380px] lg:max-w-[380px] lg:shrink-0 lg:border-r ${
             mobileShowThread ? "hidden lg:flex" : "flex"
           }`}
         >
@@ -923,7 +1259,7 @@ function Chats() {
                             {c.preview}
                           </span>
                         </div>
-                        <div className="mt-1 flex items-center gap-2">
+                        <div className="mt-1 flex flex-wrap items-center gap-2">
                           <span
                             className={`rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${
                               SOURCE_BADGE_CLASS[c.sourceKey] || SOURCE_BADGE_CLASS.test_bot
@@ -931,6 +1267,19 @@ function Chats() {
                           >
                             {c.sourceLabel}
                           </span>
+                          <ConversationBadgeButton
+                            badge={c.assignedBadge}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openBadgePicker(c.conversationId, c.badgeId);
+                            }}
+                          />
+                          {c.hasDocument ? (
+                            <ConversationDocumentIndicator
+                              documentCount={c.documentCount}
+                              documentLabel={c.documentLabel}
+                            />
+                          ) : null}
                         </div>
                       </div>
                     </button>
@@ -959,7 +1308,7 @@ function Chats() {
 
         {/* Thread */}
         <section
-          className={`flex min-h-0 flex-1 flex-col bg-[#FCFAFF]/60 ${
+          className={`flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[#FCFAFF]/60 ${
             mobileShowThread ? "flex" : "hidden lg:flex"
           }`}
         >
@@ -992,6 +1341,18 @@ function Chats() {
                     >
                       {active.sourceLabel}
                     </span>
+                    <ConversationBadgeButton
+                      badge={active.assignedBadge}
+                      className="mr-1.5 align-middle"
+                      onClick={() => openBadgePicker(active.conversationId, active.badgeId)}
+                    />
+                    {active.hasDocument ? (
+                      <ConversationDocumentIndicator
+                        documentCount={active.documentCount}
+                        documentLabel={active.documentLabel}
+                        className="mr-1.5 align-middle"
+                      />
+                    ) : null}
                     · {messages.length} messages
                   </p>
                 </div>
@@ -1055,7 +1416,14 @@ function Chats() {
                   const isMainAccount = m.role === "main_account";
                   const isPending = isLiveAgent && m.deliveryStatus === "pending";
                   const isSent = isLiveAgent && m.deliveryStatus === "sent";
+                  const isEditing =
+                    editingMessage &&
+                    editingMessage.messageIndex === m.messageIndex &&
+                    (editingMessage.localId
+                      ? editingMessage.localId === m.localId
+                      : true);
                   const timeLabel = formatMessageTimestamp(m.createdAt);
+                  const editedLabel = m.editedAt ? formatMessageTimestamp(m.editedAt) : "";
                   const senderLabel = isMainAccount
                     ? "Main Account"
                     : isLiveAgent
@@ -1064,10 +1432,10 @@ function Chats() {
                   return (
                     <div
                       key={m.id}
-                      className={`flex ${isCustomer ? "justify-start" : "justify-end"}`}
+                      className={`group/msg flex ${isCustomer ? "justify-start" : "justify-end"}`}
                     >
                       <div
-                        className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm shadow-sm ${
+                        className={`relative max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm shadow-sm ${
                           isCustomer
                             ? "rounded-bl-md bg-gradient-to-br from-[#8B5CF6] to-[#7C3AED] text-white"
                             : isPending
@@ -1080,21 +1448,75 @@ function Chats() {
                         }`}
                       >
                         {!isCustomer ? (
-                          <p
-                            className={`mb-1 text-[10px] font-semibold uppercase tracking-wide ${
-                              isPending
-                                ? "text-orange-600"
-                                : isMainAccount
-                                ? "text-blue-700"
-                                : isLiveAgent
-                                ? "text-emerald-700"
-                                : "text-slate-400"
-                            }`}
-                          >
-                            {senderLabel}
-                          </p>
+                          <div className="mb-1 flex items-center justify-between gap-2">
+                            <p
+                              className={`text-[10px] font-semibold uppercase tracking-wide ${
+                                isPending
+                                  ? "text-orange-600"
+                                  : isMainAccount
+                                  ? "text-blue-700"
+                                  : isLiveAgent
+                                  ? "text-emerald-700"
+                                  : "text-slate-400"
+                              }`}
+                            >
+                              {senderLabel}
+                            </p>
+                            {m.canModify && !isPending && !isEditing ? (
+                              <div className="flex items-center gap-0.5 opacity-0 transition group-hover/msg:opacity-100">
+                                <button
+                                  type="button"
+                                  onClick={() => startEditMessage(m)}
+                                  disabled={messageActionSaving}
+                                  className="rounded p-1 text-slate-400 hover:bg-white/80 hover:text-violet-600 disabled:opacity-40"
+                                  title="Edit message"
+                                  aria-label="Edit message"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void deleteMessage(m)}
+                                  disabled={messageActionSaving}
+                                  className="rounded p-1 text-slate-400 hover:bg-white/80 hover:text-red-600 disabled:opacity-40"
+                                  title="Delete message"
+                                  aria-label="Delete message"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            ) : null}
+                          </div>
                         ) : null}
-                        {m.text.trim() ? (
+                        {isEditing ? (
+                          <div className="space-y-2">
+                            <textarea
+                              rows={3}
+                              value={editDraft}
+                              onChange={(e) => setEditDraft(e.target.value)}
+                              onKeyDown={handleEditDraftKeyDown}
+                              className="w-full resize-y rounded-lg border border-[#EEE8FF] bg-white px-2 py-1.5 text-sm text-slate-800 focus:border-[#C4B5FD] focus:outline-none focus:ring-2 focus:ring-[#8B5CF6]/20"
+                            />
+                            <div className="flex justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={cancelEditMessage}
+                                disabled={messageActionSaving}
+                                className="rounded-lg px-2 py-1 text-xs font-medium text-slate-500 hover:bg-white/80"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void saveEditMessage()}
+                                disabled={messageActionSaving || !editDraft.trim()}
+                                className="rounded-lg bg-violet-600 px-2 py-1 text-xs font-semibold text-white hover:bg-violet-700 disabled:opacity-50"
+                              >
+                                Save
+                              </button>
+                            </div>
+                          </div>
+                        ) : m.text.trim() ? (
                           <MessageText
                             text={m.text}
                             linkClassName={
@@ -1104,25 +1526,28 @@ function Chats() {
                             }
                           />
                         ) : null}
-                        {Array.isArray(m.attachments) && m.attachments.length > 0 ? (
+                        {!isEditing && Array.isArray(m.attachments) && m.attachments.length > 0 ? (
                           <AssistantAttachments
                             attachments={m.attachments}
                             variant={isCustomer ? "customer" : "default"}
                           />
                         ) : null}
-                        <div
-                          className={`mt-1.5 flex items-center justify-end gap-2 text-[10px] font-medium ${
-                            isCustomer ? "text-white/75" : "text-slate-400"
-                          }`}
-                        >
-                          {isPending ? (
-                            <span className="font-semibold text-orange-600">Sending…</span>
-                          ) : null}
-                          {isSent || (isLiveAgent && !isPending) ? (
-                            <span className="font-semibold text-emerald-600">Sent</span>
-                          ) : null}
-                          {timeLabel ? <span>{timeLabel}</span> : null}
-                        </div>
+                        {!isEditing ? (
+                          <div
+                            className={`mt-1.5 flex items-center justify-end gap-2 text-[10px] font-medium ${
+                              isCustomer ? "text-white/75" : "text-slate-400"
+                            }`}
+                          >
+                            {isPending ? (
+                              <span className="font-semibold text-orange-600">Sending…</span>
+                            ) : null}
+                            {isSent || (isLiveAgent && !isPending) ? (
+                              <span className="font-semibold text-emerald-600">Sent</span>
+                            ) : null}
+                            {editedLabel ? <span>Edited {editedLabel}</span> : null}
+                            {timeLabel ? <span>{timeLabel}</span> : null}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   );
@@ -1175,6 +1600,16 @@ function Chats() {
           )}
         </section>
       </div>
+      <BadgePickerModal
+        open={Boolean(badgePicker)}
+        badges={conversationBadges}
+        currentBadgeId={badgePicker?.badgeId || ""}
+        saving={badgeSaving}
+        onClose={() => {
+          if (!badgeSaving) setBadgePicker(null);
+        }}
+        onSelect={(badgeId) => void assignConversationBadge(badgeId)}
+      />
       {error ? (
         <div className="mt-3 rounded-xl border border-red-100 bg-red-50 px-4 py-2 text-sm text-red-700">
           {error}

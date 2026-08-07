@@ -76,6 +76,7 @@ function Integrations() {
   const [waRefreshing, setWaRefreshing] = useState(false);
   const [waSyncing, setWaSyncing] = useState(false);
   const [waSyncMessage, setWaSyncMessage] = useState("");
+  const [connectingNowMs, setConnectingNowMs] = useState(() => Date.now());
   const syncedAccountsRef = useRef(new Set());
   const restoreAttemptTimesRef = useRef(new Map());
 
@@ -273,7 +274,7 @@ function Integrations() {
       }
     };
     void tick();
-    const id = setInterval(tick, 2000);
+    const id = setInterval(tick, 1000);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -404,6 +405,19 @@ function Integrations() {
     (activePhase === "reconnecting" ||
       (Boolean(activeAccount?.persisted) &&
         !["qr", "initializing", "authenticated"].includes(activePhase)));
+  const isFinishingConnection =
+    !activeConnected && (activePhase === "initializing" || activePhase === "authenticated");
+  const connectingForMs =
+    isFinishingConnection && Number.isFinite(Number(activeAccount?.phaseSince))
+      ? Math.max(0, connectingNowMs - Number(activeAccount.phaseSince))
+      : 0;
+  const connectingTooLong = connectingForMs >= 40000;
+
+  useEffect(() => {
+    if (!showWhatsAppConfig || !isFinishingConnection) return undefined;
+    const id = setInterval(() => setConnectingNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [showWhatsAppConfig, isFinishingConnection, activeAccount?.phaseSince]);
 
   return (
     <>
@@ -629,7 +643,11 @@ function Integrations() {
                                 : account.phase === "reconnecting"
                                   ? "Restoring session…"
                                   : account.phase === "qr"
-                                    ? "Waiting for scan"
+                                    ? account.needsQrRelink
+                                      ? "Scan QR to relink"
+                                      : account.qrDataUrl
+                                        ? "Waiting for scan"
+                                        : "Generating QR…"
                                     : account.phase === "initializing" || account.phase === "authenticated"
                                       ? "Connecting…"
                                       : "Not linked"}
@@ -702,9 +720,13 @@ function Integrations() {
                           ? "Connecting…"
                           : isRestoringSession
                             ? "Restoring…"
-                            : activePhase === "qr"
-                              ? "Linking…"
-                              : "Not linked"}
+                            : activeAccount?.needsQrRelink
+                              ? "Scan QR to relink"
+                              : activePhase === "qr"
+                                ? activeAccount?.qrDataUrl
+                                  ? "Linking…"
+                                  : "Generating QR…"
+                                : "Not linked"}
                     </p>
                   </div>
                 </div>
@@ -739,8 +761,43 @@ function Integrations() {
                         <>
                           <RefreshCw size={20} className="mx-auto mb-2 animate-spin text-slate-400" />
                           <p className="text-sm text-slate-500">
-                            Finishing WhatsApp connection. This usually takes under a minute.
+                            {connectingTooLong
+                              ? "Connection is taking longer than expected. Try retrying or link with a fresh QR."
+                              : "Finishing WhatsApp connection. This usually takes under a minute."}
                           </p>
+                          {connectingTooLong ? (
+                            <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void startAccountLinking(activeAccountId)}
+                                disabled={waRefreshing}
+                                className="rounded-lg border border-[#DDD6FE] bg-white px-3 py-1.5 text-xs font-semibold text-[#6D28D9] hover:bg-[#F8F5FF] disabled:opacity-60"
+                              >
+                                Retry connection
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void regenerateQr(activeAccountId)}
+                                disabled={waRefreshing}
+                                className="rounded-lg border border-[#DDD6FE] bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-[#FCFAFF] disabled:opacity-60"
+                              >
+                                Fresh QR link
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void disconnectWhatsApp(activeAccountId)}
+                                disabled={waRefreshing}
+                                className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 disabled:opacity-60"
+                              >
+                                Disconnect
+                              </button>
+                            </div>
+                          ) : null}
+                        </>
+                      ) : activePhase === "qr" ? (
+                        <>
+                          <RefreshCw size={20} className="mx-auto mb-2 animate-spin text-slate-400" />
+                          <p className="text-sm text-slate-500">Generating QR code…</p>
                         </>
                       ) : isRestoringSession ? (
                         <>

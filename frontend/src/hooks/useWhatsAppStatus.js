@@ -4,7 +4,7 @@ import { getWorkspaceUserProfile } from "../auth/userSession";
 import { getWhatsAppAccountLimit, normalizePlan } from "../planConfig";
 
 /** Minimum wait before retrying restore for the same account slot. */
-export const WHATSAPP_RESTORE_RETRY_MS = 15000;
+export const WHATSAPP_RESTORE_RETRY_MS = 8000;
 
 export function accountNeedsWhatsAppRestore(account) {
   if (!account?.persisted) return false;

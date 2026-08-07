@@ -44,6 +44,34 @@ function formatLoginIp(ip) {
   return value;
 }
 
+/** Rolling last 7 days (including today) with "Jul 21" style axis labels. */
+function buildLastWeekDays() {
+  const fullFormatter = new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+  const axisFormatter = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const days = [];
+  for (let i = 6; i >= 0; i -= 1) {
+    const d = new Date(startOfToday);
+    d.setDate(startOfToday.getDate() - i);
+    days.push({
+      key: `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`,
+      day: axisFormatter.format(d),
+      fullLabel: fullFormatter.format(d),
+      date: d,
+    });
+  }
+  const weekRangeLabel =
+    days.length >= 2
+      ? `${axisFormatter.format(days[0].date)} – ${axisFormatter.format(days[days.length - 1].date)}`
+      : "";
+  return { days, weekRangeLabel };
+}
+
 const activityData = [
   { day: "Mon", value: 62 },
   { day: "Tue", value: 78 },
@@ -318,18 +346,21 @@ function Dashboard() {
     { name: "Live Agent", value: liveAgentPercent },
     { name: "AI Managed", value: aiManagedPercent },
   ];
+  const lastWeekDaysMeta = useMemo(() => buildLastWeekDays(), []);
   const activityDataLive = useMemo(() => {
-    const labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const dayBuckets = new Map(labels.map((day) => [day, 0]));
+    const byKey = new Map(lastWeekDaysMeta.days.map((item) => [item.key, { ...item, value: 0 }]));
     sessions.forEach((session) => {
       const stamp = Date.parse(session?.updatedAt || session?.createdAt || "");
       if (!Number.isFinite(stamp)) return;
-      const date = new Date(stamp);
-      const day = labels[(date.getDay() + 6) % 7];
-      dayBuckets.set(day, (dayBuckets.get(day) || 0) + (Number(session?.messageCount) || 0));
+      const d = new Date(stamp);
+      const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      const bucket = byKey.get(key);
+      if (!bucket) return;
+      bucket.value += Number(session?.messageCount) || 0;
     });
-    return labels.map((day) => ({ day, value: dayBuckets.get(day) || 0 }));
-  }, [sessions]);
+    return [...byKey.values()].map(({ day, fullLabel, value }) => ({ day, fullLabel, value }));
+  }, [sessions, lastWeekDaysMeta]);
+  const conversationsWeekRangeLabel = lastWeekDaysMeta.weekRangeLabel;
   const productsCount = Array.isArray(agentDetails?.productsOrServices)
     ? agentDetails.productsOrServices.length
     : 0;
@@ -430,23 +461,10 @@ function Dashboard() {
       };
     });
   }, [sessions]);
-  const conversationsLast10Days = useMemo(() => {
-    const dayFormatter = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
-    const days = [];
-    const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    for (let i = 9; i >= 0; i -= 1) {
-      const d = new Date(startOfToday);
-      d.setDate(startOfToday.getDate() - i);
-      const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-      days.push({
-        key,
-        day: dayFormatter.format(d),
-        conversations: 0,
-        messages: 0,
-      });
-    }
-    const byKey = new Map(days.map((item) => [item.key, item]));
+  const conversationsLastWeek = useMemo(() => {
+    const byKey = new Map(
+      lastWeekDaysMeta.days.map((item) => [item.key, { ...item, conversations: 0, messages: 0 }])
+    );
     sessions.forEach((session) => {
       const stamp = Date.parse(session?.createdAt || session?.updatedAt || "");
       if (!Number.isFinite(stamp)) return;
@@ -457,12 +475,13 @@ function Dashboard() {
       bucket.conversations += 1;
       bucket.messages += Number(session?.messageCount) || 0;
     });
-    return days.map(({ day, conversations, messages }) => ({
+    return [...byKey.values()].map(({ day, fullLabel, conversations, messages }) => ({
       day,
+      fullLabel,
       conversations,
       messages,
     }));
-  }, [sessions]);
+  }, [sessions, lastWeekDaysMeta]);
   const getByLabelLike = (row, regex) => {
     const entries = Object.entries(row?.collectedData || {});
     const match = entries.find(([key, value]) => regex.test(String(key)) && String(value || "").trim());
@@ -563,7 +582,9 @@ function Dashboard() {
             <article className="flex min-h-0 flex-col rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5 lg:h-full">
               <div className="mb-4 flex shrink-0 items-center justify-between">
                 <p className="text-lg font-semibold text-slate-800">Conversations</p>
-                <p className="text-xs text-slate-400">Messages / Day</p>
+                <p className="text-xs text-slate-400">
+                  Last week{conversationsWeekRangeLabel ? ` · ${conversationsWeekRangeLabel}` : ""} · Messages / day
+                </p>
               </div>
               <div className="h-48 min-h-0 lg:h-auto lg:flex-1">
                 <ResponsiveContainer width="100%" height="100%">
@@ -576,12 +597,22 @@ function Dashboard() {
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="#EEE8FF" />
                     <XAxis dataKey="day" tick={{ fontSize: 12, fill: "#94A3B8" }} />
-                    <YAxis tick={{ fontSize: 12, fill: "#94A3B8" }} />
+                    <YAxis tick={{ fontSize: 12, fill: "#94A3B8" }} allowDecimals={false} />
                     <Tooltip
-                      contentStyle={{
-                        borderRadius: "12px",
-                        border: "1px solid #ECE3FF",
-                        backgroundColor: "#FFFFFF",
+                      content={({ active, payload }) => {
+                        if (!active || !payload?.length) return null;
+                        const row = payload[0]?.payload || {};
+                        return (
+                          <div className="rounded-xl border border-[#ECE3FF] bg-white px-3 py-2 text-xs shadow-md">
+                            <p className="font-semibold text-slate-700">{row.fullLabel || row.day}</p>
+                            <p className="mt-1 text-slate-600">
+                              Messages:{" "}
+                              <span className="font-semibold text-[#8B5CF6]">
+                                {Number(row.value) || 0}
+                              </span>
+                            </p>
+                          </div>
+                        );
                       }}
                     />
                     <Area
@@ -856,23 +887,25 @@ function Dashboard() {
 
             <article className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
               <div className="mb-4 flex items-center justify-between">
-                <p className="text-lg font-semibold text-slate-800">Conversations (10 Days)</p>
-                <p className="text-xs text-slate-400">Hover a bar for messages</p>
+                <p className="text-lg font-semibold text-slate-800">Conversations (Last Week)</p>
+                <p className="text-xs text-slate-400">
+                  {conversationsWeekRangeLabel || "Last 7 days"} · Hover a bar for details
+                </p>
               </div>
               <div className="h-60">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={conversationsLast10Days} barCategoryGap="18%">
+                  <BarChart data={conversationsLastWeek} barCategoryGap="18%">
                     <CartesianGrid strokeDasharray="3 3" stroke="#EEE8FF" />
                     <XAxis dataKey="day" tick={{ fontSize: 11, fill: "#94A3B8" }} interval={0} />
                     <YAxis tick={{ fontSize: 12, fill: "#94A3B8" }} allowDecimals={false} />
                     <Tooltip
                       cursor={{ fill: "rgba(139, 92, 246, 0.06)" }}
-                      content={({ active, payload, label }) => {
+                      content={({ active, payload }) => {
                         if (!active || !payload?.length) return null;
                         const row = payload[0]?.payload || {};
                         return (
                           <div className="rounded-xl border border-[#ECE3FF] bg-white px-3 py-2 text-xs shadow-md">
-                            <p className="font-semibold text-slate-700">{label}</p>
+                            <p className="font-semibold text-slate-700">{row.fullLabel || row.day}</p>
                             <p className="mt-1 text-slate-600">
                               Conversations:{" "}
                               <span className="font-semibold text-[#8B5CF6]">

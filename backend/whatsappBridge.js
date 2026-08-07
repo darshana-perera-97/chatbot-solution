@@ -27,7 +27,8 @@ const WHATSAPP_WEB_VERSION =
 const WA_VERSION_REMOTE_TEMPLATE =
   "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html";
 /** After authenticated, ready should follow within this window or we recycle the browser session. */
-const READY_AFTER_AUTH_TIMEOUT_MS = 75000;
+const READY_AFTER_AUTH_TIMEOUT_MS = 30000;
+const CONNECTION_PROBE_INTERVAL_MS = 2500;
 
 function sanitizeWebCacheDir(webCachePath, pinnedVersion) {
   if (!webCachePath || !fs.existsSync(webCachePath)) return;
@@ -375,9 +376,9 @@ function buildPuppeteerOptions(executablePath = "") {
   );
 
   const opts = {
-    // Cold starts can exceed Puppeteer's default 30s on some machines.
-    timeout: 120000,
-    protocolTimeout: 120000,
+    // Cold starts and getChats() over large chat lists can exceed Puppeteer's default 30s.
+    timeout: 180000,
+    protocolTimeout: 300000,
     headless: true,
     args,
   };
@@ -396,28 +397,185 @@ function isTransientPuppeteerFrameError(err) {
   );
 }
 
+function isProtocolTimeoutError(err) {
+  const msg = err instanceof Error ? err.message : String(err || "");
+  return /Runtime\.callFunctionOn timed out|protocolTimeout/i.test(msg);
+}
+
+const GET_CHATS_MAX_ATTEMPTS = 3;
+const GET_CHATS_RETRY_BASE_MS = 5000;
+
+async function ensureClientPageResponsive(client) {
+  if (!client?.pupPage) {
+    throw new Error("WhatsApp page not available");
+  }
+  if (typeof client.getState === "function") {
+    const state = await client.getState();
+    if (state && state !== "CONNECTED") {
+      throw new Error(`WhatsApp not connected (state=${state})`);
+    }
+  }
+  await client.pupPage.evaluate(() => {
+    if (!window.WWebJS || typeof window.require !== "function") {
+      throw new Error("WhatsApp Web is still loading");
+    }
+    return Date.now();
+  });
+}
+
+async function recoverClientPage(client) {
+  if (!client?.pupPage) return false;
+  try {
+    await client.pupPage.evaluate(() => Date.now());
+    return true;
+  } catch {
+    /* try a lightweight state probe */
+  }
+  try {
+    if (typeof client.getState === "function") {
+      const state = await client.getState();
+      return state === "CONNECTED";
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
+/** Resolve a personal chat model — tries @lid, @c.us, and LID↔phone mappings with retries. */
+async function resolveChatForPeerJid(client, peerJid, peerPhone = "") {
+  if (!client || typeof client.getChatById !== "function") return null;
+  const primary = typeof peerJid === "string" ? peerJid.trim() : "";
+  if (!primary || isNonPersonalWhatsAppJid(primary)) return null;
+
+  const candidates = [];
+  const seen = new Set();
+  const push = (jid) => {
+    const id = typeof jid === "string" ? jid.trim() : "";
+    if (!id || seen.has(id) || isNonPersonalWhatsAppJid(id)) return;
+    seen.add(id);
+    candidates.push(id);
+  };
+
+  push(primary);
+  push(phoneToCusJid(peerPhone));
+
+  if (typeof client.getContactLidAndPhone === "function") {
+    try {
+      const rows = await client.getContactLidAndPhone([...candidates]);
+      for (const row of rows || []) {
+        push(typeof row?.lid === "string" ? row.lid : "");
+        push(typeof row?.pn === "string" ? row.pn : "");
+        push(phoneToCusJid(row?.pn));
+      }
+    } catch {
+      /* ignore mapping errors */
+    }
+  }
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) {
+      await recoverClientPage(client);
+      await sleepMs(500 * attempt);
+    }
+    for (const jid of candidates) {
+      try {
+        const chat = await client.getChatById(jid);
+        if (chat && !isNonPersonalWhatsAppChat(chat)) return chat;
+      } catch (e) {
+        if (!isTransientPuppeteerFrameError(e) && !isProtocolTimeoutError(e)) {
+          continue;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchClientChatsWithRetry(client, { maxAttempts = GET_CHATS_MAX_ATTEMPTS } = {}) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await ensureClientPageResponsive(client);
+      return await client.getChats();
+    } catch (e) {
+      lastError = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      const retryable =
+        isProtocolTimeoutError(e) ||
+        isTransientPuppeteerFrameError(e) ||
+        /still loading/i.test(msg);
+      if (!retryable || attempt >= maxAttempts) {
+        throw e instanceof Error ? e : new Error(msg);
+      }
+      if (isTransientPuppeteerFrameError(e)) {
+        await recoverClientPage(client);
+      }
+      await sleepMs(GET_CHATS_RETRY_BASE_MS * attempt);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError || "getChats failed"));
+}
+
 function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function releaseLinuxProfileDir(profileDir) {
-  if (process.platform !== "linux") return;
-  if (!profileDir || !fs.existsSync(profileDir)) return;
+/** Browser PIDs owned by live whatsapp-web.js clients — never kill during profile cleanup. */
+const protectedWhatsAppBrowserPids = new Set();
 
-  const lockArtifacts = ["SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort"];
-  for (const name of lockArtifacts) {
-    const p = path.join(profileDir, name);
-    try {
-      if (fs.existsSync(p)) fs.rmSync(p, { force: true, recursive: true });
-    } catch {
-      /* ignore stale lock cleanup errors */
+function registerProtectedBrowserPid(pid) {
+  const n = Number(pid);
+  if (Number.isInteger(n) && n > 1) protectedWhatsAppBrowserPids.add(n);
+}
+
+function unregisterProtectedBrowserPid(pid) {
+  const n = Number(pid);
+  if (Number.isInteger(n) && n > 1) protectedWhatsAppBrowserPids.delete(n);
+}
+
+function readClientBrowserPid(client) {
+  try {
+    const proc = client?.pupBrowser?.process?.();
+    const pid = proc?.pid;
+    return Number.isInteger(pid) && pid > 1 ? pid : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function findChromePidsForProfile(profileDir) {
+  const pids = new Set();
+  if (!profileDir) return pids;
+
+  const resolvedDir = resolveBinaryPath(profileDir);
+  const profileCandidates = [...new Set([profileDir, resolvedDir].filter(Boolean))];
+
+  if (process.platform === "darwin" || process.platform === "linux") {
+    for (const dir of profileCandidates) {
+      const needle = `--user-data-dir=${dir}`;
+      try {
+        const out = execSync(`pgrep -f ${JSON.stringify(needle)}`, {
+          stdio: ["ignore", "pipe", "ignore"],
+          encoding: "utf8",
+        });
+        for (const line of out.split("\n")) {
+          const pid = Number(line.trim());
+          if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) pids.add(pid);
+        }
+      } catch {
+        /* pgrep returns exit 1 when nothing matches */
+      }
     }
   }
 
-  // If a crashed/restarted Node process left Chromium running with this exact profile,
-  // terminate only those browser processes whose command line includes this profile path.
-  const escapedDir = profileDir.replace(/["`\\$]/g, "\\$&");
-  const escapedForGrep = escapedDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (pids.size) return pids;
+
+  const escapedForGrep = profileCandidates
+    .map((dir) => dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  if (!escapedForGrep) return pids;
+
   try {
     const lines = execSync("ps -eo pid,args", {
       stdio: ["ignore", "pipe", "ignore"],
@@ -431,15 +589,94 @@ function releaseLinuxProfileDir(profileDir) {
 
     for (const line of lines) {
       const pid = Number(line.split(/\s+/, 1)[0]);
-      if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
-      try {
-        execSync(`kill -TERM ${pid}`, { stdio: "ignore" });
-      } catch {
-        /* ignore if already gone */
+      if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) pids.add(pid);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  return pids;
+}
+
+function isBrowserAlreadyRunningError(message) {
+  const msg = String(message || "");
+  return /browser is already running|user.?data.?dir|SingletonLock|profile appears to be in use/i.test(
+    msg
+  );
+}
+
+/**
+ * Clear Chrome profile locks and terminate orphaned headless browsers still holding
+ * this LocalAuth userDataDir after a Node crash/restart (Linux + macOS).
+ */
+function releaseStaleBrowserProfileDir(profileDir) {
+  if (!profileDir || !fs.existsSync(profileDir)) return;
+
+  const lockArtifacts = ["SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort"];
+  for (const name of lockArtifacts) {
+    const p = path.join(profileDir, name);
+    try {
+      if (fs.existsSync(p)) fs.rmSync(p, { force: true, recursive: true });
+    } catch {
+      /* ignore stale lock cleanup errors */
+    }
+  }
+
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+
+  const pids = findChromePidsForProfile(profileDir);
+  const orphanPids = [...pids].filter((pid) => !protectedWhatsAppBrowserPids.has(pid));
+  if (!orphanPids.length) return;
+
+  for (const pid of orphanPids) {
+    try {
+      execSync(`kill -TERM ${pid}`, { stdio: "ignore" });
+    } catch {
+      /* ignore if already gone */
+    }
+  }
+
+  // Give Chrome a moment to exit cleanly, then force-kill stragglers.
+  const waitUntil = Date.now() + 400;
+  while (Date.now() < waitUntil) {
+    /* brief spin — rare path during boot/reconnect cleanup */
+  }
+
+  for (const pid of orphanPids) {
+    if (protectedWhatsAppBrowserPids.has(pid)) continue;
+    try {
+      execSync(`kill -0 ${pid}`, { stdio: "ignore" });
+      execSync(`kill -KILL ${pid}`, { stdio: "ignore" });
+    } catch {
+      /* process already exited */
+    }
+  }
+
+  for (const name of lockArtifacts) {
+    const p = path.join(profileDir, name);
+    try {
+      if (fs.existsSync(p)) fs.rmSync(p, { force: true, recursive: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** Before boot restore, release every persisted WhatsApp Web profile on disk. */
+function releaseAllPersistedBrowserProfiles() {
+  try {
+    if (!fs.existsSync(dataRoot)) return;
+    for (const ent of fs.readdirSync(dataRoot, { withFileTypes: true })) {
+      if (!ent.isDirectory()) continue;
+      const authRoot = path.join(dataRoot, ent.name, "whatsapp-auth");
+      if (!fs.existsSync(authRoot)) continue;
+      for (const authEnt of fs.readdirSync(authRoot, { withFileTypes: true })) {
+        if (!authEnt.isDirectory() || !authEnt.name.startsWith("session-")) continue;
+        releaseStaleBrowserProfileDir(path.join(authRoot, authEnt.name));
       }
     }
   } catch {
-    /* ignore process scan issues */
+    /* ignore scan errors */
   }
 }
 
@@ -460,6 +697,34 @@ function isWhatsAppGroupJid(jidOrConversationId) {
   return false;
 }
 
+/** True for WhatsApp Status / broadcast JIDs (e.g. `status@broadcast`). */
+function isWhatsAppStatusJid(jidOrConversationId) {
+  const raw = String(jidOrConversationId || "").trim().toLowerCase();
+  if (!raw) return false;
+  if (raw === "status@broadcast") return true;
+  if (raw.endsWith("@broadcast")) return true;
+  if (raw.endsWith("_broadcast") || raw.includes("status_broadcast")) return true;
+  return false;
+}
+
+/** True for WhatsApp channel / newsletter JIDs. */
+function isWhatsAppChannelJid(jidOrConversationId) {
+  const raw = String(jidOrConversationId || "").trim().toLowerCase();
+  if (!raw) return false;
+  if (raw.endsWith("@newsletter")) return true;
+  if (raw.endsWith("_newsletter")) return true;
+  return false;
+}
+
+/** Groups, channels, and status — not 1:1 personal chats. */
+function isNonPersonalWhatsAppJid(jidOrConversationId) {
+  return (
+    isWhatsAppGroupJid(jidOrConversationId) ||
+    isWhatsAppStatusJid(jidOrConversationId) ||
+    isWhatsAppChannelJid(jidOrConversationId)
+  );
+}
+
 function chatJidFromChat(chat) {
   const rawId = chat?.id;
   if (typeof rawId === "string") return rawId.trim();
@@ -468,8 +733,14 @@ function chatJidFromChat(chat) {
 }
 
 function isWhatsAppGroupChat(chat) {
-  if (chat?.isGroup) return true;
-  return isWhatsAppGroupJid(chatJidFromChat(chat));
+  return isNonPersonalWhatsAppChat(chat);
+}
+
+function isNonPersonalWhatsAppChat(chat) {
+  if (!chat) return false;
+  if (chat.isGroup) return true;
+  if (chat.isChannel) return true;
+  return isNonPersonalWhatsAppJid(chatJidFromChat(chat));
 }
 
 /** Best-effort reverse of {@link jidToConversationId} when whatsappChatId was not persisted. */
@@ -722,28 +993,27 @@ async function deliverTextToPeer(client, peerJid, text, options = {}) {
       const exists = await chatExists(jid);
       if (exists === false) {
         lastError = `chat not found for ${jid}`;
-        return false;
+        return { ok: false, messageId: "" };
       }
       try {
-        // waitUntilMsgSent improves odds of a Message return; library still often returns undefined
-        // after a real delivery — do not use Boolean(sent).
-        await client.sendMessage(jid, trimmed, {
+        const sent = await client.sendMessage(jid, trimmed, {
           sendSeen: false,
           waitUntilMsgSent: true,
           ...sendOptions,
         });
-        return true;
+        const messageId =
+          typeof sent?.id?._serialized === "string" ? sent.id._serialized.trim() : "";
+        return { ok: true, messageId };
       } catch (e) {
         lastError = e instanceof Error ? e.message : String(e);
         console.warn("[whatsapp] sendMessage:", jid, lastError);
         if (!isTransientPuppeteerFrameError(e) || tryIndex >= maxTries - 1) {
-          return false;
+          return { ok: false, messageId: "" };
         }
-        // Frame can recover after WhatsApp Web re-attaches; brief backoff then retry same JID.
         await sleepMs(750 * (tryIndex + 1));
       }
     }
-    return false;
+    return { ok: false, messageId: "" };
   };
 
   // Resolve alternate ids before the first send when possible (LID ↔ phone).
@@ -788,6 +1058,7 @@ async function deliverTextToPeer(client, peerJid, text, options = {}) {
         pushCandidate(cid);
       }
     } catch (e) {
+      if (isTransientPuppeteerFrameError(e) || isProtocolTimeoutError(e)) continue;
       console.warn(
         "[whatsapp] getChatById:",
         jid,
@@ -798,11 +1069,13 @@ async function deliverTextToPeer(client, peerJid, text, options = {}) {
 
   if (quoteId) {
     for (const jid of [...candidates]) {
-      if (await attempt(jid, { quotedMessageId: quoteId })) return { ok: true };
+      const result = await attempt(jid, { quotedMessageId: quoteId });
+      if (result.ok) return { ok: true, messageId: result.messageId || "" };
     }
   }
   for (const jid of [...candidates]) {
-    if (await attempt(jid)) return { ok: true };
+    const result = await attempt(jid);
+    if (result.ok) return { ok: true, messageId: result.messageId || "" };
   }
 
   return {
@@ -848,8 +1121,31 @@ async function deliverAssistantText(client, msg, text) {
 }
 
 const WHATSAPP_STALE_REPLY_MS = 2 * 60 * 1000;
-/** Max recent messages to import per personal chat when syncing WhatsApp conversations. */
-const WHATSAPP_SYNC_MESSAGE_LIMIT = 500;
+/**
+ * Max messages to import per personal chat when syncing WhatsApp conversations.
+ * whatsapp-web.js loads earlier messages until this limit; 0 = no cap (Infinity).
+ */
+const WHATSAPP_SYNC_MESSAGE_LIMIT = Math.max(
+  0,
+  Number.parseInt(process.env.WHATSAPP_SYNC_MESSAGE_LIMIT || "5000", 10) || 0
+);
+
+/** WhatsApp system messages — not real chat content; never persist or auto-reply. */
+const IGNORED_WHATSAPP_MESSAGE_TYPES = new Set(["e2e_notification"]);
+
+function isIgnoredWhatsAppMessage(msg) {
+  const type = typeof msg?.type === "string" ? msg.type.trim().toLowerCase() : "";
+  if (type && IGNORED_WHATSAPP_MESSAGE_TYPES.has(type)) return true;
+  const body = typeof msg?.body === "string" ? msg.body.trim().toLowerCase() : "";
+  if (body === "[e2e_notification]" || body === "e2e_notification") return true;
+  if (msg?.isStatus) return true;
+  const peer = peerJidFromWhatsAppMessage(msg);
+  if (isNonPersonalWhatsAppJid(peer)) return true;
+  const from = typeof msg?.from === "string" ? msg.from.trim() : "";
+  const to = typeof msg?.to === "string" ? msg.to.trim() : "";
+  if (isNonPersonalWhatsAppJid(from) || isNonPersonalWhatsAppJid(to)) return true;
+  return false;
+}
 
 function getWhatsAppMessageAgeMs(msg) {
   const ts = Number(msg?.timestamp);
@@ -974,16 +1270,34 @@ async function attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments, c
   }
 }
 
-async function whatsappMessageToRecord(msg, sanitizeMessageAttachments, client) {
+async function whatsappMessageToRecord(msg, sanitizeMessageAttachments, client, options = {}) {
+  if (isIgnoredWhatsAppMessage(msg)) return null;
   const body = typeof msg?.body === "string" ? msg.body.trim() : "";
   // Phone/desktop sends from the linked WhatsApp account (not AI / live-agent dashboard).
   const role = msg?.fromMe ? "main_account" : "user";
-  const attachments = msg?.hasMedia
-    ? await attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments, client)
-    : [];
-  if (!body && !attachments.length) return null;
-  const record = { role, content: body };
+  const skipMedia = Boolean(options.skipMedia);
+  const attachments =
+    msg?.hasMedia && !skipMedia
+      ? await attachmentsFromWhatsAppMessage(msg, sanitizeMessageAttachments, client)
+      : [];
+  let content = body;
+  if (!content && attachments.length) {
+    content = "";
+  } else if (!content && msg?.hasMedia) {
+    content = "[Media]";
+  } else if (!content && typeof msg?.type === "string" && msg.type !== "chat") {
+    content = `[${msg.type}]`;
+  }
+  if (!content && !attachments.length) return null;
+  const record = { role, content };
   if (attachments.length) record.attachments = attachments;
+  const waMessageId =
+    typeof msg?.id?._serialized === "string"
+      ? msg.id._serialized.trim()
+      : typeof msg?.id === "string"
+        ? msg.id.trim()
+        : "";
+  if (waMessageId) record.whatsappMessageId = waMessageId.slice(0, 200);
   const ts = Number(msg?.timestamp);
   if (Number.isFinite(ts) && ts > 0) {
     const ms = ts < 1e12 ? ts * 1000 : ts;
@@ -1022,7 +1336,7 @@ function priorMessagesFromSession(existing) {
  * @param {function} deps.sanitizeChatMessages
  * @param {function} deps.sanitizeMessageAttachments
  * @param {function} deps.saveTestChatSession
- * @param {function} deps.mergeAgentMessagesPreservingOrder
+ * @param {function} deps.appendUniqueSessionMessages
  * @param {function} [deps.onAccountLinkedViaQr]
  */
 function createWhatsAppBridge(deps) {
@@ -1033,7 +1347,7 @@ function createWhatsAppBridge(deps) {
     sanitizeChatMessages,
     sanitizeMessageAttachments,
     saveTestChatSession,
-    mergeAgentMessagesPreservingOrder,
+    appendUniqueSessionMessages,
     onAccountLinkedViaQr,
   } = deps;
 
@@ -1067,15 +1381,425 @@ function createWhatsAppBridge(deps) {
   const BASE_RECONNECT_DELAY_MS = 2000;
   const MAX_RECONNECT_DELAY_MS = 30000;
   const RECONNECT_READY_TIMEOUT_MS = 180000;
-  const WATCHDOG_INTERVAL_MS = 30000;
-  const WATCHDOG_STUCK_LINKING_MS = 120000;
-  const WATCHDOG_MISSING_SLOT_MS = 45000;
+  const WATCHDOG_INTERVAL_MS = 20000;
+  const WATCHDOG_STUCK_LINKING_MS = 40000;
+  const WATCHDOG_MISSING_SLOT_MS = 20000;
   const WATCHDOG_DISCONNECTED_MS = 45000;
   const WATCHDOG_RECONNECT_LOCK_MS = RECONNECT_READY_TIMEOUT_MS + 45000;
   const WATCHDOG_ACTION_COOLDOWN_MS = 60000;
   const CONNECTION_HEALTH_INTERVAL_MS = 45000;
-  const PAGE_KEEPALIVE_INTERVAL_MS = 15000;
+  const PAGE_KEEPALIVE_INTERVAL_MS = 8000;
   const BACKGROUND_RECONNECT_INTERVAL_MS = 10000;
+  const PERIODIC_CONVERSATION_SYNC_INTERVAL_MS = 180000;
+  const ACCOUNT_SYNC_DEBOUNCE_MS = 15000;
+  const CHAT_SYNC_DEBOUNCE_MS = 3000;
+  const FRAME_GLITCH_RECONNECT_THRESHOLD = 3;
+  const FRAME_GLITCH_WINDOW_MS = 90000;
+  /** @type {Map<string, ReturnType<typeof setTimeout>>} debounced full sync per account slot */
+  const pendingAccountSyncTimers = new Map();
+  /** @type {Map<string, ReturnType<typeof setTimeout>>} debounced single-chat sync per jid */
+  const pendingChatSyncTimers = new Map();
+  /** @type {Map<string, Promise<void>>} serialize read-modify-write per conversation */
+  const conversationPersistChains = new Map();
+
+  function accountLabelForSlot(slotKeyId, waClient, accountId) {
+    const entryNow = slots.get(slotKeyId);
+    return (
+      channelLabelFromClient(waClient) ||
+      (entryNow && entryNow.pushname) ||
+      (entryNow && entryNow.phone) ||
+      `WhatsApp ${accountId}`
+    );
+  }
+
+  function scheduleDebouncedChatSync(workspaceUserId, accountId, jid, peerPhone = "") {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const peerJid = typeof jid === "string" ? jid.trim() : "";
+    if (!safe || !peerJid) return;
+    const debounceKey = `${slotKey(safe, safeAccountId)}::${peerJid}`;
+    const existing = pendingChatSyncTimers.get(debounceKey);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      pendingChatSyncTimers.delete(debounceKey);
+      void syncSingleChatForJid(safe, safeAccountId, peerJid, peerPhone);
+    }, CHAT_SYNC_DEBOUNCE_MS);
+    pendingChatSyncTimers.set(debounceKey, timer);
+    if (typeof timer.unref === "function") timer.unref();
+  }
+
+  async function syncSingleChatForJid(workspaceUserId, accountId, jid, peerPhone = "") {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const peerJid = typeof jid === "string" ? jid.trim() : "";
+    if (!safe || !peerJid || isNonPersonalWhatsAppJid(peerJid)) return;
+
+    const key = slotKey(safe, safeAccountId);
+    const entry = slots.get(key);
+    if (!entry?.client || entry.phase !== "ready") return;
+
+    let resolvedPhone =
+      typeof peerPhone === "string" ? peerPhone.trim() : "";
+    if (!resolvedPhone) {
+      const conversationId = jidToConversationId(peerJid);
+      const session = getTestChatSessionByConversation(safe, conversationId);
+      resolvedPhone =
+        typeof session?.whatsappPeerPhone === "string" ? session.whatsappPeerPhone.trim() : "";
+    }
+
+    try {
+      await recoverClientPage(entry.client);
+      const chat = await resolveChatForPeerJid(entry.client, peerJid, resolvedPhone);
+      if (!chat) {
+        waLog(safe, safeAccountId, `single-chat sync skipped (chat unavailable for ${peerJid})`);
+        return;
+      }
+      const label =
+        channelLabelFromClient(entry.client) ||
+        entry.pushname ||
+        entry.phone ||
+        `WhatsApp ${safeAccountId}`;
+      await syncSingleChatToSession(entry.client, safe, safeAccountId, chat, label);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (isTransientPuppeteerFrameError(e) || isProtocolTimeoutError(e)) {
+        waLog(safe, safeAccountId, "single-chat sync skipped (transient)", msg.slice(0, 120));
+        return;
+      }
+      waLog(safe, safeAccountId, "single-chat sync failed", msg.slice(0, 120));
+    }
+  }
+
+  function scheduleDebouncedAccountSync(workspaceUserId, accountId) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe) return;
+    const debounceKey = slotKey(safe, safeAccountId);
+    const existing = pendingAccountSyncTimers.get(debounceKey);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      pendingAccountSyncTimers.delete(debounceKey);
+      void syncConversationsForAccount(safe, safeAccountId).catch((e) => {
+        waLog(
+          safe,
+          safeAccountId,
+          "debounced conversation sync failed",
+          e instanceof Error ? e.message : String(e)
+        );
+      });
+    }, ACCOUNT_SYNC_DEBOUNCE_MS);
+    pendingAccountSyncTimers.set(debounceKey, timer);
+    if (typeof timer.unref === "function") timer.unref();
+  }
+
+  async function patchInboundMessageAttachments(
+    workspaceUserId,
+    conversationId,
+    sessionOpts,
+    attachments
+  ) {
+    if (!Array.isArray(attachments) || !attachments.length) return;
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    if (!safe) return;
+    const refreshed = getTestChatSessionByConversation(safe, conversationId);
+    if (!refreshed?.messages?.length) return;
+    const patched = [...refreshed.messages];
+    for (let i = patched.length - 1; i >= 0; i -= 1) {
+      if (patched[i]?.role === "user") {
+        patched[i] = { ...patched[i], attachments };
+        break;
+      }
+    }
+    saveTestChatSession(safe, conversationId, patched, {
+      ...sessionOpts,
+      liveAgentEnabled: Boolean(refreshed.liveAgentEnabled),
+    });
+  }
+
+  /**
+   * Persist an inbound personal-chat message immediately (before slow contact lookups).
+   * Safe to call from both `message_create` and `message` — dedupes via appendUniqueSessionMessages.
+   */
+  async function persistInboundWhatsAppMessage(workspaceUserId, accountId, slotKeyId, waClient, msg) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const jid = peerJidFromWhatsAppMessage(msg);
+    if (!jid || isNonPersonalWhatsAppJid(jid)) return null;
+
+    const conversationId = jidToConversationId(jid);
+    const incomingRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, waClient, {
+      skipMedia: true,
+    });
+    if (!incomingRecord) return null;
+
+    const existing = getTestChatSessionByConversation(safe, conversationId);
+    const label = accountLabelForSlot(slotKeyId, waClient, safeAccountId);
+    const existingPeerPhone =
+      typeof existing?.whatsappPeerPhone === "string" ? existing.whatsappPeerPhone.trim() : "";
+    const sessionOpts = {
+      chatSource: "whatsapp",
+      channelAccountName: label,
+      whatsappChatId: jid,
+      whatsappPeerPhone: existingPeerPhone,
+      whatsappAccountId: safeAccountId,
+      liveAgentEnabled: Boolean(existing?.liveAgentEnabled),
+    };
+
+    const existingMessages = Array.isArray(existing?.messages) ? existing.messages : [];
+    const persistedMessages = appendUniqueSessionMessages(existingMessages, [incomingRecord]);
+    const wasDuplicate = persistedMessages.length === existingMessages.length;
+
+    if (!wasDuplicate) {
+      saveTestChatSession(safe, conversationId, persistedMessages, sessionOpts);
+      // Backfill older history for brand-new chats only — live message is already saved above.
+      if (!existing || existingMessages.length === 0) {
+        scheduleDebouncedChatSync(safe, safeAccountId, jid, existingPeerPhone);
+      }
+      waLog(safe, safeAccountId, `saved inbound message (${conversationId})`);
+    }
+
+    if (!existingPeerPhone) {
+      void resolvePeerWhatsappPhone(waClient, msg)
+        .then((phone) => {
+          if (!phone) return;
+          const latest = getTestChatSessionByConversation(safe, conversationId);
+          if (!latest) return;
+          saveTestChatSession(safe, conversationId, latest.messages, {
+            ...sessionOpts,
+            whatsappPeerPhone: phone,
+            liveAgentEnabled: Boolean(latest.liveAgentEnabled),
+          });
+        })
+        .catch(() => {});
+    }
+
+    if (msg?.hasMedia) {
+      void whatsappMessageToRecord(msg, sanitizeMessageAttachments, waClient)
+        .then((withMedia) => {
+          const att = Array.isArray(withMedia?.attachments) ? withMedia.attachments : [];
+          if (!att.length) return;
+          return patchInboundMessageAttachments(safe, conversationId, sessionOpts, att);
+        })
+        .catch(() => {});
+    }
+
+    return {
+      conversationId,
+      incomingRecord,
+      persistedMessages,
+      sessionOpts,
+      wasDuplicate,
+      jid,
+    };
+  }
+
+  async function persistOutboundWhatsAppMessage(workspaceUserId, accountId, slotKeyId, waClient, msg) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const jid = peerJidFromWhatsAppMessage(msg);
+    if (!jid || isNonPersonalWhatsAppJid(jid)) return;
+
+    try {
+      const chat = await msg.getChat();
+      if (isNonPersonalWhatsAppChat(chat)) return;
+    } catch {
+      /* ignore */
+    }
+
+    const conversationId = jidToConversationId(jid);
+    const outboundRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, waClient, {
+      skipMedia: true,
+    });
+    if (!outboundRecord) return;
+
+    const existing = getTestChatSessionByConversation(safe, conversationId);
+    const existingMessages = Array.isArray(existing?.messages) ? existing.messages : [];
+    if (
+      sessionAlreadyHasOutboundContent(
+        existingMessages,
+        outboundRecord.content,
+        Array.isArray(outboundRecord.attachments) ? outboundRecord.attachments.length : 0
+      )
+    ) {
+      return;
+    }
+
+    const label = accountLabelForSlot(slotKeyId, waClient, safeAccountId);
+    const nextMessages = appendUniqueSessionMessages(existingMessages, [outboundRecord]);
+    const existingPeerPhone =
+      typeof existing?.whatsappPeerPhone === "string" ? existing.whatsappPeerPhone.trim() : "";
+
+    saveTestChatSession(safe, conversationId, nextMessages, {
+      chatSource: "whatsapp",
+      channelAccountName: label,
+      whatsappChatId: jid,
+      whatsappPeerPhone: existingPeerPhone,
+      whatsappAccountId: safeAccountId,
+      liveAgentEnabled: Boolean(existing?.liveAgentEnabled),
+    });
+    scheduleDebouncedAccountSync(safe, safeAccountId);
+
+    if (!existingPeerPhone) {
+      void resolvePeerPhoneFromJid(waClient, jid, msg)
+        .then((phone) => {
+          if (!phone) return;
+          const latest = getTestChatSessionByConversation(safe, conversationId);
+          if (!latest) return;
+          saveTestChatSession(safe, conversationId, latest.messages, {
+            chatSource: "whatsapp",
+            channelAccountName: label,
+            whatsappChatId: jid,
+            whatsappPeerPhone: phone,
+            whatsappAccountId: safeAccountId,
+            liveAgentEnabled: Boolean(latest.liveAgentEnabled),
+          });
+        })
+        .catch(() => {});
+    }
+
+    if (msg?.hasMedia) {
+      void whatsappMessageToRecord(msg, sanitizeMessageAttachments, waClient)
+        .then((withMedia) => {
+          const att = Array.isArray(withMedia?.attachments) ? withMedia.attachments : [];
+          if (!att.length) return;
+          const refreshed = getTestChatSessionByConversation(safe, conversationId);
+          if (!refreshed?.messages?.length) return;
+          const patched = [...refreshed.messages];
+          for (let i = patched.length - 1; i >= 0; i -= 1) {
+            if (patched[i]?.role === "main_account") {
+              patched[i] = { ...patched[i], attachments: att };
+              break;
+            }
+          }
+          saveTestChatSession(safe, conversationId, patched, {
+            chatSource: "whatsapp",
+            channelAccountName: label,
+            whatsappChatId: jid,
+            whatsappPeerPhone: existingPeerPhone,
+            whatsappAccountId: safeAccountId,
+            liveAgentEnabled: Boolean(refreshed.liveAgentEnabled),
+          });
+        })
+        .catch(() => {});
+    }
+  }
+
+  async function handleInboundWhatsAppAiReply(workspaceUserId, accountId, slotKeyId, waClient, msg) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const jid = peerJidFromWhatsAppMessage(msg);
+    if (!jid || isNonPersonalWhatsAppJid(jid)) return;
+
+    const conversationId = jidToConversationId(jid);
+    const chainKey = `${safe}::${conversationId}`;
+    const pendingPersist = conversationPersistChains.get(chainKey);
+    if (pendingPersist) {
+      await pendingPersist.catch(() => {});
+    }
+
+    const existing = getTestChatSessionByConversation(safe, conversationId);
+    if (!existing?.messages?.length) return;
+
+    const incomingRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, waClient, {
+      skipMedia: true,
+    });
+    if (!incomingRecord) return;
+
+    const label = accountLabelForSlot(slotKeyId, waClient, safeAccountId);
+    const sessionOpts = {
+      chatSource: "whatsapp",
+      channelAccountName: label,
+      whatsappChatId: jid,
+      whatsappPeerPhone:
+        typeof existing.whatsappPeerPhone === "string" ? existing.whatsappPeerPhone.trim() : "",
+      whatsappAccountId: safeAccountId,
+      liveAgentEnabled: Boolean(existing.liveAgentEnabled),
+    };
+    const persistedMessages = Array.isArray(existing.messages) ? existing.messages : [];
+
+    if (isStaleWhatsAppMessage(msg)) {
+      waLog(
+        safe,
+        safeAccountId,
+        `skipped auto-reply for stale message (${Math.round(getWhatsAppMessageAgeMs(msg) / 1000)}s old)`
+      );
+      return;
+    }
+
+    if (!incomingRecord.content) return;
+
+    const priorForAi = priorMessagesFromSession({ messages: persistedMessages })
+      .filter((m) => m.role === "user" || m.role === "assistant" || m.role === "main_account")
+      .map((m) => (m.role === "main_account" ? { ...m, role: "assistant" } : m));
+
+    const messagesForAi = sanitizeChatMessages([
+      ...priorForAi,
+      {
+        role: "user",
+        content: incomingRecord.content,
+        ...(incomingRecord.createdAt ? { createdAt: incomingRecord.createdAt } : {}),
+      },
+    ]);
+
+    const result = await completeWorkspaceChatTurn({
+      userId: safe,
+      conversationId,
+      messages: messagesForAi,
+      skipUserPersist: true,
+      ...sessionOpts,
+    });
+
+    if (Array.isArray(incomingRecord.attachments) && incomingRecord.attachments.length) {
+      await patchInboundMessageAttachments(safe, conversationId, sessionOpts, incomingRecord.attachments);
+    }
+
+    if (result.kind === "success" && typeof result.reply === "string" && result.reply.trim()) {
+      await deliverAssistantText(waClient, msg, result.reply);
+      return;
+    }
+
+    if (result.kind === "live_agent" || result.kind === "ai_disabled") {
+      return;
+    }
+
+    const fallbackCopy = (() => {
+      if (result.kind === "openai_missing") {
+        return (
+          "Automatic replies aren't available — the server has no AI API key configured. " +
+          "Your message was saved; please contact the workspace owner."
+        );
+      }
+      if (result.kind === "error") {
+        return (
+          "Sorry — I couldn't generate a reply right now. Your message was saved; please try again shortly."
+        );
+      }
+      if (result.kind === "validation_error") {
+        return "";
+      }
+      return "";
+    })();
+
+    if (fallbackCopy) {
+      await deliverAssistantText(waClient, msg, fallbackCopy);
+    }
+  }
+
+  function runSerializedConversationPersist(workspaceUserId, conversationId, task) {
+    const chainKey = `${workspaceUserId}::${conversationId}`;
+    const prev = conversationPersistChains.get(chainKey) || Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(() => task());
+    conversationPersistChains.set(chainKey, next);
+    void next.finally(() => {
+      if (conversationPersistChains.get(chainKey) === next) {
+        conversationPersistChains.delete(chainKey);
+      }
+    });
+    return next;
+  }
+
   const waLog = (workspaceUserId, accountId, message, ...extra) => {
     const prefix = `[whatsapp][user:${workspaceUserId}][account:${accountId}]`;
     if (extra.length) {
@@ -1126,6 +1850,96 @@ function createWhatsAppBridge(deps) {
     entry.readyWatchdogTimer = null;
   }
 
+  function stopConnectionProbe(entry) {
+    if (!entry?.connectionProbeTimer) return;
+    clearInterval(entry.connectionProbeTimer);
+    entry.connectionProbeTimer = null;
+  }
+
+  function finalizeEntryReady(entry, client, workspaceUserId, accountId, key, linkOptions = {}) {
+    if (!entry || entry.phase === "ready") return;
+    clearReadyWatchdog(entry);
+    stopConnectionProbe(entry);
+    setEntryPhase(entry, "ready");
+    entry.qrDataUrl = "";
+    const wid = client?.info?.wid;
+    entry.phone = wid?.user || "";
+    entry.pushname = channelLabelFromClient(client);
+    failedReconnectCounts.delete(key);
+    lastReconnectAttemptAt.delete(key);
+    reconnectBackoffMs.delete(key);
+    const pendingTimer = pendingReconnectTimers.get(key);
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingReconnectTimers.delete(key);
+    }
+    whatsappAutoStart.addLink(workspaceUserId, accountId);
+    startPageKeepAlive(entry, workspaceUserId, accountId);
+    if (entry.linkIntent === "user_qr" && typeof onAccountLinkedViaQr === "function") {
+      onAccountLinkedViaQr(workspaceUserId, accountId, {
+        pushname: entry.pushname,
+        phone: entry.phone,
+        label: `Account ${accountId}`,
+      });
+    }
+    entry.linkIntent = "auto_restore";
+    if (client) {
+      void profilePicDataUrlFromClient(client).then((dataUrl) => {
+        entry.profilePicDataUrl = typeof dataUrl === "string" ? dataUrl : "";
+      });
+    }
+    waLog(
+      workspaceUserId,
+      accountId,
+      `linked and ready (account=${entry.pushname || "unknown"}${entry.phone ? ` · ${entry.phone}` : ""})`
+    );
+    if (!bulkRestoreInProgress && !linkOptions.deferConversationSync) {
+      setTimeout(() => {
+        void syncConversationsForAccount(workspaceUserId, accountId).catch((e) => {
+          waLog(
+            workspaceUserId,
+            accountId,
+            "auto conversation sync failed",
+            e instanceof Error ? e.message : String(e)
+          );
+        });
+      }, 8000);
+    }
+  }
+
+  async function probeEntryConnection(entry, client, workspaceUserId, accountId, key, linkOptions) {
+    if (!entry || entry.phase === "ready" || !client) return false;
+    if (!["authenticated", "initializing"].includes(entry.phase)) return false;
+    try {
+      if (client.info?.wid?.user) {
+        finalizeEntryReady(entry, client, workspaceUserId, accountId, key, linkOptions);
+        return true;
+      }
+      if (typeof client.getState === "function") {
+        const state = await client.getState();
+        if (state === "CONNECTED") {
+          finalizeEntryReady(entry, client, workspaceUserId, accountId, key, linkOptions);
+          return true;
+        }
+      }
+    } catch {
+      /* ignore transient probe errors */
+    }
+    return false;
+  }
+
+  function startConnectionProbe(entry, client, workspaceUserId, accountId, key, linkOptions) {
+    stopConnectionProbe(entry);
+    if (!entry || !client) return;
+    entry.connectionProbeTimer = setInterval(() => {
+      void probeEntryConnection(entry, client, workspaceUserId, accountId, key, linkOptions);
+    }, CONNECTION_PROBE_INTERVAL_MS);
+    if (typeof entry.connectionProbeTimer.unref === "function") {
+      entry.connectionProbeTimer.unref();
+    }
+    void probeEntryConnection(entry, client, workspaceUserId, accountId, key, linkOptions);
+  }
+
   function startReadyWatchdog(entry, workspaceUserId, accountId) {
     if (!entry) return;
     clearReadyWatchdog(entry);
@@ -1168,16 +1982,31 @@ function createWhatsAppBridge(deps) {
     waLog(safe, safeAccountId, "destroying client session");
     const entry = slots.get(key);
     clearReadyWatchdog(entry);
+    stopConnectionProbe(entry);
     stopPageKeepAlive(entry);
+    let profileDir = "";
+    let browserPid = 0;
     if (entry?.client) {
+      browserPid = readClientBrowserPid(entry.client);
       try {
         entry.client.removeAllListeners();
         await entry.client.destroy();
       } catch {
         /* ignore */
       }
+      unregisterProtectedBrowserPid(browserPid);
+      // Allow Chrome to flush LocalAuth / IndexedDB to disk before profile cleanup.
+      await sleepMs(800);
+      try {
+        const authRoot = resolveUserAuthRoot(safe);
+        const localAuthClientId = localAuthClientIdForAccount(safeAccountId);
+        profileDir = path.join(authRoot, `session-${localAuthClientId}`);
+      } catch {
+        /* ignore */
+      }
     }
     slots.delete(key);
+    if (profileDir) releaseStaleBrowserProfileDir(profileDir);
     waLog(safe, safeAccountId, "client session removed");
   }
 
@@ -1214,11 +2043,34 @@ function createWhatsAppBridge(deps) {
   function markSlotUnhealthy(entry, workspaceUserId, accountId, reason) {
     if (!entry) return;
     if (entry.phase !== "ready") return;
+    const now = Date.now();
+    if (!entry.frameGlitchWindowStart || now - entry.frameGlitchWindowStart > FRAME_GLITCH_WINDOW_MS) {
+      entry.frameGlitchWindowStart = now;
+      entry.frameGlitchCount = 0;
+    }
+    entry.frameGlitchCount = Number(entry.frameGlitchCount) || 0;
+    entry.frameGlitchCount += 1;
+    if (entry.frameGlitchCount < FRAME_GLITCH_RECONNECT_THRESHOLD) {
+      waLog(
+        workspaceUserId,
+        accountId,
+        `transient glitch (${entry.frameGlitchCount}/${FRAME_GLITCH_RECONNECT_THRESHOLD}): ${String(reason).slice(0, 80)}`
+      );
+      return;
+    }
+    entry.frameGlitchCount = 0;
+    entry.frameGlitchWindowStart = 0;
     waLog(workspaceUserId, accountId, `connection unhealthy (${reason}); scheduling reconnect`);
     setEntryPhase(entry, "disconnected");
     entry.error = reason;
     stopPageKeepAlive(entry);
     scheduleReconnect(workspaceUserId, accountId, reason);
+  }
+
+  function clearFrameGlitch(entry) {
+    if (!entry) return;
+    entry.frameGlitchCount = 0;
+    entry.frameGlitchWindowStart = 0;
   }
 
   function setEntryPhase(entry, phase) {
@@ -1271,6 +2123,9 @@ function createWhatsAppBridge(deps) {
 
         void page
           .evaluate(() => Date.now())
+          .then(() => {
+            clearFrameGlitch(entry);
+          })
           .catch((e) => {
             const msg = e instanceof Error ? e.message : String(e);
             if (!isTransientPuppeteerFrameError(e)) return;
@@ -1331,16 +2186,31 @@ function createWhatsAppBridge(deps) {
     if (!hasPersistedAccountSession(safe, safeAccountId)) return;
 
     const key = slotKey(safe, safeAccountId);
-    const entry = slots.get(key);
+    let entry = slots.get(key);
     if (entry?.phase === "ready") {
       clearReconnectState(key);
       return;
     }
+    if (entry?.phase === "qr") {
+      // Auto-restore landed on QR — session needs a manual rescan, not another Chrome launch.
+      if (entry.linkIntent !== "user_qr") return;
+    }
     if (
       entry &&
-      ["initializing", "qr", "authenticated", "reconnecting"].includes(entry.phase)
+      ["initializing", "qr", "authenticated"].includes(entry.phase)
     ) {
-      return;
+      const stuckMs = phaseAgeMs(entry, Date.now());
+      if (force && stuckMs >= 8000) {
+        waLog(
+          safe,
+          safeAccountId,
+          `force: restarting stuck ${entry.phase} session (${stuckMs}ms)`
+        );
+        await destroyClient(safe, safeAccountId);
+        entry = null;
+      } else {
+        return;
+      }
     }
     if (reconnecting.has(key)) return;
 
@@ -1450,6 +2320,8 @@ function createWhatsAppBridge(deps) {
         phone: "",
         profilePicDataUrl: "",
         persisted,
+        needsQrRelink: false,
+        phaseSince: null,
       };
     }
     return {
@@ -1463,6 +2335,10 @@ function createWhatsAppBridge(deps) {
       phone: entry.phone || "",
       profilePicDataUrl: typeof entry.profilePicDataUrl === "string" ? entry.profilePicDataUrl : "",
       persisted,
+      needsQrRelink: Boolean(
+        persisted && entry.phase === "qr" && entry.linkIntent !== "user_qr"
+      ),
+      phaseSince: Number.isFinite(Number(entry.phaseSince)) ? Number(entry.phaseSince) : null,
     };
   }
 
@@ -1487,10 +2363,23 @@ function createWhatsAppBridge(deps) {
       const key = slotKey(safe, accountId);
       const slotEntry = slots.get(key);
       const persisted = hasPersistedAccountSession(safe, accountId);
-      if (persisted && (!slotEntry || slotEntry.phase !== "ready") && !reconnecting.has(key)) {
-        void ensureConnected(safe, accountId);
-      } else if (slotNeedsAutoReconnect(safe, accountId, slotEntry) && !reconnecting.has(key)) {
-        void ensureConnected(safe, accountId);
+      if (!bulkRestoreInProgress) {
+        const staleAutoRestoreQr =
+          slotEntry?.phase === "qr" && slotEntry.linkIntent !== "user_qr";
+        if (
+          persisted &&
+          !staleAutoRestoreQr &&
+          (!slotEntry || slotEntry.phase !== "ready") &&
+          !reconnecting.has(key)
+        ) {
+          void ensureConnected(safe, accountId);
+        } else if (
+          !staleAutoRestoreQr &&
+          slotNeedsAutoReconnect(safe, accountId, slotEntry) &&
+          !reconnecting.has(key)
+        ) {
+          void ensureConnected(safe, accountId);
+        }
       }
       if (slotEntry) maybeRefreshProfilePic(slotEntry);
       accounts.push(buildAccountStatus(safe, accountId, slotEntry));
@@ -1509,11 +2398,11 @@ function createWhatsAppBridge(deps) {
   }
 
   async function syncSingleChatToSession(client, workspaceUserId, accountId, chat, label) {
-    if (isWhatsAppGroupChat(chat)) return { action: "skipped", reason: "group" };
+    if (isNonPersonalWhatsAppChat(chat)) return { action: "skipped", reason: "non_personal" };
 
     const jid = chatJidFromChat(chat);
     if (!jid) return { action: "skipped", reason: "no_jid" };
-    if (isWhatsAppGroupJid(jid)) return { action: "skipped", reason: "group" };
+    if (isNonPersonalWhatsAppJid(jid)) return { action: "skipped", reason: "non_personal" };
 
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
@@ -1521,7 +2410,9 @@ function createWhatsAppBridge(deps) {
 
     let waMessages = [];
     try {
-      const fetched = await chat.fetchMessages({ limit: WHATSAPP_SYNC_MESSAGE_LIMIT });
+      const fetchLimit =
+        WHATSAPP_SYNC_MESSAGE_LIMIT > 0 ? WHATSAPP_SYNC_MESSAGE_LIMIT : Infinity;
+      const fetched = await chat.fetchMessages({ limit: fetchLimit });
       const sorted = (Array.isArray(fetched) ? fetched : []).sort(
         (a, b) => (Number(a?.timestamp) || 0) - (Number(b?.timestamp) || 0)
       );
@@ -1598,7 +2489,7 @@ function createWhatsAppBridge(deps) {
 
       let chats = [];
       try {
-        chats = await client.getChats();
+        chats = await fetchClientChatsWithRetry(client);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         waLog(safe, safeAccountId, "sync getChats failed", msg);
@@ -1609,9 +2500,9 @@ function createWhatsAppBridge(deps) {
       let updated = 0;
       let skipped = 0;
 
-      // Personal chats only — never fetch or store WhatsApp group messages.
+      // Personal chats only — never fetch or store group / channel / status messages.
       const personalChats = (Array.isArray(chats) ? chats : []).filter(
-        (chat) => !isWhatsAppGroupChat(chat)
+        (chat) => !isNonPersonalWhatsAppChat(chat)
       );
       skipped += (Array.isArray(chats) ? chats.length : 0) - personalChats.length;
 
@@ -1739,6 +2630,84 @@ function createWhatsAppBridge(deps) {
     };
   }
 
+  async function resolveReadyClientForAccount(workspaceUserId, accountId) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    if (!safe) return null;
+    const primaryKey = slotKey(safe, safeAccountId);
+    const primary = slots.get(primaryKey);
+    if (primary?.client && primary.phase === "ready") {
+      return { client: primary.client, accountId: safeAccountId };
+    }
+    for (const [slotId, slotEntry] of slots.entries()) {
+      if (!slotId.startsWith(`${safe}::`)) continue;
+      if (!slotEntry?.client || slotEntry.phase !== "ready") continue;
+      return { client: slotEntry.client, accountId: slotId.split("::")[1] || safeAccountId };
+    }
+    return null;
+  }
+
+  async function editWhatsAppMessage(workspaceUserId, accountId, messageId, content) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const waMessageId = typeof messageId === "string" ? messageId.trim() : "";
+    const body = typeof content === "string" ? content.trim() : "";
+    if (!safe || !waMessageId || !body) {
+      return { ok: false, message: "Missing user, WhatsApp message id, or new text" };
+    }
+    const resolved = await resolveReadyClientForAccount(safe, safeAccountId);
+    if (!resolved?.client) {
+      return { ok: false, message: "WhatsApp is not connected for this account" };
+    }
+    try {
+      const msg = await resolved.client.getMessageById(waMessageId);
+      if (!msg) {
+        return { ok: false, message: "Message not found on WhatsApp" };
+      }
+      const edited = await msg.edit(body);
+      if (!edited) {
+        return {
+          ok: false,
+          message:
+            "WhatsApp could not edit this message (it may be too old or not editable on WhatsApp).",
+        };
+      }
+      return { ok: true, messageId: waMessageId };
+    } catch (e) {
+      return {
+        ok: false,
+        message: e instanceof Error ? e.message : "WhatsApp edit failed",
+      };
+    }
+  }
+
+  async function deleteWhatsAppMessage(workspaceUserId, accountId, messageId, options = {}) {
+    const safe = sanitizeAgentDetailsUserId(workspaceUserId);
+    const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
+    const waMessageId = typeof messageId === "string" ? messageId.trim() : "";
+    const everyone = options.everyone !== false;
+    if (!safe || !waMessageId) {
+      return { ok: false, message: "Missing user or WhatsApp message id" };
+    }
+    const resolved = await resolveReadyClientForAccount(safe, safeAccountId);
+    if (!resolved?.client) {
+      return { ok: false, message: "WhatsApp is not connected for this account" };
+    }
+    try {
+      const msg = await resolved.client.getMessageById(waMessageId);
+      if (!msg) {
+        return { ok: false, message: "Message not found on WhatsApp" };
+      }
+      await msg.delete(everyone);
+      return { ok: true, messageId: waMessageId };
+    } catch (e) {
+      return {
+        ok: false,
+        message: e instanceof Error ? e.message : "WhatsApp delete failed",
+      };
+    }
+  }
+
   async function startLinking(workspaceUserId, accountId = "1", options = {}) {
     const safe = sanitizeAgentDetailsUserId(workspaceUserId);
     const safeAccountId = sanitizeWhatsAppAccountId(accountId) || "1";
@@ -1792,7 +2761,7 @@ function createWhatsAppBridge(deps) {
     const webCachePath = resolveUserWebCacheDir(safe, safeAccountId);
     const localAuthClientId = localAuthClientIdForAccount(safeAccountId);
     const localAuthProfileDir = path.join(authRoot, `session-${localAuthClientId}`);
-    releaseLinuxProfileDir(localAuthProfileDir);
+    releaseStaleBrowserProfileDir(localAuthProfileDir);
 
     sanitizeWebCacheDir(webCachePath, WHATSAPP_WEB_VERSION);
     try {
@@ -1812,11 +2781,11 @@ function createWhatsAppBridge(deps) {
         clientId: localAuthClientId,
         dataPath: authRoot,
       }),
+      authTimeoutMs: 120000,
       // Prefer this server session, but give a brief window so a second Web client
       // does not thrash the link into a disconnect loop.
       takeoverOnConflict: true,
       takeoverTimeoutMs: 10000,
-      restartOnAuthFail: true,
       webVersion: WHATSAPP_WEB_VERSION,
       webVersionCache: {
         type: "local",
@@ -1845,6 +2814,7 @@ function createWhatsAppBridge(deps) {
       entry.qrDataUrl = "";
       whatsappAutoStart.addLink(safe, safeAccountId);
       startReadyWatchdog(entry, safe, safeAccountId);
+      startConnectionProbe(entry, client, safe, safeAccountId, key, options);
       waLog(safe, safeAccountId, "account login authenticated");
     });
 
@@ -1852,6 +2822,7 @@ function createWhatsAppBridge(deps) {
       const pct = Number(percent);
       if (Number.isFinite(pct) && pct >= 99 && ["authenticated", "initializing"].includes(entry.phase)) {
         startReadyWatchdog(entry, safe, safeAccountId);
+        void probeEntryConnection(entry, client, safe, safeAccountId, key, options);
       }
     });
 
@@ -1862,50 +2833,7 @@ function createWhatsAppBridge(deps) {
     });
 
     client.on("ready", () => {
-      clearReadyWatchdog(entry);
-      setEntryPhase(entry, "ready");
-      entry.qrDataUrl = "";
-      const wid = client.info?.wid;
-      entry.phone = wid?.user || "";
-      entry.pushname = channelLabelFromClient(client);
-      failedReconnectCounts.delete(key);
-      lastReconnectAttemptAt.delete(key);
-      reconnectBackoffMs.delete(key);
-      const pendingTimer = pendingReconnectTimers.get(key);
-      if (pendingTimer) {
-        clearTimeout(pendingTimer);
-        pendingReconnectTimers.delete(key);
-      }
-      whatsappAutoStart.addLink(safe, safeAccountId);
-      startPageKeepAlive(entry, safe, safeAccountId);
-      if (entry.linkIntent === "user_qr" && typeof onAccountLinkedViaQr === "function") {
-        onAccountLinkedViaQr(safe, safeAccountId, {
-          pushname: entry.pushname,
-          phone: entry.phone,
-          label: `Account ${safeAccountId}`,
-        });
-      }
-      entry.linkIntent = "auto_restore";
-      void profilePicDataUrlFromClient(client).then((dataUrl) => {
-        entry.profilePicDataUrl = typeof dataUrl === "string" ? dataUrl : "";
-      });
-      waLog(
-        safe,
-        safeAccountId,
-        `linked and ready (account=${entry.pushname || "unknown"}${entry.phone ? ` · ${entry.phone}` : ""})`
-      );
-      if (!bulkRestoreInProgress && !options.deferConversationSync) {
-        setTimeout(() => {
-          void syncConversationsForAccount(safe, safeAccountId).catch((e) => {
-            waLog(
-              safe,
-              safeAccountId,
-              "auto conversation sync failed",
-              e instanceof Error ? e.message : String(e)
-            );
-          });
-        }, 3000);
-      }
+      finalizeEntryReady(entry, client, safe, safeAccountId, key, options);
     });
 
     client.on("change_state", (state) => {
@@ -1913,9 +2841,8 @@ function createWhatsAppBridge(deps) {
       if (!normalized) return;
       waLog(safe, safeAccountId, "change_state", normalized);
       if (normalized === "CONNECTED") {
-        if (entry.phase !== "ready") setEntryPhase(entry, "ready");
+        finalizeEntryReady(entry, client, safe, safeAccountId, key, options);
         clearReconnectState(key);
-        startPageKeepAlive(entry, safe, safeAccountId);
         return;
       }
       if (["OPENING", "PAIRING"].includes(normalized)) return;
@@ -1944,224 +2871,86 @@ function createWhatsAppBridge(deps) {
     });
 
     /**
-     * Persist messages sent from the linked WhatsApp phone/desktop (fromMe).
-     * The `message` event does not fire for those; `message_create` does.
-     * Do not run AI — only append to the conversation thread.
+     * Persist every created message (inbound + outbound). The `message` event does not fire for
+     * outbound phone/desktop sends; inbound is persisted here first so slow contact lookups never
+     * block saving new contacts.
      */
     client.on("message_create", async (msg) => {
-      if (!msg?.fromMe) return;
-
+      if (isIgnoredWhatsAppMessage(msg)) return;
       const jid = peerJidFromWhatsAppMessage(msg);
-      if (!jid || isWhatsAppGroupJid(jid)) return;
+      if (!jid || isNonPersonalWhatsAppJid(jid)) return;
 
-      try {
-        const chat = await msg.getChat();
-        if (isWhatsAppGroupChat(chat)) return;
-      } catch {
-        /* ignore */
-      }
-
-      try {
-        const outboundRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, client);
-        if (!outboundRecord) return;
-
-        const conversationId = jidToConversationId(jid);
-        const existing = getTestChatSessionByConversation(safe, conversationId);
-        const existingMessages = Array.isArray(existing?.messages) ? existing.messages : [];
-        if (
-          sessionAlreadyHasOutboundContent(
-            existingMessages,
-            outboundRecord.content,
-            Array.isArray(outboundRecord.attachments) ? outboundRecord.attachments.length : 0
-          )
-        ) {
-          return;
+      const conversationId = jidToConversationId(jid);
+      void runSerializedConversationPersist(safe, conversationId, async () => {
+        try {
+          if (msg.fromMe) {
+            await persistOutboundWhatsAppMessage(safe, safeAccountId, key, client, msg);
+          } else {
+            await persistInboundWhatsAppMessage(safe, safeAccountId, key, client, msg);
+          }
+        } catch (e) {
+          waLog(
+            safe,
+            safeAccountId,
+            msg.fromMe ? "failed syncing outbound WhatsApp message" : "failed saving inbound WhatsApp message",
+            e instanceof Error ? e.message : String(e)
+          );
         }
-
-        const entryNow = slots.get(key);
-        const label =
-          channelLabelFromClient(client) ||
-          (entryNow && entryNow.pushname) ||
-          (entryNow && entryNow.phone) ||
-          `WhatsApp ${safeAccountId}`;
-
-        // Append directly so main_account rows are not dropped by the agent-merge filter.
-        const nextMessages = [...existingMessages, outboundRecord];
-
-        let whatsappPeerPhone =
-          typeof existing?.whatsappPeerPhone === "string" ? existing.whatsappPeerPhone.trim() : "";
-        if (!whatsappPeerPhone) {
-          whatsappPeerPhone = await resolvePeerPhoneFromJid(client, jid, msg);
-        }
-
-        saveTestChatSession(safe, conversationId, nextMessages, {
-          chatSource: "whatsapp",
-          channelAccountName: label,
-          whatsappChatId: jid,
-          whatsappPeerPhone,
-          whatsappAccountId: safeAccountId,
-          liveAgentEnabled: Boolean(existing?.liveAgentEnabled),
-        });
-      } catch (e) {
-        waLog(
-          safe,
-          safeAccountId,
-          "failed syncing outbound WhatsApp message",
-          e instanceof Error ? e.message : String(e)
-        );
-      }
+      });
     });
 
     client.on("message", async (msg) => {
       if (msg.fromMe) return;
+      if (isIgnoredWhatsAppMessage(msg)) return;
 
       const jid = peerJidFromWhatsAppMessage(msg);
-      // Never read or store group messages — JID check covers getChat() failures.
-      if (!jid || isWhatsAppGroupJid(jid)) return;
+      if (!jid || isNonPersonalWhatsAppJid(jid)) return;
 
-      try {
-        const chat = await msg.getChat();
-        if (isWhatsAppGroupChat(chat)) return;
-      } catch {
-        /* ignore */
-      }
-
-      const conversationId = jidToConversationId(jid);
-
-      const entryNow = slots.get(key);
-      const label =
-        channelLabelFromClient(client) ||
-        (entryNow && entryNow.pushname) ||
-        (entryNow && entryNow.phone) ||
-        `WhatsApp ${safeAccountId}`;
-
-      if (isStaleWhatsAppMessage(msg)) {
-        const incomingStale = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, client);
-        if (incomingStale) {
-          const existingStale = getTestChatSessionByConversation(safe, conversationId);
-          const priorStale = priorMessagesFromSession(existingStale).filter(
-            (m) => m.role === "user" || m.role === "assistant"
-          );
-          const messagesStale = mergeAgentMessagesPreservingOrder
-            ? mergeAgentMessagesPreservingOrder(existingStale?.messages, [...priorStale, incomingStale])
-            : [...priorStale, incomingStale];
-          const whatsappPeerPhoneStale = await resolvePeerWhatsappPhone(client, msg);
-          saveTestChatSession(safe, conversationId, messagesStale, {
-            chatSource: "whatsapp",
-            channelAccountName: label,
-            whatsappChatId: jid,
-            whatsappPeerPhone: whatsappPeerPhoneStale,
-            whatsappAccountId: safeAccountId,
-          });
-        }
+      void handleInboundWhatsAppAiReply(safe, safeAccountId, key, client, msg).catch((e) => {
         waLog(
           safe,
           safeAccountId,
-          `skipped auto-reply for stale message (${Math.round(getWhatsAppMessageAgeMs(msg) / 1000)}s old)`
+          "inbound AI handling failed",
+          e instanceof Error ? e.message : String(e)
         );
-        return;
-      }
-
-      const incomingRecord = await whatsappMessageToRecord(msg, sanitizeMessageAttachments, client);
-      if (!incomingRecord) return;
-
-      const existing = getTestChatSessionByConversation(safe, conversationId);
-      const prior = priorMessagesFromSession(existing).filter(
-        (m) => m.role === "user" || m.role === "assistant"
-      );
-      const priorForAi = priorMessagesFromSession(existing)
-        .filter(
-          (m) => m.role === "user" || m.role === "assistant" || m.role === "main_account"
-        )
-        .map((m) => (m.role === "main_account" ? { ...m, role: "assistant" } : m));
-      const whatsappPeerPhone = await resolvePeerWhatsappPhone(client, msg);
-      const sessionOpts = {
-        chatSource: "whatsapp",
-        channelAccountName: label,
-        whatsappChatId: jid,
-        whatsappPeerPhone,
-        whatsappAccountId: safeAccountId,
-      };
-
-      if (!incomingRecord.content) {
-        const messagesMediaOnly = mergeAgentMessagesPreservingOrder
-          ? mergeAgentMessagesPreservingOrder(existing?.messages, [...prior, incomingRecord])
-          : [...prior, incomingRecord];
-        saveTestChatSession(safe, conversationId, messagesMediaOnly, sessionOpts);
-        return;
-      }
-
-      const messagesForAi = sanitizeChatMessages([
-        ...priorForAi,
-        {
-          role: "user",
-          content: incomingRecord.content,
-          ...(incomingRecord.createdAt ? { createdAt: incomingRecord.createdAt } : {}),
-        },
-      ]);
-
-      const result = await completeWorkspaceChatTurn({
-        userId: safe,
-        conversationId,
-        messages: messagesForAi,
-        ...sessionOpts,
       });
-
-      if (Array.isArray(incomingRecord.attachments) && incomingRecord.attachments.length) {
-        const refreshed = getTestChatSessionByConversation(safe, conversationId);
-        if (refreshed?.messages?.length) {
-          const patched = [...refreshed.messages];
-          for (let i = patched.length - 1; i >= 0; i -= 1) {
-            if (patched[i]?.role === "user") {
-              patched[i] = { ...patched[i], attachments: incomingRecord.attachments };
-              break;
-            }
-          }
-          saveTestChatSession(safe, conversationId, patched, {
-            ...sessionOpts,
-            liveAgentEnabled: Boolean(refreshed.liveAgentEnabled),
-          });
-        }
-      }
-
-      if (result.kind === "success" && typeof result.reply === "string" && result.reply.trim()) {
-        await deliverAssistantText(client, msg, result.reply);
-        return;
-      }
-
-      if (result.kind === "live_agent" || result.kind === "ai_disabled") {
-        return;
-      }
-
-      const fallbackCopy = (() => {
-        if (result.kind === "openai_missing") {
-          return (
-            "Automatic replies aren't available — the server has no AI API key configured. " +
-            "Your message was saved; please contact the workspace owner."
-          );
-        }
-        if (result.kind === "error") {
-          return (
-            "Sorry — I couldn't generate a reply right now. Your message was saved; please try again shortly."
-          );
-        }
-        if (result.kind === "validation_error") {
-          return "";
-        }
-        return "";
-      })();
-
-      if (fallbackCopy) {
-        await deliverAssistantText(client, msg, fallbackCopy);
-      }
     });
 
-    try {
+    const initializeClient = async () => {
       await client.initialize();
+      const browserPid = readClientBrowserPid(client);
+      if (browserPid) registerProtectedBrowserPid(browserPid);
       waLog(safe, safeAccountId, "client initialize() called successfully");
+      startReadyWatchdog(entry, safe, safeAccountId);
+      startConnectionProbe(entry, client, safe, safeAccountId, key, options);
+    };
+
+    try {
+      await initializeClient();
     } catch (e) {
-      setEntryPhase(entry, "error");
       const message = e instanceof Error ? e.message : String(e);
+      if (isBrowserAlreadyRunningError(message)) {
+        waLog(
+          safe,
+          safeAccountId,
+          "browser profile still locked — releasing stale Chrome and retrying once"
+        );
+        releaseStaleBrowserProfileDir(localAuthProfileDir);
+        await sleepMs(500);
+        try {
+          await initializeClient();
+          return { ok: true };
+        } catch (retryErr) {
+          const retryMessage = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          setEntryPhase(entry, "error");
+          entry.error = formatBrowserLaunchHelp(
+            "Failed to launch browser for WhatsApp Web. " + retryMessage
+          );
+          waLog(safe, safeAccountId, "initialize failed after profile cleanup", entry.error);
+          return { ok: false, error: entry.error };
+        }
+      }
+      setEntryPhase(entry, "error");
       entry.error = formatBrowserLaunchHelp(
         "Failed to launch browser for WhatsApp Web. " + message
       );
@@ -2271,7 +3060,13 @@ function createWhatsAppBridge(deps) {
     const readyTimeoutMs =
       Number(options.readyTimeoutMs) > 0 ? Number(options.readyTimeoutMs) : 180000;
     const maxAttempts = Number(options.maxAttempts) > 0 ? Number(options.maxAttempts) : 3;
-    const retryDelayMs = Number(options.retryDelayMs) > 0 ? Number(options.retryDelayMs) : 2000;
+    const bootRestore = options.boot === true;
+    const retryDelayMs =
+      Number(options.retryDelayMs) > 0
+        ? Number(options.retryDelayMs)
+        : bootRestore
+          ? 500
+          : 2000;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
     await warmupForRestore();
@@ -2298,6 +3093,7 @@ function createWhatsAppBridge(deps) {
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
           waLog(uid, accountId, `restore attempt ${attempt}/${maxAttempts}`);
+          releaseStaleBrowserProfileDir(resolveAccountSessionDir(uid, accountId));
           const startResult = await startLinking(uid, accountId, {
             deferConversationSync: true,
           });
@@ -2315,15 +3111,32 @@ function createWhatsAppBridge(deps) {
             break;
           }
 
-          const wait = await waitForSlotPhase(uid, accountId, ["ready"], readyTimeoutMs);
+          const wait = await waitForSlotPhase(
+            uid,
+            accountId,
+            ["ready", "authenticated"],
+            readyTimeoutMs
+          );
           if (wait.ok && wait.phase === "ready") {
             restored = true;
             break;
           }
+          if (wait.ok && wait.phase === "authenticated") {
+            const readyWait = await waitForSlotPhase(uid, accountId, ["ready"], 90000);
+            if (readyWait.ok && readyWait.phase === "ready") {
+              restored = true;
+              break;
+            }
+          }
 
           const phaseNow = slots.get(slotKey(uid, accountId))?.phase || wait.phase;
           if (phaseNow === "qr") {
-            lastReason = "session_expired_needs_qr";
+            lastReason = "needs_qr_rescan";
+            const qrEntry = slots.get(slotKey(uid, accountId));
+            if (qrEntry) {
+              // Keep the live QR client — user can scan from Integrations without wiping auth files.
+              qrEntry.linkIntent = "user_qr";
+            }
             break;
           }
           lastReason = wait.error || phaseNow || "not_ready";
@@ -2332,6 +3145,7 @@ function createWhatsAppBridge(deps) {
         }
 
         if (attempt < maxAttempts) {
+          await destroyClient(uid, accountId);
           const delayMs = retryDelayMs * attempt;
           waLog(uid, accountId, `restore retry in ${delayMs}ms`, lastReason);
           await sleep(delayMs);
@@ -2345,17 +3159,12 @@ function createWhatsAppBridge(deps) {
       }
 
       waLog(uid, accountId, "restore failed", lastReason || "unknown");
-      const isSessionInvalid =
-        lastReason === "session_expired_needs_qr" || /auth.?fail/i.test(lastReason);
-      if (isSessionInvalid) {
+      const isAuthFailure = /auth.?fail/i.test(lastReason);
+      if (isAuthFailure) {
+        await destroyClient(uid, accountId);
         removeAuthSession(uid, accountId);
         whatsappAutoStart.removeLink(uid, accountId);
         failedReconnectCounts.delete(slotKey(uid, accountId));
-        const staleKey = slotKey(uid, accountId);
-        const staleEntry = slots.get(staleKey);
-        if (staleEntry && staleEntry.phase !== "ready") {
-          slots.delete(staleKey);
-        }
         waLog(uid, accountId, "cleared invalid session (reason: " + lastReason + ")");
       }
       return { userId: uid, accountId, ok: false, reason: lastReason || "unknown" };
@@ -2384,6 +3193,8 @@ function createWhatsAppBridge(deps) {
 
     const restoredAccounts = results.filter((r) => r?.ok);
     restoredAccounts.forEach((r, index) => {
+      // Stagger post-restore sync so multiple Chrome instances do not call getChats() at once.
+      const syncDelayMs = bootRestore ? 15000 + index * 15000 : 4000 + index * 2000;
       setTimeout(() => {
         void syncConversationsForAccount(r.userId, r.accountId).catch((e) => {
           waLog(
@@ -2393,7 +3204,7 @@ function createWhatsAppBridge(deps) {
             e instanceof Error ? e.message : String(e)
           );
         });
-      }, 4000 + index * 2000);
+      }, syncDelayMs);
     });
 
     return results.filter(Boolean);
@@ -2404,6 +3215,7 @@ function createWhatsAppBridge(deps) {
   async function warmupForRestore() {
     if (!warmupPromise) {
       warmupPromise = (async () => {
+        releaseAllPersistedBrowserProfiles();
         const webCachePath = resolveSharedWebCacheDir();
         resolveChromeExecutablePath();
         sanitizeWebCacheDir(webCachePath, WHATSAPP_WEB_VERSION);
@@ -2465,6 +3277,7 @@ function createWhatsAppBridge(deps) {
   }
 
   async function runConnectionWatchdog() {
+    if (bulkRestoreInProgress) return;
     const now = Date.now();
     const links = whatsappAutoStart.readRestoreLinks();
 
@@ -2514,7 +3327,12 @@ function createWhatsAppBridge(deps) {
         entry.linkIntent !== "user_qr" &&
         stuckMs >= WATCHDOG_STUCK_LINKING_MS
       ) {
-        await forceWatchdogRestart(uid, accountId, "stale_restore_qr");
+        // Auto-restore QR means the saved session is invalid — do not relaunch Chrome in a loop.
+        waLog(
+          uid,
+          accountId,
+          "watchdog: auto-restore requires QR rescan (session stale); waiting for manual relink"
+        );
         continue;
       }
 
@@ -2596,14 +3414,48 @@ function createWhatsAppBridge(deps) {
     );
   }
 
+  function startPeriodicConversationSyncLoop() {
+    let syncIndex = 0;
+    const timer = setInterval(() => {
+      if (bulkRestoreInProgress) return;
+      const readySlots = [];
+      for (const [key, entry] of slots.entries()) {
+        if (!entry?.client || entry.phase !== "ready") continue;
+        const parts = String(key).split("::");
+        if (parts.length !== 2) continue;
+        readySlots.push({ userId: parts[0], accountId: parts[1], key });
+      }
+      if (!readySlots.length) return;
+      const slot = readySlots[syncIndex % readySlots.length];
+      syncIndex += 1;
+      if (syncingConversations.has(slot.key)) return;
+      void syncConversationsForAccount(slot.userId, slot.accountId).catch((e) => {
+        waLog(
+          slot.userId,
+          slot.accountId,
+          "periodic conversation sync failed",
+          e instanceof Error ? e.message : String(e)
+        );
+      });
+    }, PERIODIC_CONVERSATION_SYNC_INTERVAL_MS);
+    if (typeof timer.unref === "function") timer.unref();
+    waLog(
+      "system",
+      "sync",
+      `periodic conversation sync started (every ${PERIODIC_CONVERSATION_SYNC_INTERVAL_MS / 1000}s, round-robin per account)`
+    );
+  }
+
   function startBackgroundReconnectLoop() {
     const timer = setInterval(() => {
+      if (bulkRestoreInProgress) return;
       listPersistedAccountLinks().forEach((link) => {
         const uid = link.userId;
         const accountId = link.accountId;
         const key = slotKey(uid, accountId);
         const slotEntry = slots.get(key);
         if (slotEntry?.phase === "ready") return;
+        if (slotEntry?.phase === "qr" && slotEntry.linkIntent !== "user_qr") return;
         if (!slotNeedsAutoReconnect(uid, accountId, slotEntry) && slotEntry) return;
         if (reconnecting.has(key)) return;
         void ensureConnected(uid, accountId);
@@ -2620,6 +3472,7 @@ function createWhatsAppBridge(deps) {
   startBackgroundReconnectLoop();
   startConnectionHealthLoop();
   startConnectionWatchdog();
+  startPeriodicConversationSyncLoop();
 
   return {
     startLinking,
@@ -2632,6 +3485,8 @@ function createWhatsAppBridge(deps) {
     disconnectAndForget,
     getStatus,
     sendText,
+    editWhatsAppMessage,
+    deleteWhatsAppMessage,
     syncConversations,
     syncConversationsForAccount,
     resolvePeerPhone,
@@ -2648,4 +3503,7 @@ module.exports = {
   jidToConversationId,
   conversationIdToWhatsappJid,
   isWhatsAppGroupJid,
+  isWhatsAppStatusJid,
+  isWhatsAppChannelJid,
+  isNonPersonalWhatsAppJid,
 };

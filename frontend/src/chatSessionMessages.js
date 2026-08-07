@@ -1,11 +1,12 @@
 export const CHAT_SESSION_POLL_MS = 4000;
 export const CHAT_SESSION_POLL_FAST_MS = 2000;
 export const CHATS_OPERATOR_POLL_MS = 2000;
-export const CHATS_OPERATOR_POLL_FAST_MS = 1500;
+export const CHATS_OPERATOR_POLL_FAST_MS = 1000;
+export const CHATS_WA_CONNECTED_POLL_MS = 1000;
 /** WhatsApp status on Chats — less frequent than session list polls. */
 export const CHATS_WA_STATUS_POLL_MS = 8000;
 /** Active thread refresh while a conversation is open. */
-export const CHATS_ACTIVE_THREAD_POLL_MS = 1500;
+export const CHATS_ACTIVE_THREAD_POLL_MS = 1000;
 
 /** Split message text into lines so chat bubbles can preserve line breaks. */
 export function splitMessageLines(text) {

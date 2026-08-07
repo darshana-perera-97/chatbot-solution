@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { apiUrl } from "../apiBase";
 import { getWorkspaceUserProfile } from "../auth/userSession";
+import {
+  nextBadgeColor,
+  normalizeConversationBadges,
+  slugifyBadgeId,
+} from "../conversationBadges";
 
 const colorFields = [
   {
@@ -51,7 +56,10 @@ function Settings() {
     sendButtonColor: "#7C3AED",
     launcherImage: "",
     aiRepliesEnabled: true,
+    conversationBadges: [],
   });
+  const [newBadgeLabel, setNewBadgeLabel] = useState("");
+  const [newBadgeColor, setNewBadgeColor] = useState("#7C3AED");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState("");
@@ -69,6 +77,7 @@ function Settings() {
     sendButtonColor: "#7C3AED",
     launcherImage: "",
     aiRepliesEnabled: true,
+    conversationBadges: [],
   });
 
   useEffect(() => {
@@ -100,9 +109,11 @@ function Settings() {
           sendButtonColor: settings.sendButtonColor || "#7C3AED",
           launcherImage: typeof settings.launcherImage === "string" ? settings.launcherImage : "",
           aiRepliesEnabled: settings.aiRepliesEnabled !== false,
+          conversationBadges: normalizeConversationBadges(settings.conversationBadges),
         };
         setForm(next);
         setLastSaved(next);
+        setNewBadgeColor(nextBadgeColor(next.conversationBadges));
       } catch (err) {
         if (!active) return;
         setError(err instanceof Error ? err.message : "Could not load settings");
@@ -205,7 +216,7 @@ function Settings() {
 </html>`,
     [embedScriptSrc, userId, embedApiBase, previewThemeAttr, previewLauncherImageAttr]
   );
-  const hasColorChanges =
+  const hasChanges =
     form.primaryColor !== lastSaved.primaryColor ||
     form.accentColor !== lastSaved.accentColor ||
     form.backgroundColor !== lastSaved.backgroundColor ||
@@ -217,7 +228,49 @@ function Settings() {
     form.receiverMessageTextColor !== lastSaved.receiverMessageTextColor ||
     form.sendButtonColor !== lastSaved.sendButtonColor ||
     form.launcherImage !== lastSaved.launcherImage ||
-    form.aiRepliesEnabled !== lastSaved.aiRepliesEnabled;
+    form.aiRepliesEnabled !== lastSaved.aiRepliesEnabled ||
+    JSON.stringify(form.conversationBadges) !== JSON.stringify(lastSaved.conversationBadges);
+
+  const onAddBadge = () => {
+    const label = newBadgeLabel.trim();
+    if (!label) {
+      setError("Enter a badge label.");
+      return;
+    }
+    if (form.conversationBadges.length >= 30) {
+      setError("You can add up to 30 badges.");
+      return;
+    }
+    const existingIds = new Set(form.conversationBadges.map((badge) => badge.id));
+    const id = slugifyBadgeId(label, existingIds);
+    const nextBadges = [
+      ...form.conversationBadges,
+      { id, label: label.slice(0, 40), color: newBadgeColor },
+    ];
+    setForm((prev) => ({ ...prev, conversationBadges: nextBadges }));
+    setNewBadgeLabel("");
+    setNewBadgeColor(nextBadgeColor(nextBadges));
+    setError("");
+    setStatus("");
+  };
+
+  const onRemoveBadge = (badgeId) => {
+    setForm((prev) => ({
+      ...prev,
+      conversationBadges: prev.conversationBadges.filter((badge) => badge.id !== badgeId),
+    }));
+    setStatus("");
+  };
+
+  const onUpdateBadge = (badgeId, patch) => {
+    setForm((prev) => ({
+      ...prev,
+      conversationBadges: prev.conversationBadges.map((badge) =>
+        badge.id === badgeId ? { ...badge, ...patch } : badge
+      ),
+    }));
+    setStatus("");
+  };
 
   const onLauncherFileChange = (e) => {
     const file = e.target.files?.[0];
@@ -246,7 +299,7 @@ function Settings() {
   };
 
   const onSave = async () => {
-    if (!userId || saving || !hasColorChanges) return;
+    if (!userId || saving || !hasChanges) return;
     setSaving(true);
     setStatus("");
     setError("");
@@ -259,7 +312,12 @@ function Settings() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.message || "Could not save settings");
       setStatus("Widget settings saved.");
-      setLastSaved({ ...form });
+      const savedForm = {
+        ...form,
+        conversationBadges: normalizeConversationBadges(data?.settings?.conversationBadges || form.conversationBadges),
+      };
+      setForm(savedForm);
+      setLastSaved(savedForm);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save settings");
     } finally {
@@ -369,11 +427,98 @@ function Settings() {
             </div>
           </div>
 
+          <div className="mt-5 rounded-xl border border-[#EEE8FF] bg-white px-3 py-3 shadow-[0_4px_12px_rgba(124,58,237,0.05)]">
+            <div>
+              <p className="text-sm font-semibold text-slate-800">Conversation badges</p>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Create badges your team can assign to conversations on the Chats page. Each conversation can have one badge.
+              </p>
+            </div>
+
+            {form.conversationBadges.length ? (
+              <ul className="mt-3 space-y-2">
+                {form.conversationBadges.map((badge) => (
+                  <li
+                    key={badge.id}
+                    className="flex flex-wrap items-center gap-2 rounded-lg border border-[#EEE8FF] bg-[#FCFAFF] px-2.5 py-2"
+                  >
+                    <span
+                      className="inline-flex rounded-md border px-2 py-0.5 text-[11px] font-semibold"
+                      style={{
+                        backgroundColor: `${badge.color}1A`,
+                        color: badge.color,
+                        borderColor: `${badge.color}55`,
+                      }}
+                    >
+                      {badge.label}
+                    </span>
+                    <input
+                      type="text"
+                      value={badge.label}
+                      onChange={(e) => onUpdateBadge(badge.id, { label: e.target.value.slice(0, 40) })}
+                      className="min-w-0 flex-1 rounded-lg border border-[#E9DFFF] bg-white px-2.5 py-1.5 text-xs text-slate-700 outline-none focus:border-[#C4B5FD]"
+                      maxLength={40}
+                    />
+                    <input
+                      type="color"
+                      value={badge.color}
+                      onChange={(e) => onUpdateBadge(badge.id, { color: e.target.value.toUpperCase() })}
+                      className="h-9 w-11 cursor-pointer rounded-lg border border-[#DDD6FE] bg-white p-1"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => onRemoveBadge(badge.id)}
+                      className="rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50"
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-3 text-xs text-slate-500">No badges yet. Add your first badge below.</p>
+            )}
+
+            <div className="mt-3 flex flex-wrap items-end gap-2">
+              <label className="min-w-[160px] flex-1">
+                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  New badge label
+                </span>
+                <input
+                  type="text"
+                  value={newBadgeLabel}
+                  onChange={(e) => setNewBadgeLabel(e.target.value)}
+                  placeholder="e.g. VIP, Follow up"
+                  maxLength={40}
+                  className="w-full rounded-lg border border-[#E9DFFF] bg-[#FCFAFF] px-2.5 py-2 text-sm text-slate-700 outline-none focus:border-[#C4B5FD] focus:ring-2 focus:ring-[#8B5CF6]/20"
+                />
+              </label>
+              <label>
+                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Color
+                </span>
+                <input
+                  type="color"
+                  value={newBadgeColor}
+                  onChange={(e) => setNewBadgeColor(e.target.value.toUpperCase())}
+                  className="h-10 w-12 cursor-pointer rounded-lg border border-[#DDD6FE] bg-white p-1"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={onAddBadge}
+                className="rounded-lg border border-[#DDD6FE] bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-[#F8F5FF]"
+              >
+                Add badge
+              </button>
+            </div>
+          </div>
+
           <div className="mt-5 flex items-center gap-3">
             <button
               type="button"
               onClick={onSave}
-              disabled={saving || !userId || !hasColorChanges}
+              disabled={saving || !userId || !hasChanges}
               className="rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#A78BFA] px-5 py-2.5 text-sm font-semibold text-white shadow-md shadow-[#8B5CF6]/25 transition hover:opacity-95 disabled:opacity-50"
             >
               {saving ? "Saving..." : "Save settings"}

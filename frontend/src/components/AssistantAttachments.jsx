@@ -107,6 +107,8 @@ const VARIANT_STYLES = {
     fileTitle: "text-slate-600",
     link: "text-violet-700 decoration-violet-300 hover:text-violet-900",
     imageButton: "hover:opacity-95",
+    expiredBox: "border-dashed border-slate-300/90 bg-slate-100/80",
+    expiredText: "text-slate-500",
   },
   embed: {
     wrap: "mt-2 space-y-2 border-t border-slate-200/80 pt-2",
@@ -117,6 +119,8 @@ const VARIANT_STYLES = {
     fileTitle: "text-slate-600",
     link: "text-violet-700 decoration-violet-300 hover:text-violet-900",
     imageButton: "hover:opacity-95",
+    expiredBox: "border-dashed border-slate-300/90 bg-slate-100/80",
+    expiredText: "text-slate-500",
   },
   customer: {
     wrap: "mt-2 space-y-2 border-t border-white/25 pt-2",
@@ -127,8 +131,20 @@ const VARIANT_STYLES = {
     fileTitle: "text-white/90",
     link: "text-white underline decoration-white/50 hover:text-white",
     imageButton: "hover:opacity-90",
+    expiredBox: "border-dashed border-white/40 bg-white/10",
+    expiredText: "text-white/70",
   },
 };
+
+function ExpiredMediaNotice({ label, styles }) {
+  return (
+    <div className={`rounded-lg border px-3 py-2 ${styles.expiredBox}`}>
+      <p className={`text-[11px] font-medium ${styles.expiredText}`}>
+        {label} — removed after 14 days
+      </p>
+    </div>
+  );
+}
 
 export function AssistantAttachments({ attachments, variant = "default" }) {
   if (!Array.isArray(attachments) || attachments.length === 0) return null;
@@ -142,7 +158,18 @@ export function AssistantAttachments({ attachments, variant = "default" }) {
       </p>
       <div className="flex flex-col gap-2">
         {attachments.map((a, i) => {
-          const key = `${a.kind}-${i}-${a.imageName || a.pdfName || a.videoName || a.fileName || ""}`;
+          const key = `${a.kind}-${i}-${a.imageName || a.pdfName || a.videoName || a.fileName || ""}-${a.expired ? "expired" : "active"}`;
+          if (a.expired) {
+            const expiredLabel =
+              a.kind === "image"
+                ? a.imageName || "Image"
+                : a.kind === "video"
+                ? a.videoName || "Video"
+                : a.kind === "pdf"
+                ? a.pdfName || "PDF"
+                : a.fileName || "File";
+            return <ExpiredMediaNotice key={key} label={expiredLabel} styles={styles} />;
+          }
           if (a.kind === "image" && typeof a.imageData === "string" && a.imageData.startsWith("data:image/")) {
             const label = a.imageName || "Image";
             return (
