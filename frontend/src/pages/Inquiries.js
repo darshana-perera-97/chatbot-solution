@@ -146,6 +146,7 @@ function Inquiries() {
   const [sourceFilter, setSourceFilter] = useState("all");
   const [exportFilter, setExportFilter] = useState("all");
   const [exportingIds, setExportingIds] = useState(() => new Set());
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
 
   useEffect(() => {
     let active = true;
@@ -276,15 +277,55 @@ function Inquiries() {
     });
   }, [dateFrom, dateTo, enrichedRows, exportFilter, sourceFilter]);
 
-  const withEmail = useMemo(() => {
-    const hasEmail = (row) =>
-      Object.entries(row?.collectedData || {}).some(
-        ([key, value]) => /email/i.test(String(key)) && String(value || "").trim()
-      );
-    return filteredRows.filter(hasEmail).length;
-  }, [filteredRows]);
-
   const filtersActive = Boolean(dateFrom || dateTo || sourceFilter !== "all" || exportFilter !== "all");
+
+  const selectableFilteredIds = useMemo(
+    () =>
+      filteredRows
+        .map((row) => String(row.id || "").trim())
+        .filter(Boolean),
+    [filteredRows]
+  );
+
+  const selectedFilteredCount = useMemo(
+    () => selectableFilteredIds.filter((id) => selectedIds.has(id)).length,
+    [selectableFilteredIds, selectedIds]
+  );
+
+  const allFilteredSelected =
+    selectableFilteredIds.length > 0 &&
+    selectableFilteredIds.every((id) => selectedIds.has(id));
+
+  const someFilteredSelected =
+    selectedFilteredCount > 0 && !allFilteredSelected;
+
+  function toggleRowSelection(rowId) {
+    const id = String(rowId || "").trim();
+    if (!id) return;
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAllFiltered() {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allFilteredSelected) {
+        selectableFilteredIds.forEach((id) => next.delete(id));
+      } else {
+        selectableFilteredIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  }
+
+  const selectedRows = useMemo(
+    () => filteredRows.filter((row) => selectedIds.has(String(row.id || "").trim())),
+    [filteredRows, selectedIds]
+  );
 
   function applyExportUpdates(updates) {
     if (!Array.isArray(updates) || !updates.length) return;
@@ -344,14 +385,16 @@ function Inquiries() {
     }
   }
 
-  async function handleDownloadCsv() {
-    downloadInquiriesCsv(filteredRows);
-    const idsToMark = filteredRows
+  async function handleExportSelected() {
+    if (!selectedRows.length) return;
+    downloadInquiriesCsv(selectedRows);
+    const idsToMark = selectedRows
       .filter((row) => !row.exported && row.id)
       .map((row) => String(row.id));
     if (idsToMark.length) {
       await setExportStatus(idsToMark, true);
     }
+    setSelectedIds(new Set());
   }
 
   return (
@@ -366,12 +409,12 @@ function Inquiries() {
           </div>
           <button
             type="button"
-            onClick={handleDownloadCsv}
-            disabled={loading || filteredRows.length === 0}
+            onClick={handleExportSelected}
+            disabled={loading || selectedRows.length === 0}
             className="inline-flex items-center gap-2 rounded-xl border border-[#E9DFFF] bg-[#FDFCFF] px-4 py-2 text-sm font-semibold text-[#7C3AED] transition hover:bg-[#F6F1FF] disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Download className="h-4 w-4" aria-hidden />
-            Download CSV
+            Export selected{selectedRows.length ? ` (${selectedRows.length})` : ""}
           </button>
         </div>
         <div className="mt-4 flex flex-wrap gap-2 text-xs">
@@ -379,9 +422,11 @@ function Inquiries() {
             Showing: {filteredRows.length}
             {filtersActive ? ` of ${enrichedRows.length}` : ""}
           </span>
-          <span className="rounded-full bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-700">
-            With Email: {withEmail}
-          </span>
+          {selectedFilteredCount > 0 ? (
+            <span className="rounded-full bg-[#EDE9FE] px-2.5 py-1 font-semibold text-[#6D28D9]">
+              Selected: {selectedFilteredCount}
+            </span>
+          ) : null}
         </div>
       </header>
 
@@ -459,7 +504,7 @@ function Inquiries() {
         ) : filteredRows.length === 0 ? (
           <div className="p-6 text-sm text-slate-500">
             {enrichedRows.length === 0
-              ? "No inquiries with email or contact number found yet."
+              ? "No inquiries with contact details found yet."
               : "No inquiries match the selected filters."}
           </div>
         ) : (
@@ -467,8 +512,20 @@ function Inquiries() {
             <table className="min-w-full border-separate border-spacing-y-2 p-2 text-left">
               <thead>
                 <tr className="text-xs uppercase tracking-wide text-slate-400">
+                  <th className="w-10 px-3 py-2 font-medium">
+                    <input
+                      type="checkbox"
+                      checked={allFilteredSelected}
+                      ref={(el) => {
+                        if (el) el.indeterminate = someFilteredSelected;
+                      }}
+                      onChange={toggleSelectAllFiltered}
+                      disabled={selectableFilteredIds.length === 0}
+                      aria-label="Select all inquiries in view"
+                      className="h-4 w-4 rounded border-[#D8CCFF] text-[#7C3AED] focus:ring-[#8B5CF6]/30 disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                  </th>
                   <th className="px-3 py-2 font-medium">Name</th>
-                  <th className="px-3 py-2 font-medium">Email</th>
                   <th className="px-3 py-2 font-medium">Phone</th>
                   <th className="px-3 py-2 font-medium">Source</th>
                   <th className="px-3 py-2 font-medium">Updated</th>
@@ -479,12 +536,23 @@ function Inquiries() {
                 {filteredRows.map((row) => {
                   const rowId = String(row.id || "").trim();
                   const isBusy = rowId ? exportingIds.has(rowId) : false;
+                  const isSelected = rowId ? selectedIds.has(rowId) : false;
                   return (
                     <tr
                       key={row.id || `${row.conversationId}-${row.updatedAt}`}
-                      className="rounded-xl bg-white shadow-sm"
+                      className={`rounded-xl bg-white shadow-sm ${isSelected ? "ring-1 ring-[#C4B5FD]" : ""}`}
                     >
-                      <td className="rounded-l-xl px-3 py-3 text-sm font-semibold text-slate-700">
+                      <td className="rounded-l-xl px-3 py-3">
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          disabled={!rowId}
+                          onChange={() => toggleRowSelection(rowId)}
+                          aria-label={`Select inquiry ${getByLabelLike(row, /name|full\s*name/i)}`}
+                          className="h-4 w-4 rounded border-[#D8CCFF] text-[#7C3AED] focus:ring-[#8B5CF6]/30 disabled:cursor-not-allowed disabled:opacity-50"
+                        />
+                      </td>
+                      <td className="px-3 py-3 text-sm font-semibold text-slate-700">
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
@@ -513,7 +581,6 @@ function Inquiries() {
                           <span>{getByLabelLike(row, /name|full\s*name/i)}</span>
                         </div>
                       </td>
-                      <td className="px-3 py-3 text-sm text-slate-600">{getByLabelLike(row, /email/i)}</td>
                       <td className="px-3 py-3 text-sm text-slate-600">
                         {getByLabelLike(row, /phone|mobile|contact/i)}
                       </td>

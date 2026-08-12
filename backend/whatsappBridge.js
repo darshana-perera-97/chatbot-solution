@@ -1391,6 +1391,12 @@ function createWhatsAppBridge(deps) {
   const PAGE_KEEPALIVE_INTERVAL_MS = 8000;
   const BACKGROUND_RECONNECT_INTERVAL_MS = 10000;
   const PERIODIC_CONVERSATION_SYNC_INTERVAL_MS = 180000;
+  /** Recycle ready Chrome sessions on a fixed uptime to avoid Puppeteer protocol timeouts. */
+  const PERIODIC_CLIENT_RESTART_MS =
+    Number(process.env.WHATSAPP_PERIODIC_RESTART_MS) > 0
+      ? Number(process.env.WHATSAPP_PERIODIC_RESTART_MS)
+      : 2 * 60 * 60 * 1000;
+  const PERIODIC_CLIENT_RESTART_CHECK_INTERVAL_MS = 60000;
   const ACCOUNT_SYNC_DEBOUNCE_MS = 15000;
   const CHAT_SYNC_DEBOUNCE_MS = 3000;
   const FRAME_GLITCH_RECONNECT_THRESHOLD = 3;
@@ -3414,6 +3420,48 @@ function createWhatsAppBridge(deps) {
     );
   }
 
+  async function runPeriodicClientRestart() {
+    if (bulkRestoreInProgress) return;
+    const now = Date.now();
+    const candidates = [];
+
+    for (const [key, entry] of slots.entries()) {
+      if (!entry?.client || entry.phase !== "ready") continue;
+      const parts = String(key).split("::");
+      if (parts.length !== 2) continue;
+      const [uid, accountId] = parts;
+      if (!hasPersistedAccountSession(uid, accountId)) continue;
+      if (watchdogRecovering.has(key) || reconnecting.has(key)) continue;
+
+      const uptimeMs = phaseAgeMs(entry, now);
+      if (uptimeMs >= PERIODIC_CLIENT_RESTART_MS) {
+        candidates.push({ userId: uid, accountId, key, uptimeMs });
+      }
+    }
+
+    if (!candidates.length) return;
+
+    candidates.sort((a, b) => b.uptimeMs - a.uptimeMs);
+    const target = candidates[0];
+    await forceWatchdogRestart(
+      target.userId,
+      target.accountId,
+      `periodic_restart_${Math.round(PERIODIC_CLIENT_RESTART_MS / 3600000)}h`
+    );
+  }
+
+  function startPeriodicClientRestartLoop() {
+    const timer = setInterval(() => {
+      void runPeriodicClientRestart();
+    }, PERIODIC_CLIENT_RESTART_CHECK_INTERVAL_MS);
+    if (typeof timer.unref === "function") timer.unref();
+    waLog(
+      "system",
+      "restart",
+      `periodic client restart loop started (check every ${PERIODIC_CLIENT_RESTART_CHECK_INTERVAL_MS / 1000}s, restart after ${PERIODIC_CLIENT_RESTART_MS / 3600000}h uptime)`
+    );
+  }
+
   function startPeriodicConversationSyncLoop() {
     let syncIndex = 0;
     const timer = setInterval(() => {
@@ -3472,6 +3520,7 @@ function createWhatsAppBridge(deps) {
   startBackgroundReconnectLoop();
   startConnectionHealthLoop();
   startConnectionWatchdog();
+  startPeriodicClientRestartLoop();
   startPeriodicConversationSyncLoop();
 
   return {
