@@ -527,14 +527,14 @@ function Dashboard() {
   }, [sessions]);
 
   return (
-    <div className="dashboard-page relative grid min-h-0 w-full grid-cols-1 gap-5 xl:h-full xl:min-h-0 xl:flex-1 xl:grid-cols-[1fr_300px]">
-      <main className="min-h-0 space-y-5 overflow-y-auto rounded-3xl border border-[#F0E9FF] bg-white p-6 shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
+    <div className="dashboard-page relative grid min-h-0 w-full min-w-0 grid-cols-1 gap-4 sm:gap-5 xl:h-full xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(0,1fr)_minmax(240px,300px)]">
+      <main className="min-h-0 min-w-0 space-y-5 overflow-y-auto rounded-2xl border border-[#F0E9FF] bg-white p-4 shadow-[0_18px_50px_rgba(139,92,246,0.08)] sm:rounded-3xl sm:p-6 xl:min-h-0">
           <header className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h1 className="text-3xl font-bold tracking-tight text-slate-900">
+            <div className="min-w-0">
+              <h1 className="workspace-title">
                 DIY Chatbot Command Center
               </h1>
-              <p className="mt-1 text-sm text-slate-400">{overviewDateLabel} . Workspace Overview</p>
+              <p className="workspace-subtitle">{overviewDateLabel} . Workspace Overview</p>
             </div>
             <div
               title={waDetailLine}
@@ -561,12 +561,12 @@ function Dashboard() {
             </div>
           </header>
 
-          <section className="relative grid overflow-hidden rounded-3xl bg-gradient-to-r from-[#9A6BEB] via-[#8B5CF6] to-[#A78BFA] p-7 text-white shadow-[0_20px_40px_rgba(139,92,246,0.35)] lg:grid-cols-[1fr_220px] lg:items-center">
+          <section className="relative grid overflow-hidden rounded-2xl bg-gradient-to-r from-[#9A6BEB] via-[#8B5CF6] to-[#A78BFA] p-5 text-white shadow-[0_20px_40px_rgba(139,92,246,0.35)] sm:rounded-3xl sm:p-7 lg:grid-cols-[1fr_220px] lg:items-center">
             <div className="absolute -left-8 -top-8 h-32 w-32 rounded-full bg-white/10" />
-            <div className="absolute right-6 top-4 h-16 w-16 rounded-2xl bg-white/15" />
-            <div className="relative z-10">
-              <p className="text-3xl font-semibold">Hello, {displayName}</p>
-              <p className="mt-2 max-w-xl text-sm text-white/85">
+            <div className="absolute right-6 top-4 hidden h-16 w-16 rounded-2xl bg-white/15 sm:block" />
+            <div className="relative z-10 min-w-0">
+              <p className="break-words text-[17px] font-semibold md:text-2xl lg:text-3xl">Hello, {displayName}</p>
+              <p className="mt-1.5 max-w-xl text-[11px] leading-4 text-white/85 md:mt-2 md:text-sm md:leading-6">
                 Your workspace has {liveConversationCount} tracked conversations, {liveLeadCount} collected leads,
                 and {liveAgentSessions} live-agent sessions.
               </p>
@@ -580,8 +580,8 @@ function Dashboard() {
 
           <section className="grid gap-4 lg:grid-cols-[2fr_1fr] lg:items-stretch">
             <article className="flex min-h-0 flex-col rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5 lg:h-full">
-              <div className="mb-4 flex shrink-0 items-center justify-between">
-                <p className="text-lg font-semibold text-slate-800">Conversations</p>
+              <div className="mb-4 flex shrink-0 flex-wrap items-center justify-between gap-2">
+                <p className="workspace-heading">Conversations</p>
                 <p className="text-xs text-slate-400">
                   Last week{conversationsWeekRangeLabel ? ` · ${conversationsWeekRangeLabel}` : ""} · Messages / day
                 </p>
@@ -632,7 +632,7 @@ function Dashboard() {
             <div className="space-y-4">
               <article className="rounded-2xl border border-[#EEE8FF] bg-gradient-to-b from-white to-[#FAF7FF] p-5 shadow-[0_1px_0_rgba(139,92,246,0.06)]">
                 <div>
-                  <p className="text-lg font-semibold text-slate-800">Bot Deployment</p>
+                  <p className="workspace-heading">Bot Deployment</p>
                   <p className="mt-0.5 text-xs font-medium text-slate-400">Live agent vs AI managed sessions</p>
                 </div>
                 <div className="relative mx-auto mt-4 h-40 w-full max-w-[200px]">
@@ -681,7 +681,7 @@ function Dashboard() {
                     </PieChart>
                   </ResponsiveContainer>
                   <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-                    <span className="text-[1.65rem] font-bold leading-none tracking-tight text-slate-900">
+                    <span className="text-xl font-bold leading-none tracking-tight text-slate-900 md:text-[1.65rem]">
                       {liveAgentPercent}%
                     </span>
                     <span className="mt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">
@@ -712,14 +712,14 @@ function Dashboard() {
                     <UsersRound size={12} />
                     Builders
                   </p>
-                  <p className="mt-2 text-2xl font-bold text-slate-800">{buildersCount}</p>
+                  <p className="mt-2 text-lg font-bold text-slate-800 md:text-2xl">{buildersCount}</p>
                 </div>
                 <div className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-4">
                   <p className="flex items-center gap-1.5 text-xs uppercase tracking-wide text-slate-400">
                     <Briefcase size={12} />
                     Conversations
                   </p>
-                  <p className="mt-2 text-2xl font-bold text-slate-800">{liveConversationCount}</p>
+                  <p className="mt-2 text-lg font-bold text-slate-800 md:text-2xl">{liveConversationCount}</p>
                 </div>
               </div>
             </div>
@@ -727,8 +727,8 @@ function Dashboard() {
 
           <section>
             <div className="mb-3 flex items-center justify-between">
-              <p className="text-xl font-semibold text-slate-900">Chatbot Solutions</p>
-              <p className="text-sm text-slate-400">Templates . Flows . Integrations</p>
+              <p className="workspace-heading text-slate-900">Chatbot Solutions</p>
+              <p className="text-[11px] text-slate-400 sm:text-sm">Templates . Flows . Integrations</p>
             </div>
             <div className="grid gap-4 md:grid-cols-3">
               {projectsLive.map((project) => (
@@ -750,8 +750,8 @@ function Dashboard() {
 
           <section className="grid gap-4 xl:grid-cols-2">
             <article className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
-              <div className="mb-4 flex items-center justify-between">
-                <p className="text-lg font-semibold text-slate-800">Lead Conversion Trend</p>
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                <p className="workspace-heading">Lead Conversion Trend</p>
                 <p className="text-xs text-slate-400">Submitted details vs total chats</p>
               </div>
               <div className="h-60">
@@ -783,8 +783,8 @@ function Dashboard() {
             </article>
 
             <article className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
-              <div className="mb-4 flex items-center justify-between">
-                <p className="text-lg font-semibold text-slate-800">Channel Throughput</p>
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                <p className="workspace-heading">Channel Throughput</p>
                 <p className="text-xs text-slate-400">AI-managed vs Live Agent by channel</p>
               </div>
               <div className="h-60">
@@ -817,7 +817,7 @@ function Dashboard() {
             <article className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-lg font-semibold text-slate-800">Recent Login IPs</p>
+                  <p className="workspace-heading">Recent Login IPs</p>
                   <p className="mt-0.5 text-xs text-slate-400">Your last 8 sign-ins</p>
                 </div>
                 <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[#F4ECFF] text-[#8B5CF6]">
@@ -825,7 +825,7 @@ function Dashboard() {
                 </span>
               </div>
               <div className="overflow-x-auto">
-                <table className="min-w-full border-separate border-spacing-y-2 text-left">
+                <table className="min-w-[520px] border-separate border-spacing-y-2 text-left">
                   <thead>
                     <tr className="text-xs uppercase tracking-wide text-slate-400">
                       <th className="px-3 py-2 font-medium">Date & Time</th>
@@ -886,8 +886,8 @@ function Dashboard() {
             </article>
 
             <article className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
-              <div className="mb-4 flex items-center justify-between">
-                <p className="text-lg font-semibold text-slate-800">Conversations (Last Week)</p>
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                <p className="workspace-heading">Conversations (Last Week)</p>
                 <p className="text-xs text-slate-400">
                   {conversationsWeekRangeLabel || "Last 7 days"} · Hover a bar for details
                 </p>
@@ -936,11 +936,11 @@ function Dashboard() {
 
           <section className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-              <p className="text-lg font-semibold text-slate-800">Recent Inquiries</p>
+              <p className="workspace-heading">Recent Inquiries</p>
               <p className="text-xs text-slate-400">Latest 5 leads</p>
             </div>
             <div className="overflow-x-auto">
-              <table className="min-w-full border-separate border-spacing-y-2 text-left">
+              <table className="min-w-[640px] border-separate border-spacing-y-2 text-left">
                 <thead>
                   <tr className="text-xs uppercase tracking-wide text-slate-400">
                     <th className="px-3 py-2 font-medium">Name</th>
@@ -1007,10 +1007,10 @@ function Dashboard() {
           </section>
       </main>
 
-      <aside className="min-h-0 space-y-5 overflow-y-auto rounded-3xl border border-[#F0E9FF] bg-white p-6 shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
+      <aside className="min-h-0 min-w-0 space-y-5 overflow-y-auto rounded-2xl border border-[#F0E9FF] bg-white p-4 shadow-[0_18px_50px_rgba(139,92,246,0.08)] sm:rounded-3xl sm:p-6 xl:min-h-0">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-lg font-semibold text-slate-900">My Profile</p>
+              <p className="workspace-heading text-slate-900">My Profile</p>
               <p className="text-xs text-slate-400">Workspace owner</p>
             </div>
             <button type="button" className="text-slate-400">
@@ -1024,7 +1024,7 @@ function Dashboard() {
               alt={displayName}
               className="mx-auto h-20 w-20 rounded-full border-4 border-[#FB923C]"
             />
-            <p className="mt-4 font-semibold text-slate-900">{displayName}</p>
+            <p className="mt-4 text-[13px] font-semibold text-slate-900 md:text-base">{displayName}</p>
             <p className="text-xs text-slate-400">{displayEmail}</p>
             {currentLoginIp ? (
               <p className="mt-1 font-mono text-[11px] text-slate-500">IP: {currentLoginIp}</p>
@@ -1036,7 +1036,7 @@ function Dashboard() {
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#F4ECFF] text-[#8B5CF6]">
                 <Bot size={22} strokeWidth={1.5} aria-hidden />
               </div>
-              <p className="min-w-0 flex-1 text-lg font-semibold text-slate-900">AI Agent Control</p>
+              <p className="workspace-heading min-w-0 flex-1 text-slate-900">AI Agent Control</p>
             </div>
             <div className="mt-4 flex items-center justify-between gap-3 rounded-xl border border-[#E9DFFF] bg-white px-3 py-2.5">
               <span className="text-sm font-semibold text-slate-800">Generate AI replies</span>
@@ -1061,7 +1061,7 @@ function Dashboard() {
 
           <section>
             <div className="mb-3">
-              <p className="text-lg font-semibold text-slate-900">Last Conversations</p>
+              <p className="workspace-heading text-slate-900">Last Conversations</p>
             </div>
             <div className="space-y-3">
               {lastConversations.map((chat) => (
@@ -1095,7 +1095,7 @@ function Dashboard() {
       </aside>
 
       {liveDataError ? (
-        <div className="fixed bottom-4 right-4 z-40 rounded-xl border border-red-100 bg-red-50 px-4 py-2 text-sm text-red-700 shadow-md">
+        <div className="fixed bottom-4 left-4 right-4 z-40 rounded-xl border border-red-100 bg-red-50 px-4 py-2 text-sm text-red-700 shadow-md sm:left-auto sm:max-w-sm">
           {liveDataError}
         </div>
       ) : null}
@@ -1112,7 +1112,7 @@ function Dashboard() {
             className="w-full max-w-md rounded-2xl border border-[#E9D5FF] bg-white p-6 shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
-            <h2 id="workspace-login-popup-title" className="text-xl font-bold text-slate-900">
+            <h2 id="workspace-login-popup-title" className="text-lg font-bold text-slate-900 md:text-xl">
               Welcome back
             </h2>
             <p className="mt-2 text-sm text-slate-600">

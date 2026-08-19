@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { Menu, X } from "lucide-react";
 import avatarAntonion from "../assets/avatar-antonion.svg";
 import avatarDhea from "../assets/avatar-dhea.svg";
 import avatarRina from "../assets/avatar-rina.svg";
@@ -9,6 +10,7 @@ import { landingPageData } from "../data/landingPageData";
 function LandingPage() {
   const { brand, navLinks, hero, services, logoCarousel, setup, blog, stats, faq, contact, footer } = landingPageData;
   const [openFaqIndex, setOpenFaqIndex] = useState(0);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const logoCarouselRef = useRef(null);
   const serviceIconClasses =
     "h-5 w-5 text-white drop-shadow-[0_2px_4px_rgba(0,0,0,0.2)]";
@@ -41,17 +43,18 @@ function LandingPage() {
       <div className="relative overflow-hidden">
         <div className="pointer-events-none absolute -left-24 top-[-120px] h-80 w-80 rounded-full bg-[#d9ceff] blur-3xl" />
         <div className="pointer-events-none absolute -right-20 top-24 h-72 w-72 rounded-full bg-[#c5f3f3] blur-3xl" />
-        <div className="mx-auto w-full max-w-7xl px-6 pb-16 pt-8 md:px-9 md:pt-10">
-            <header className="sticky top-4 z-20 mb-2 flex items-center justify-between gap-6 rounded-2xl border border-white/60 bg-white/55 px-4 py-3 shadow-[0_10px_30px_rgba(31,41,55,0.08)] backdrop-blur-xl md:px-5">
-              <span className="flex flex-col leading-tight">
-                <span className="text-xl font-extrabold tracking-tight text-[#4f36c9]">
+        <div className="mx-auto w-full max-w-7xl px-4 pb-16 pt-6 sm:px-6 md:px-9 md:pt-10">
+            <header className="sticky top-3 z-20 mb-2 rounded-2xl border border-white/60 bg-white/55 px-3 py-3 shadow-[0_10px_30px_rgba(31,41,55,0.08)] backdrop-blur-xl sm:top-4 sm:px-4 md:px-5">
+              <div className="flex items-center justify-between gap-3 sm:gap-6">
+              <span className="flex min-w-0 flex-col leading-tight">
+                <span className="truncate text-[15px] font-extrabold tracking-tight text-[#4f36c9] md:text-xl">
                   {brand.product}
                 </span>
-                <span className="text-[11px] font-semibold uppercase tracking-[0.1em] text-[#7b74a8]">
+                <span className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#7b74a8] sm:text-[11px]">
                   {brand.byline}
                 </span>
               </span>
-            <nav className="hidden items-center gap-5 md:flex">
+            <nav className="hidden items-center gap-5 lg:flex">
               {navLinks.map((link) => (
                 <a
                   key={link.label}
@@ -62,38 +65,64 @@ function LandingPage() {
                 </a>
               ))}
             </nav>
+            <div className="flex shrink-0 items-center gap-2">
             <Link
-              className="rounded-full border border-[#d7cffd] bg-white/80 px-5 py-2.5 text-sm font-bold text-[#4f36c9] no-underline transition hover:border-[#c6bbfb] hover:bg-[#f8f6ff]"
+              className="rounded-full border border-[#d7cffd] bg-white/80 px-3 py-2 text-xs font-bold text-[#4f36c9] no-underline transition hover:border-[#c6bbfb] hover:bg-[#f8f6ff] sm:px-5 sm:py-2.5 sm:text-sm"
               to="/login"
             >
               Sign in
             </Link>
+            <button
+              type="button"
+              className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-[#d7cffd] bg-white/80 text-[#4f36c9] lg:hidden"
+              aria-label={mobileNavOpen ? "Close menu" : "Open menu"}
+              aria-expanded={mobileNavOpen}
+              onClick={() => setMobileNavOpen((open) => !open)}
+            >
+              {mobileNavOpen ? <X size={18} /> : <Menu size={18} />}
+            </button>
+            </div>
+              </div>
+              {mobileNavOpen ? (
+                <nav className="mt-3 grid gap-1 border-t border-[#ece7ff] pt-3 lg:hidden">
+                  {navLinks.map((link) => (
+                    <a
+                      key={link.label}
+                      className="rounded-xl px-3 py-2.5 text-sm font-medium text-[#68658a] no-underline transition hover:bg-[#f7f4ff] hover:text-[#4f36c9]"
+                      href={link.href}
+                      onClick={() => setMobileNavOpen(false)}
+                    >
+                      {link.label}
+                    </a>
+                  ))}
+                </nav>
+              ) : null}
             </header>
 
-            <section className="grid grid-cols-1 gap-8 py-14 lg:grid-cols-[1.08fr_1fr]">
+            <section className="grid grid-cols-1 gap-8 py-10 sm:py-14 lg:grid-cols-[1.08fr_1fr]">
               <div>
                 <p className="mb-3 text-xs font-semibold uppercase tracking-[0.14em] text-[#776dba]">
                   {hero.kicker}
                 </p>
-                <h1 className="mb-5 max-w-[560px] text-4xl font-bold leading-[1.02] tracking-[-0.02em] md:text-6xl">
+                <h1 className="mb-3 max-w-[560px] text-[1.25rem] font-bold leading-[1.2] tracking-[-0.02em] md:mb-5 md:text-4xl lg:text-6xl lg:leading-[1.02]">
                   {hero.title}
                 </h1>
-                <p className="mb-7 max-w-[560px] text-base leading-8 text-[#5f5a84] md:text-lg">{hero.description}</p>
+                <p className="mb-5 max-w-[560px] text-[13px] leading-5 text-[#5f5a84] md:mb-7 md:text-base md:leading-8 lg:text-lg">{hero.description}</p>
                 <div className="mb-7 flex flex-wrap gap-3">
                   <a
-                    className="rounded-full bg-gradient-to-r from-[#6d50ff] to-[#5236d8] px-6 py-3 text-sm font-bold text-white no-underline shadow-[0_14px_32px_rgba(82,54,216,0.35)] transition hover:translate-y-[-1px]"
+                    className="rounded-full bg-gradient-to-r from-[#6d50ff] to-[#5236d8] px-4 py-2.5 text-xs font-bold text-white no-underline shadow-[0_14px_32px_rgba(82,54,216,0.35)] transition hover:translate-y-[-1px] md:px-6 md:py-3 md:text-sm"
                     href={hero.primaryCtaHref}
                   >
                     {hero.primaryCtaLabel}
                   </a>
                   <Link
-                    className="rounded-full border border-[#ddd6ff] bg-white px-6 py-3 text-sm font-bold text-[#5f45db] no-underline transition hover:bg-[#f7f4ff]"
+                    className="rounded-full border border-[#ddd6ff] bg-white px-4 py-2.5 text-xs font-bold text-[#5f45db] no-underline transition hover:bg-[#f7f4ff] md:px-6 md:py-3 md:text-sm"
                     to="/dashboard"
                   >
                     {hero.secondaryCtaLabel}
                   </Link>
                 </div>
-                <div className="flex items-center gap-2 text-[13px] text-[#7772a0]">
+                <div className="flex flex-wrap items-center gap-2 text-[13px] text-[#7772a0]">
                   {[avatarAntonion, avatarDhea, avatarRina, avatarZaenal].map((avatar) => (
                     <img
                       key={avatar}
@@ -105,7 +134,7 @@ function LandingPage() {
                   <span className="ml-2.5 font-medium">{hero.trustText}</span>
                 </div>
               </div>
-              <div className="relative rounded-[28px] border border-white/60 bg-[radial-gradient(circle_at_28%_2%,#f2eeff,#e8e3ff_60%,#ddd6ff_100%)] p-6 shadow-[0_24px_50px_rgba(88,74,153,0.22)]">
+            <div className="relative rounded-[28px] border border-white/60 bg-[radial-gradient(circle_at_28%_2%,#f2eeff,#e8e3ff_60%,#ddd6ff_100%)] p-4 shadow-[0_24px_50px_rgba(88,74,153,0.22)] sm:p-6">
                 <div className="rounded-3xl border border-white/70 bg-white/75 p-5 shadow-[0_24px_55px_rgba(90,64,180,0.2)] backdrop-blur-sm">
                   <div className="mb-4 flex items-center justify-between">
                     <div className="flex items-center gap-2">
@@ -154,7 +183,7 @@ function LandingPage() {
                 <span className="inline-flex rounded-full border border-[#ddd5ff] bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6047da]">
                   {logoCarousel.label}
                 </span>
-                <h2 className="mt-2 text-xl font-semibold tracking-tight text-[#2f2a4e] md:text-2xl">
+                <h2 className="mt-2 text-base font-semibold tracking-tight text-[#2f2a4e] md:text-2xl">
                   {logoCarousel.title}
                 </h2>
               </div>
@@ -195,10 +224,10 @@ function LandingPage() {
               <span className="inline-flex rounded-full border border-[#ddd5ff] bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6047da]">
                 Core Features
               </span>
-              <h2 className="mt-3 text-[1.6rem] font-semibold tracking-tight text-[#2f2a4e] md:text-[1.9rem]">
+              <h2 className="mt-3 text-base font-semibold tracking-tight text-[#2f2a4e] md:text-2xl lg:text-[1.9rem]">
                 Everything you need to scale AI conversations
               </h2>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-[#666184]">
+              <p className="mt-2 max-w-2xl text-xs leading-5 text-[#666184] sm:text-sm sm:leading-6">
                 Purpose-built tools to automate replies, qualify leads, and optimize performance from one dashboard.
               </p>
             </div>
@@ -218,8 +247,8 @@ function LandingPage() {
                       0{index + 1}
                     </span>
                   </div>
-                  <h3 className="text-lg font-semibold tracking-tight text-[#2f2a4e]">{item.title}</h3>
-                  <p className="mt-2 text-[13px] leading-6 text-[#666184]">{item.text}</p>
+                  <h3 className="text-[15px] font-semibold tracking-tight text-[#2f2a4e] md:text-lg">{item.title}</h3>
+                  <p className="mt-2 text-[12px] leading-5 text-[#666184] md:text-[13px] md:leading-6">{item.text}</p>
                 </div>
               </article>
             ))}
@@ -234,7 +263,7 @@ function LandingPage() {
                 <span className="inline-flex rounded-full border border-[#d9d1ff] bg-white/80 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6349de]">
                   Quick Onboarding
                 </span>
-                <h2 className="mt-3 text-[1.5rem] font-semibold leading-tight text-[#2f2a4e] md:text-[1.7rem]">
+                <h2 className="mt-3 text-base font-semibold leading-tight text-[#2f2a4e] md:text-xl lg:text-[1.7rem]">
                   {setup.title}
                 </h2>
                 <p className="mt-2 max-w-2xl text-sm leading-6 text-[#605b82]">{setup.description}</p>
@@ -269,11 +298,11 @@ function LandingPage() {
 
           <section className="mt-12 grid grid-cols-1 gap-4 md:mt-14 lg:grid-cols-[1fr_1.2fr]" id="blog">
             <article className="rounded-3xl border border-[#ece9fb] bg-gradient-to-br from-white to-[#f8f7ff] p-6 shadow-[0_18px_35px_rgba(74,67,119,0.08)]">
-              <h2 className="mb-3 text-[1.44rem] font-semibold leading-tight">{blog.introTitle}</h2>
-              <p className="leading-[1.65] text-[#6b6784]">{blog.introText}</p>
+              <h2 className="mb-3 text-base font-semibold leading-tight md:text-[1.44rem]">{blog.introTitle}</h2>
+              <p className="text-[13px] leading-5 text-[#6b6784] md:text-base md:leading-[1.65]">{blog.introText}</p>
             </article>
             <article className="rounded-3xl border border-[#ece9fb] bg-gradient-to-br from-[#f8f9ff] to-[#f3f5ff] p-6 shadow-[0_18px_35px_rgba(74,67,119,0.08)]">
-              <h2 className="mb-3 text-[1.44rem] font-semibold leading-tight">{blog.articlesTitle}</h2>
+              <h2 className="mb-3 text-base font-semibold leading-tight md:text-[1.44rem]">{blog.articlesTitle}</h2>
               <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2">
                 {blog.articles.map((item) => (
                   <div
@@ -296,7 +325,7 @@ function LandingPage() {
                 key={stat.label}
                 className="rounded-2xl border border-[#ece9fb] bg-white/90 py-6 text-center shadow-[0_12px_24px_rgba(74,67,119,0.08)]"
               >
-                <h3 className="text-3xl font-bold tracking-tight text-[#5339cb]">{stat.value}</h3>
+                <h3 className="text-xl font-bold tracking-tight text-[#5339cb] md:text-3xl">{stat.value}</h3>
                 <p className="mt-2 text-[13px] font-medium text-[#6b6784]">{stat.label}</p>
               </article>
             ))}
@@ -307,7 +336,7 @@ function LandingPage() {
               <span className="inline-flex rounded-full border border-[#ddd5ff] bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6047da]">
                 {faq.label}
               </span>
-              <h2 className="mt-3 text-[1.55rem] font-semibold tracking-tight text-[#2f2a4e] md:text-[1.85rem]">
+              <h2 className="mt-3 text-base font-semibold tracking-tight text-[#2f2a4e] md:text-2xl lg:text-[1.85rem]">
                 {faq.title}
               </h2>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-[#666184]">{faq.description}</p>
@@ -325,7 +354,7 @@ function LandingPage() {
                       onClick={() => setOpenFaqIndex(isOpen ? -1 : index)}
                       className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left"
                     >
-                      <span className="text-[15px] font-semibold text-[#2f2a4e]">{item.question}</span>
+                      <span className="text-[13px] font-semibold leading-5 text-[#2f2a4e] md:text-[15px]">{item.question}</span>
                       <span
                         className={`inline-flex h-7 w-7 items-center justify-center rounded-full bg-[#eee9ff] text-lg font-semibold text-[#5c43d7] transition-transform ${
                           isOpen ? "rotate-45" : ""
@@ -353,16 +382,16 @@ function LandingPage() {
 
           <section
             id="contact"
-            className="mt-14 grid grid-cols-1 gap-8 rounded-[32px] border border-[#e7e3fb] bg-gradient-to-br from-white to-[#f7f5ff] p-7 shadow-[0_22px_45px_rgba(74,67,119,0.1)] md:mt-16 md:grid-cols-[0.95fr_1.05fr] md:p-10"
+            className="mt-14 grid grid-cols-1 gap-8 rounded-[32px] border border-[#e7e3fb] bg-gradient-to-br from-white to-[#f7f5ff] p-5 shadow-[0_22px_45px_rgba(74,67,119,0.1)] sm:p-7 md:mt-16 md:grid-cols-[0.95fr_1.05fr] md:p-10"
           >
             <div>
               <span className="inline-flex rounded-full border border-[#ddd5ff] bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#6047da]">
                 Contact Us
               </span>
-              <h2 className="mt-3 text-3xl font-bold leading-tight tracking-tight text-[#2f2a4e]">
+              <h2 className="mt-3 text-lg font-bold leading-tight tracking-tight text-[#2f2a4e] md:text-2xl lg:text-3xl">
                 {contact.title}
               </h2>
-              <p className="mt-3 max-w-md text-sm leading-7 text-[#666184]">{contact.description}</p>
+              <p className="mt-3 max-w-md text-xs leading-6 text-[#666184] sm:text-sm sm:leading-7">{contact.description}</p>
               <div className="mt-7 rounded-2xl border border-[#ece7ff] bg-white/80 p-4 shadow-[0_12px_24px_rgba(74,67,119,0.08)]">
                 <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#7f78ad]">
                   Contact Details
@@ -435,14 +464,14 @@ function LandingPage() {
 
         </div>
         <footer className="mt-12 w-full border-t border-[#2e2a56] bg-[#171432] text-[#d8d7ef] shadow-[0_20px_40px_rgba(23,20,50,0.35)]">
-          <div className="mx-auto w-full max-w-7xl px-6 py-10 md:px-9">
+          <div className="mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 md:px-9 md:py-10">
             <div className="grid grid-cols-1 gap-8 md:grid-cols-[1.25fr_2fr]">
               <div>
-                <p className="text-xl font-bold text-white">{brand.product}</p>
+                <p className="text-base font-bold text-white md:text-xl">{brand.product}</p>
                 <p className="text-xs uppercase tracking-[0.12em] text-[#a9a5cd]">{brand.byline}</p>
                 <p className="mt-4 max-w-md text-sm leading-7 text-[#c6c3e3]">{footer.description}</p>
               </div>
-              <div className="grid grid-cols-2 gap-6 md:grid-cols-4">
+              <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 md:grid-cols-4">
                 {footer.columns.map((column) => (
                   <div key={column.title}>
                     <p className="text-sm font-semibold text-white">{column.title}</p>

@@ -489,7 +489,7 @@ function Knowledgebase() {
         <span className="font-semibold text-slate-700">Storage:</span>{" "}
         <code className="rounded bg-white px-1.5 py-0.5 text-[11px] text-[#5B21B6]">backend/data/</code>
       </p>
-      <div className="text-right">
+      <div className="text-left sm:text-right">
         <p>
           <span className="font-semibold text-slate-700">Last saved:</span> {formatSavedAt(savedOverview.updatedAt)}
         </p>
@@ -508,11 +508,11 @@ function Knowledgebase() {
   );
 
   return (
-    <main className="min-h-0 flex-1 overflow-y-auto rounded-3xl border border-[#F0E9FF] bg-white p-6 shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
+    <main className="workspace-card">
       <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight text-slate-900">Knowledgebase</h1>
-          <p className="mt-2 text-sm text-slate-400">
+        <div className="min-w-0">
+          <h1 className="workspace-title">Knowledgebase</h1>
+          <p className="workspace-subtitle">
             {pageMode === "view"
               ? "Review what is stored for your chatbot. Switch to Edit to change it."
               : "Update fields below, then save. Switch to View to read without editing."}

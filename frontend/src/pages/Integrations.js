@@ -421,10 +421,10 @@ function Integrations() {
 
   return (
     <>
-      <main className="min-h-0 flex-1 overflow-y-auto rounded-3xl border border-[#F0E9FF] bg-white p-6 shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
+      <main className="workspace-card">
         <header className="mb-8 max-w-2xl">
-          <h1 className="text-3xl font-bold tracking-tight text-slate-900">Integrations</h1>
-          <p className="mt-2 text-sm text-slate-400">
+          <h1 className="workspace-title">Integrations</h1>
+          <p className="workspace-subtitle">
             Connect channels where your AI agent can talk to customers. More integrations will appear here as
             they are enabled.
           </p>
@@ -465,8 +465,8 @@ function Integrations() {
                   </span>
                 </div>
 
-                <h2 className="mt-4 text-lg font-semibold text-slate-900">{item.name}</h2>
-                <p className="mt-2 flex-1 text-sm leading-relaxed text-slate-500">{item.description}</p>
+                <h2 className="workspace-heading mt-4 text-slate-900">{item.name}</h2>
+                <p className="mt-2 flex-1 text-xs leading-relaxed text-slate-500 sm:text-sm">{item.description}</p>
                 {isWa ? (
                   <div className="mt-2 space-y-1.5">
                     <p className="rounded-lg border border-[#EEE8FF] bg-[#FCFAFF] px-2.5 py-1.5 text-xs text-slate-600">
@@ -520,12 +520,12 @@ function Integrations() {
       </main>
 
       {showWebConfig ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4">
-          <div className="w-full max-w-2xl rounded-3xl border border-[#E9DFFF] bg-gradient-to-b from-white to-[#FCFAFF] p-5 shadow-[0_30px_80px_rgba(15,23,42,0.3)]">
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/35 p-0 sm:items-center sm:p-4">
+          <div className="max-h-[92vh] w-full max-w-2xl overflow-y-auto rounded-t-3xl border border-[#E9DFFF] bg-gradient-to-b from-white to-[#FCFAFF] p-4 shadow-[0_30px_80px_rgba(15,23,42,0.3)] sm:rounded-3xl sm:p-5">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h3 className="text-xl font-semibold tracking-tight text-slate-900">Web embed code</h3>
-                <p className="mt-1 text-sm text-slate-500">
+                <h3 className="text-base font-semibold tracking-tight text-slate-900 md:text-xl">Web embed code</h3>
+                <p className="mt-1 text-xs text-slate-500 sm:text-sm">
                   Paste this script tag in your website. The chatbot bubble will render fixed at the bottom-right.
                 </p>
               </div>
@@ -576,12 +576,12 @@ function Integrations() {
       ) : null}
 
       {showWhatsAppConfig ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4">
-          <div className="w-full max-w-3xl rounded-3xl border border-[#E9DFFF] bg-gradient-to-b from-white to-[#FCFAFF] p-5 shadow-[0_30px_80px_rgba(15,23,42,0.3)]">
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/35 p-0 sm:items-center sm:p-4">
+          <div className="max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-t-3xl border border-[#E9DFFF] bg-gradient-to-b from-white to-[#FCFAFF] p-4 shadow-[0_30px_80px_rgba(15,23,42,0.3)] sm:rounded-3xl sm:p-5">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h3 className="text-xl font-semibold tracking-tight text-slate-900">WhatsApp accounts</h3>
-                <p className="mt-1 text-sm text-slate-500">
+                <h3 className="text-base font-semibold tracking-tight text-slate-900 md:text-xl">WhatsApp accounts</h3>
+                <p className="mt-1 text-xs text-slate-500 sm:text-sm">
                   Link up to {waLimit} WhatsApp number{waLimit === 1 ? "" : "s"} on your {userPlan || "current"}{" "}
                   plan. Scan each QR with WhatsApp → Linked devices.
                 </p>
@@ -737,7 +737,7 @@ function Integrations() {
                       <img
                         src={activeAccount.qrDataUrl}
                         alt="WhatsApp QR code"
-                        className="h-56 w-56 rounded-xl border border-[#E9DFFF] bg-white p-2 shadow-sm"
+                        className="h-48 w-48 max-w-full rounded-xl border border-[#E9DFFF] bg-white p-2 shadow-sm sm:h-56 sm:w-56"
                       />
                       <p className="mt-3 text-center text-xs text-slate-500">
                         QR codes expire after a short time. Regenerate if scan fails.

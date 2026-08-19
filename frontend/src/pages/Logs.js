@@ -108,10 +108,10 @@ function Logs() {
   );
 
   return (
-    <main className="min-h-0 flex-1 overflow-y-auto rounded-3xl border border-[#F0E9FF] bg-white p-6 shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
+    <main className="workspace-card">
       <header className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-slate-900">Logs</h1>
-        <p className="mt-2 text-sm text-slate-400">
+        <h1 className="workspace-title">Logs</h1>
+        <p className="workspace-subtitle">
           WhatsApp account links via QR scanner and disconnections from the Integrations page.
         </p>
         <div className="mt-4 flex flex-wrap gap-2 text-xs">
@@ -139,7 +139,7 @@ function Logs() {
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="min-w-full border-separate border-spacing-y-2 p-2 text-left">
+            <table className="min-w-[720px] border-separate border-spacing-y-2 p-2 text-left">
               <thead>
                 <tr className="text-xs uppercase tracking-wide text-slate-400">
                   <th className="px-3 py-2 font-medium">Date</th>

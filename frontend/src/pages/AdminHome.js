@@ -370,8 +370,8 @@ function AdminHome() {
 
       <main className="mx-auto max-w-6xl px-5 py-8 sm:px-8 sm:py-10">
         <div className="mb-8">
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl">Overview</h1>
-          <p className="mt-1 max-w-2xl text-sm text-slate-500">
+          <h1 className="text-lg font-bold tracking-tight text-slate-900 md:text-2xl lg:text-3xl">Overview</h1>
+          <p className="mt-1 max-w-2xl text-xs leading-5 text-slate-500 sm:text-sm sm:leading-6">
             Monitor usage and manage people and permissions for your AI agents.
           </p>
         </div>
@@ -387,7 +387,7 @@ function AdminHome() {
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">{card.label}</p>
-                    <p className="mt-2 text-3xl font-bold tabular-nums text-slate-900">{card.value}</p>
+                    <p className="mt-2 text-xl font-bold tabular-nums text-slate-900 md:text-3xl">{card.value}</p>
                     <p className="mt-1 text-xs font-medium text-[#7C3AED]">{card.hint}</p>
                   </div>
                   <div
@@ -405,7 +405,7 @@ function AdminHome() {
           <div
             role="tablist"
             aria-label="Admin sections"
-            className="flex border-b border-[#F0E9FF] bg-[#FDFCFF] px-2 pt-2 sm:px-4"
+            className="flex overflow-x-auto border-b border-[#F0E9FF] bg-[#FDFCFF] px-2 pt-2 sm:px-4"
           >
             <button
               type="button"
@@ -459,11 +459,11 @@ function AdminHome() {
                 aria-labelledby="tab-users"
                 className="overflow-x-auto"
               >
-                <div className="mb-5 flex min-w-[640px] items-center justify-between rounded-2xl border border-[#F0E9FF] bg-[#FCFAFF] p-4">
+                <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-[#F0E9FF] bg-[#FCFAFF] p-4 sm:flex-row sm:items-center sm:justify-between">
                   <p className="text-sm text-slate-600">
                     Manage workspace accounts and invite new users from this panel.
                   </p>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
                       onClick={loadUsers}
@@ -575,17 +575,17 @@ function AdminHome() {
 
       {isAddUserOpen ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4"
+          className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/40 p-0 sm:items-center sm:px-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="add-user-title"
           onClick={() => setIsAddUserOpen(false)}
         >
           <div
-            className="w-full max-w-lg rounded-2xl border border-[#E9D5FF] bg-white p-6 shadow-2xl"
+            className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-2xl border border-[#E9D5FF] bg-white p-5 shadow-2xl sm:rounded-2xl sm:p-6"
             onClick={(e) => e.stopPropagation()}
           >
-            <h2 id="add-user-title" className="text-xl font-bold text-slate-900">
+            <h2 id="add-user-title" className="text-lg font-bold text-slate-900 md:text-xl">
               Add user
             </h2>
             <p className="mt-1 text-sm text-slate-500">
@@ -675,17 +675,17 @@ function AdminHome() {
 
       {isEditUserOpen ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4"
+          className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/40 p-0 sm:items-center sm:px-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="edit-user-title"
           onClick={() => setIsEditUserOpen(false)}
         >
           <div
-            className="w-full max-w-lg rounded-2xl border border-[#E9D5FF] bg-white p-6 shadow-2xl"
+            className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-2xl border border-[#E9D5FF] bg-white p-5 shadow-2xl sm:rounded-2xl sm:p-6"
             onClick={(e) => e.stopPropagation()}
           >
-            <h2 id="edit-user-title" className="text-xl font-bold text-slate-900">
+            <h2 id="edit-user-title" className="text-lg font-bold text-slate-900 md:text-xl">
               Edit user
             </h2>
             <p className="mt-1 text-sm text-slate-500">Update account details and save changes.</p>

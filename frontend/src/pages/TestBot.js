@@ -301,11 +301,11 @@ function TestBot() {
   };
 
   return (
-    <main className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl border border-[#F0E9FF] bg-white shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
-      <header className="shrink-0 border-b border-[#F0E9FF] px-6 py-5">
+    <main className="workspace-fill flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-[#F0E9FF] bg-white shadow-[0_18px_50px_rgba(139,92,246,0.08)] sm:rounded-3xl">
+      <header className="shrink-0 border-b border-[#F0E9FF] px-4 py-4 sm:px-6 sm:py-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight text-slate-900">Test Bot</h1>
+            <h1 className="text-base font-bold tracking-tight text-slate-900 md:text-xl lg:text-2xl">Test Bot</h1>
           </div>
           <button
             type="button"
@@ -404,12 +404,12 @@ function TestBot() {
       </div>
 
       {error ? (
-        <div className="shrink-0 border-t border-red-100 bg-red-50 px-6 py-2 text-sm text-red-700">{error}</div>
+        <div className="shrink-0 border-t border-red-100 bg-red-50 px-4 py-2 text-sm text-red-700 sm:px-6">{error}</div>
       ) : null}
 
       <form
         onSubmit={sendMessage}
-        className="shrink-0 border-t border-[#F0E9FF] bg-white p-4 md:px-6 md:py-4"
+        className="shrink-0 border-t border-[#F0E9FF] bg-white p-4 pb-[max(1rem,env(safe-area-inset-bottom))] md:px-6 md:py-4"
       >
         <div className="mx-auto flex max-w-3xl gap-2">
           <input
@@ -425,10 +425,10 @@ function TestBot() {
           <button
             type="submit"
             disabled={sending || !input.trim()}
-            className="inline-flex shrink-0 items-center gap-2 rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#A78BFA] px-5 py-3 text-sm font-semibold text-white shadow-md shadow-[#8B5CF6]/30 transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#8B5CF6] to-[#A78BFA] px-3 py-3 text-sm font-semibold text-white shadow-md shadow-[#8B5CF6]/30 transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-50 sm:px-5"
           >
             <Send size={16} />
-            Send
+            <span className="hidden sm:inline">Send</span>
           </button>
         </div>
       </form>

@@ -1106,16 +1106,16 @@ function Chats() {
   };
 
   return (
-    <div className="flex min-h-[420px] w-full flex-1 flex-col xl:h-full xl:min-h-0">
-      <div className="grid min-h-[360px] flex-1 grid-cols-1 overflow-hidden rounded-3xl border border-[#F0E9FF] bg-white shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0 lg:grid-cols-[380px_minmax(0,1fr)]">
+    <div className="workspace-fill flex min-h-[360px] w-full min-w-0 flex-1 flex-col lg:min-h-0">
+      <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden rounded-2xl border border-[#F0E9FF] bg-white shadow-[0_18px_50px_rgba(139,92,246,0.08)] sm:rounded-3xl lg:min-h-0 lg:grid-cols-[minmax(280px,380px)_minmax(0,1fr)]">
         {/* Conversation list — fixed 380px on desktop so width never shifts */}
         <section
-          className={`flex min-h-0 w-full flex-col overflow-hidden border-[#EEE8FF] lg:w-[380px] lg:max-w-[380px] lg:shrink-0 lg:border-r ${
+          className={`flex min-h-0 w-full flex-col overflow-hidden border-[#EEE8FF] lg:max-w-[380px] lg:shrink-0 lg:border-r ${
             mobileShowThread ? "hidden lg:flex" : "flex"
           }`}
         >
           <div className="shrink-0 border-b border-[#EEE8FF] p-4">
-            <h1 className="text-lg font-bold tracking-tight text-slate-900">Chats</h1>
+            <h1 className="text-[15px] font-bold tracking-tight text-slate-900 md:text-lg">Chats</h1>
             <p className="mt-0.5 text-xs text-slate-400">
               Test Bot, Web widget, and WhatsApp threads — source shown on each row.
             </p>
@@ -1233,8 +1233,8 @@ function Chats() {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
-                            <span
-                              className={`truncate font-semibold ${
+            <span
+                              className={`truncate text-[13px] font-semibold sm:text-sm ${
                                 showUnread ? "text-slate-900" : "text-slate-800"
                               }`}
                             >
@@ -1291,7 +1291,7 @@ function Chats() {
           {listHoverPreview ? (
             <div
               role="tooltip"
-              className="pointer-events-none fixed z-50 max-w-xs -translate-y-1/2 rounded-xl border border-[#EEE8FF] bg-white px-3 py-2.5 shadow-lg shadow-slate-900/10"
+              className="pointer-events-none fixed z-50 hidden max-w-xs -translate-y-1/2 rounded-xl border border-[#EEE8FF] bg-white px-3 py-2.5 shadow-lg shadow-slate-900/10 lg:block"
               style={{ top: listHoverPreview.top, left: listHoverPreview.left }}
             >
               {listHoverPreview.sender ? (
@@ -1314,7 +1314,7 @@ function Chats() {
         >
           {active ? (
             <>
-              <header className="flex shrink-0 items-center gap-3 border-b border-[#EEE8FF] bg-white px-3 py-3 lg:px-4">
+              <header className="flex shrink-0 items-center gap-2 border-b border-[#EEE8FF] bg-white px-2 py-3 sm:gap-3 sm:px-3 lg:px-4">
                 <button
                   type="button"
                   onClick={backToList}
@@ -1327,7 +1327,7 @@ function Chats() {
                   {avatarInitial(active.displayName)}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate font-semibold text-slate-900">{active.displayName}</p>
+                  <p className="truncate text-sm font-semibold text-slate-900 sm:text-base">{active.displayName}</p>
                   {active.whatsappNumber ? (
                     <p className="truncate text-xs font-semibold text-emerald-700">
                       WhatsApp {active.whatsappNumber}
@@ -1356,8 +1356,9 @@ function Chats() {
                     · {messages.length} messages
                   </p>
                 </div>
-                <label className="flex items-center gap-2 rounded-lg border border-[#EEE8FF] bg-[#FDFCFF] px-2.5 py-1.5 text-xs font-semibold text-slate-600">
-                  <span>Ai chat disable</span>
+                <label className="flex shrink-0 items-center gap-1.5 rounded-lg border border-[#EEE8FF] bg-[#FDFCFF] px-2 py-1.5 text-[11px] font-semibold text-slate-600 sm:gap-2 sm:px-2.5 sm:text-xs">
+                  <span className="hidden sm:inline">Ai chat disable</span>
+                  <span className="sm:hidden">AI off</span>
                   <button
                     type="button"
                     role="switch"
@@ -1378,7 +1379,7 @@ function Chats() {
                 </label>
                 <button
                   type="button"
-                  className="shrink-0 rounded-lg p-2 text-slate-500 hover:bg-[#F6F1FF]"
+                  className="hidden shrink-0 rounded-lg p-2 text-slate-500 hover:bg-[#F6F1FF] sm:inline-flex"
                   aria-label="More"
                 >
                   <MoreVertical size={18} />
@@ -1559,7 +1560,7 @@ function Chats() {
                 ) : null}
               </div>
 
-              <footer className="shrink-0 border-t border-[#EEE8FF] bg-white p-3 lg:p-4">
+              <footer className="shrink-0 border-t border-[#EEE8FF] bg-white p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:p-4">
                 <div className="flex gap-2 rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-1.5 focus-within:border-[#C4B5FD] focus-within:ring-2 focus-within:ring-[#8B5CF6]/15">
                   <textarea
                     ref={liveInputRef}

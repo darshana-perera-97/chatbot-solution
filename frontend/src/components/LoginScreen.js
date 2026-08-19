@@ -33,19 +33,19 @@ function LoginScreen({
   const IdentityIcon = identityFieldIcon === "user" ? User : Mail;
   const heading = title || "Welcome back";
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#FCFAFF] px-4 py-8 text-slate-800">
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#FCFAFF] px-3 py-6 text-slate-800 sm:px-4 sm:py-8">
       <div className="pointer-events-none absolute -left-24 top-[-120px] h-80 w-80 rounded-full bg-[#d9ceff] blur-3xl" />
       <div className="pointer-events-none absolute -right-20 top-24 h-72 w-72 rounded-full bg-[#c5f3f3] blur-3xl" />
       <div className="pointer-events-none absolute bottom-[-110px] left-[18%] h-72 w-72 rounded-full bg-[#f6d4ff] blur-3xl" />
 
-      <div className="relative grid w-full max-w-6xl overflow-hidden rounded-[30px] border border-white/80 bg-white/90 shadow-[0_30px_80px_rgba(109,40,217,0.16)] backdrop-blur-sm lg:grid-cols-[1fr_1fr]">
-        <section className="flex justify-center border-b border-[#EFEAFF] px-6 py-10 sm:px-10 lg:border-b-0 lg:border-r lg:border-[#EFEAFF] lg:px-12">
+      <div className="relative grid w-full max-w-6xl overflow-hidden rounded-2xl border border-white/80 bg-white/90 shadow-[0_30px_80px_rgba(109,40,217,0.16)] backdrop-blur-sm sm:rounded-[30px] lg:grid-cols-[1fr_1fr]">
+        <section className="flex justify-center border-b border-[#EFEAFF] px-4 py-8 sm:px-10 sm:py-10 lg:border-b-0 lg:border-r lg:border-[#EFEAFF] lg:px-12">
           <div className="w-full max-w-md">
             <div className="flex items-center justify-between gap-3">
               <div className="flex items-center gap-2.5">
                 <img src={nexgenaoLogo} alt="NexGenAI logo" className="h-9 w-9 rounded-full object-cover" />
                 <div className="leading-tight">
-                  <p className="text-xl font-bold tracking-tight text-slate-800">AI Agent</p>
+                  <p className="text-base font-bold tracking-tight text-slate-800 md:text-xl">AI Agent</p>
                   <p className="text-[10px] font-light uppercase tracking-[0.14em] text-slate-500">by NexGenAI</p>
                 </div>
               </div>
@@ -59,11 +59,11 @@ function LoginScreen({
               ) : null}
             </div>
 
-            <h1 className="mt-10 text-4xl font-bold tracking-tight text-slate-900 sm:text-5xl">
+            <h1 className="mt-6 text-xl font-bold tracking-tight text-slate-900 md:mt-10 md:text-4xl lg:text-5xl">
               {heading}
             </h1>
             {titleExtra ? <div className="mt-3">{titleExtra}</div> : null}
-            <p className="mt-3 max-w-md text-sm leading-7 text-slate-500">
+            <p className="mt-3 max-w-md text-xs leading-6 text-slate-500 sm:text-sm sm:leading-7">
               {subtitle}
               {showSubtitleBell ? <span className="ml-1 text-[#A78BFA]">✦</span> : null}
             </p>

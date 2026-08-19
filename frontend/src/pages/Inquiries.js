@@ -398,12 +398,12 @@ function Inquiries() {
   }
 
   return (
-    <main className="min-h-0 flex-1 overflow-y-auto rounded-3xl border border-[#F0E9FF] bg-white p-6 shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
+    <main className="workspace-card">
       <header className="mb-6">
         <div className="flex flex-wrap items-start justify-between gap-4">
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight text-slate-900">Inquiries</h1>
-            <p className="mt-2 text-sm text-slate-400">
+          <div className="min-w-0">
+            <h1 className="workspace-title">Inquiries</h1>
+            <p className="workspace-subtitle">
               Collected lead data from chatbot field-capture sessions.
             </p>
           </div>
@@ -509,7 +509,7 @@ function Inquiries() {
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="min-w-full border-separate border-spacing-y-2 p-2 text-left">
+            <table className="min-w-[720px] border-separate border-spacing-y-2 p-2 text-left">
               <thead>
                 <tr className="text-xs uppercase tracking-wide text-slate-400">
                   <th className="w-10 px-3 py-2 font-medium">

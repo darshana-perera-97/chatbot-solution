@@ -326,18 +326,18 @@ function Settings() {
   };
 
   return (
-    <main className="min-h-0 flex-1 overflow-y-auto rounded-3xl border border-[#F0E9FF] bg-white p-6 shadow-[0_18px_50px_rgba(139,92,246,0.08)] xl:min-h-0">
+    <main className="workspace-card">
       <header className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-slate-900">Settings</h1>
-        <p className="mt-2 text-sm text-slate-400">Customize your premium embed chatbot look and copy the embed script snippet.</p>
+        <h1 className="workspace-title">Settings</h1>
+        <p className="workspace-subtitle">Customize your premium embed chatbot look and copy the embed script snippet.</p>
       </header>
 
       <section className="grid gap-5 xl:grid-cols-2">
         <article className="rounded-2xl border border-[#EEE8FF] bg-gradient-to-b from-white to-[#FCFAFF] p-5">
-          <div className="flex items-start justify-between gap-3">
+          <div className="flex flex-col items-start justify-between gap-3 sm:flex-row">
             <div>
-              <h2 className="text-lg font-semibold text-slate-900">Chatbot appearance</h2>
-              <p className="mt-1 text-sm text-slate-500">
+              <h2 className="workspace-heading text-slate-900">Chatbot appearance</h2>
+              <p className="mt-1 text-xs text-slate-500 sm:text-sm">
                 Minimal controls for theme colors and floating launcher button image.
               </p>
             </div>
@@ -361,14 +361,14 @@ function Settings() {
             {colorFields.map(({ key, label, hint }) => (
               <label
                 key={key}
-                className="flex items-center justify-between gap-3 rounded-xl border border-[#EEE8FF] bg-white px-3 py-3 shadow-[0_4px_12px_rgba(124,58,237,0.05)]"
+                className="flex flex-col gap-3 rounded-xl border border-[#EEE8FF] bg-white px-3 py-3 shadow-[0_4px_12px_rgba(124,58,237,0.05)] sm:flex-row sm:items-center sm:justify-between"
               >
-                <div>
+                <div className="min-w-0">
                   <p className="text-sm font-semibold text-slate-800">{label}</p>
                   <p className="mt-0.5 text-xs text-slate-500">{hint}</p>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <span
                     className="h-8 w-8 rounded-full border border-white shadow ring-1 ring-[#E9DFFF]"
                     style={{ backgroundColor: form[key] }}
@@ -529,7 +529,7 @@ function Settings() {
         </article>
 
         <article className="rounded-2xl border border-[#EEE8FF] bg-[#FDFCFF] p-5">
-          <h2 className="text-lg font-semibold text-slate-900">Live Preview</h2>
+          <h2 className="workspace-heading text-slate-900">Live Preview</h2>
           <div className="mt-4 rounded-2xl border border-[#E9DFFF] bg-white p-3">
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
               Live Preview
@@ -537,17 +537,18 @@ function Settings() {
             <p className="mt-1 text-[11px] text-slate-400">
               Real embed behavior with floating launcher
             </p>
-            <div className="mt-3 flex justify-center rounded-xl bg-[#F8F5FF] p-3">
-              <iframe
-                title="Chatbot preview"
-                srcDoc={livePreviewDoc}
-                width={380}
-                height={640}
-                style={{ border: 0, overflow: "hidden", borderRadius: 16 }}
-                loading="lazy"
-                allow="clipboard-write"
-                sandbox="allow-scripts allow-same-origin allow-forms"
-              />
+            <div className="mt-3 overflow-x-auto rounded-xl bg-[#F8F5FF] p-3">
+              <div className="mx-auto w-full max-w-[380px]">
+                <iframe
+                  title="Chatbot preview"
+                  srcDoc={livePreviewDoc}
+                  className="h-[min(640px,70vh)] w-full"
+                  style={{ border: 0, overflow: "hidden", borderRadius: 16, minHeight: 420 }}
+                  loading="lazy"
+                  allow="clipboard-write"
+                  sandbox="allow-scripts allow-same-origin allow-forms"
+                />
+              </div>
             </div>
           </div>
         </article>

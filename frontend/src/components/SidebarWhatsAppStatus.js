@@ -153,12 +153,12 @@ export function SidebarWhatsAppStatus({ collapsed = false }) {
   return (
     <div
       className={`mb-6 shrink-0 border-b border-[#EEE8FF] pb-4 ${
-        collapsed ? "xl:mb-4 xl:flex xl:flex-col xl:items-center xl:gap-2" : ""
+        collapsed ? "lg:mb-4 lg:flex lg:flex-col lg:items-center lg:gap-2" : ""
       }`}
     >
       <p
         className={`mb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400 ${
-          collapsed ? "xl:sr-only" : ""
+          collapsed ? "lg:sr-only" : ""
         }`}
       >
         WhatsApp accounts
@@ -168,7 +168,7 @@ export function SidebarWhatsAppStatus({ collapsed = false }) {
       </p>
       <div
         className={`flex flex-wrap gap-2 ${
-          collapsed ? "xl:flex-col xl:items-center xl:gap-2.5" : "items-center"
+          collapsed ? "lg:flex-col lg:items-center lg:gap-2.5" : "items-center"
         }`}
       >
         {accounts.map((account) => (
