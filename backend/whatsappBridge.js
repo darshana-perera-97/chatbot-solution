@@ -1391,12 +1391,6 @@ function createWhatsAppBridge(deps) {
   const PAGE_KEEPALIVE_INTERVAL_MS = 8000;
   const BACKGROUND_RECONNECT_INTERVAL_MS = 10000;
   const PERIODIC_CONVERSATION_SYNC_INTERVAL_MS = 180000;
-  /** Recycle ready Chrome sessions on a fixed uptime to avoid Puppeteer protocol timeouts. */
-  const PERIODIC_CLIENT_RESTART_MS =
-    Number(process.env.WHATSAPP_PERIODIC_RESTART_MS) > 0
-      ? Number(process.env.WHATSAPP_PERIODIC_RESTART_MS)
-      : 2 * 60 * 60 * 1000;
-  const PERIODIC_CLIENT_RESTART_CHECK_INTERVAL_MS = 60000;
   const ACCOUNT_SYNC_DEBOUNCE_MS = 15000;
   const CHAT_SYNC_DEBOUNCE_MS = 3000;
   const FRAME_GLITCH_RECONNECT_THRESHOLD = 3;
@@ -2047,30 +2041,12 @@ function createWhatsAppBridge(deps) {
   }
 
   function markSlotUnhealthy(entry, workspaceUserId, accountId, reason) {
-    if (!entry) return;
-    if (entry.phase !== "ready") return;
-    const now = Date.now();
-    if (!entry.frameGlitchWindowStart || now - entry.frameGlitchWindowStart > FRAME_GLITCH_WINDOW_MS) {
-      entry.frameGlitchWindowStart = now;
-      entry.frameGlitchCount = 0;
-    }
-    entry.frameGlitchCount = Number(entry.frameGlitchCount) || 0;
-    entry.frameGlitchCount += 1;
-    if (entry.frameGlitchCount < FRAME_GLITCH_RECONNECT_THRESHOLD) {
-      waLog(
-        workspaceUserId,
-        accountId,
-        `transient glitch (${entry.frameGlitchCount}/${FRAME_GLITCH_RECONNECT_THRESHOLD}): ${String(reason).slice(0, 80)}`
-      );
-      return;
-    }
-    entry.frameGlitchCount = 0;
-    entry.frameGlitchWindowStart = 0;
-    waLog(workspaceUserId, accountId, `connection unhealthy (${reason}); scheduling reconnect`);
-    setEntryPhase(entry, "disconnected");
-    entry.error = reason;
-    stopPageKeepAlive(entry);
-    scheduleReconnect(workspaceUserId, accountId, reason);
+    if (!entry || entry.phase !== "ready") return;
+    waLog(
+      workspaceUserId,
+      accountId,
+      `connection warning (no auto-restart): ${String(reason).slice(0, 120)}`
+    );
   }
 
   function clearFrameGlitch(entry) {
@@ -2600,10 +2576,12 @@ function createWhatsAppBridge(deps) {
         lastFailureMessage = result.message || "";
         waLog(safe, safeAccountId, "live-agent send failed on primary account", lastFailureMessage);
         if (isTransientPuppeteerFrameError(lastFailureMessage)) {
-          setEntryPhase(primary, "disconnected");
-          primary.error = lastFailureMessage;
-          stopPageKeepAlive(primary);
-          scheduleReconnect(safe, safeAccountId, "send_detached_frame");
+          waLog(
+            safe,
+            safeAccountId,
+            "live-agent send hit detached frame (no auto-restart)",
+            lastFailureMessage
+          );
         }
       }
     } else {
@@ -2788,9 +2766,8 @@ function createWhatsAppBridge(deps) {
         dataPath: authRoot,
       }),
       authTimeoutMs: 120000,
-      // Prefer this server session, but give a brief window so a second Web client
-      // does not thrash the link into a disconnect loop.
-      takeoverOnConflict: true,
+      // Do not take over an active WhatsApp Web session elsewhere — that causes logout loops.
+      takeoverOnConflict: false,
       takeoverTimeoutMs: 10000,
       webVersion: WHATSAPP_WEB_VERSION,
       webVersionCache: {
@@ -2853,7 +2830,7 @@ function createWhatsAppBridge(deps) {
       }
       if (["OPENING", "PAIRING"].includes(normalized)) return;
       if (["CONFLICT", "TIMEOUT", "UNPAIRED", "TOS_BLOCK", "SMB_TOS_BLOCK", "PROXYBLOCK"].includes(normalized)) {
-        markSlotUnhealthy(entry, safe, safeAccountId, `change_state_${normalized.toLowerCase()}`);
+        waLog(safe, safeAccountId, "change_state warning (no auto-restart)", normalized);
       }
     });
 
@@ -3341,18 +3318,6 @@ function createWhatsAppBridge(deps) {
         );
         continue;
       }
-
-      if (["disconnected", "error"].includes(entry.phase)) {
-        const waitingOnTimer = pendingReconnectTimers.has(key);
-        const reconnectInFlight = reconnecting.has(key);
-        if (
-          !waitingOnTimer &&
-          !reconnectInFlight &&
-          stuckMs >= WATCHDOG_DISCONNECTED_MS
-        ) {
-          await forceWatchdogRestart(uid, accountId, `stuck_${entry.phase}`);
-        }
-      }
     }
   }
 
@@ -3391,18 +3356,13 @@ function createWhatsAppBridge(deps) {
         if (typeof entry.client.getState === "function") {
           const state = await entry.client.getState();
           if (state && state !== "CONNECTED") {
-            markSlotUnhealthy(entry, uid, accountId, `health_state_${String(state).toLowerCase()}`);
-            continue;
+            waLog(uid, accountId, "health warning (no auto-restart)", `state=${state}`);
           }
-        }
-        const page = entry.client.pupPage;
-        if (page) {
-          await page.evaluate(() => document.hasFocus() || true);
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         if (isTransientPuppeteerFrameError(e)) {
-          markSlotUnhealthy(entry, uid, accountId, `health_${msg.slice(0, 80)}`);
+          waLog(uid, accountId, "health warning (no auto-restart)", msg.slice(0, 120));
         }
       }
     }
@@ -3417,48 +3377,6 @@ function createWhatsAppBridge(deps) {
       "system",
       "health",
       `connection health loop started (every ${CONNECTION_HEALTH_INTERVAL_MS / 1000}s)`
-    );
-  }
-
-  async function runPeriodicClientRestart() {
-    if (bulkRestoreInProgress) return;
-    const now = Date.now();
-    const candidates = [];
-
-    for (const [key, entry] of slots.entries()) {
-      if (!entry?.client || entry.phase !== "ready") continue;
-      const parts = String(key).split("::");
-      if (parts.length !== 2) continue;
-      const [uid, accountId] = parts;
-      if (!hasPersistedAccountSession(uid, accountId)) continue;
-      if (watchdogRecovering.has(key) || reconnecting.has(key)) continue;
-
-      const uptimeMs = phaseAgeMs(entry, now);
-      if (uptimeMs >= PERIODIC_CLIENT_RESTART_MS) {
-        candidates.push({ userId: uid, accountId, key, uptimeMs });
-      }
-    }
-
-    if (!candidates.length) return;
-
-    candidates.sort((a, b) => b.uptimeMs - a.uptimeMs);
-    const target = candidates[0];
-    await forceWatchdogRestart(
-      target.userId,
-      target.accountId,
-      `periodic_restart_${Math.round(PERIODIC_CLIENT_RESTART_MS / 3600000)}h`
-    );
-  }
-
-  function startPeriodicClientRestartLoop() {
-    const timer = setInterval(() => {
-      void runPeriodicClientRestart();
-    }, PERIODIC_CLIENT_RESTART_CHECK_INTERVAL_MS);
-    if (typeof timer.unref === "function") timer.unref();
-    waLog(
-      "system",
-      "restart",
-      `periodic client restart loop started (check every ${PERIODIC_CLIENT_RESTART_CHECK_INTERVAL_MS / 1000}s, restart after ${PERIODIC_CLIENT_RESTART_MS / 3600000}h uptime)`
     );
   }
 
@@ -3520,7 +3438,6 @@ function createWhatsAppBridge(deps) {
   startBackgroundReconnectLoop();
   startConnectionHealthLoop();
   startConnectionWatchdog();
-  startPeriodicClientRestartLoop();
   startPeriodicConversationSyncLoop();
 
   return {
